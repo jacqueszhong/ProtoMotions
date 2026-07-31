@@ -14,24 +14,183 @@ Example:
             --input-fps 30 \
             --output-fps 30
 """
-from typing import Optional
+from typing import Any, Dict, Optional
 import typer
 import os
 from pathlib import Path
 import numpy as np
 import torch
 import yaml
+from scipy.spatial.transform import Rotation as R
 
-from protomotions.components.pose_lib import extract_kinematic_info
-
-from convert_rigv1_to_proto import (
-    passes_exclude_motion_filter,
-    gen_yaml_one_motion_default,
-    create_motion_from_rigv1_data,
+from protomotions.components.pose_lib import (
+    compute_angular_velocity,
+    compute_joint_rot_mats_from_global_mats,
+    extract_kinematic_info,
+    extract_qpos_from_transforms,
+    fk_from_transforms_with_velocities,
 )
+from protomotions.simulator.base_simulator.simulator_state import RobotState
+from protomotions.utils.rotations import (
+    matrix_to_quaternion,
+    quat_mul,
+    quat_rotate,
+    quaternion_to_matrix,
+)
+
+from contact_detection import compute_contact_labels_from_pos_and_vel
 from keypoint_utils import extract_keypoints_from_motion, get_keypoint_indices
+from motion_filter import passes_exclude_motion_filter
 
 app = typer.Typer(pretty_exceptions_enable=True)
+
+
+def gen_yaml_one_motion_default(
+    output_motion_path: Path,
+    fps: int,
+    idx: int,
+    additional_fields: Optional[Dict[str, Any]] = None,
+):
+    result = {
+        "file": str(output_motion_path),
+        "fps": fps,
+        "weight": 1.0,
+        "idx": idx,
+    }
+    if additional_fields is not None:
+        result.update(additional_fields)
+    return result
+
+
+def create_motion_from_rigv1_data(
+    global_rot_mats: torch.Tensor,  # [T, 27, 3, 3]
+    root_pos: torch.Tensor,  # [T, 3]
+    kinematic_info,
+    fps: int,
+    device: torch.device = torch.device("cpu"),
+    dtype: torch.dtype = torch.float32,
+) -> RobotState:
+    """
+    Create a RobotState motion from Rigv1 global rotation matrices and root position.
+
+    Args:
+        global_rot_mats: Global rotation matrices [T, 27, 3, 3]
+        root_pos: Root position [T, 3]
+        kinematic_info: Kinematic information for the robot
+        fps: Frame rate
+        device: Torch device
+        dtype: Torch dtype
+
+    Returns:
+        RobotState motion object
+    """
+    # Convert to torch tensors if not already
+    if not isinstance(global_rot_mats, torch.Tensor):
+        global_rot_mats = torch.from_numpy(global_rot_mats)
+    if not isinstance(root_pos, torch.Tensor):
+        root_pos = torch.from_numpy(root_pos)
+
+    global_rot_mats = global_rot_mats.to(device, dtype)
+    root_pos = root_pos.to(device, dtype)
+
+    # Convert to quaternions and filter joints
+    global_quat = matrix_to_quaternion(global_rot_mats, w_last=True)
+    # for removing 4 dead joints in the Rigv1 raw data
+    joints_in_xml_order_idx = [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        13,
+        14,
+        15,
+        16,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+    ]
+    global_quat = global_quat[:, joints_in_xml_order_idx]
+    assert global_quat.shape[1] == 23
+
+    # Apply coordinate system transformations
+    # rot1 transforms motion rotations represented with a y-up character to a z-up character
+    # but did not change the motion itself
+    # rot2 changes the motion from y-up to z-up
+    rot1 = R.from_euler("xyz", np.array([-np.pi / 2, 0, 0]), degrees=False)
+    rot2 = R.from_euler("xyz", np.array([-np.pi / 2, np.pi, 0]), degrees=False)
+
+    rot1_quat = (
+        torch.from_numpy(rot1.as_quat())
+        .to(device, dtype)
+        .expand(global_quat.shape[0], -1)
+    )
+    rot2_quat = (
+        torch.from_numpy(rot2.as_quat())
+        .to(device, dtype)
+        .expand(global_quat.shape[0], -1)
+    )
+
+    for i in range(0, 23):
+        global_quat[:, i, :] = quat_mul(global_quat[:, i, :], rot1_quat, w_last=True)
+        global_quat[:, i, :] = quat_mul(rot2_quat, global_quat[:, i, :], w_last=True)
+
+    root_pos = quat_rotate(rot2_quat, root_pos, w_last=True)
+
+    # compute vels of local rotation
+    local_rot_mats = compute_joint_rot_mats_from_global_mats(
+        kinematic_info=kinematic_info,
+        global_rot_mats=quaternion_to_matrix(global_quat, w_last=True),
+    )
+
+    motion = fk_from_transforms_with_velocities(
+        kinematic_info=kinematic_info,
+        root_pos=root_pos,
+        joint_rot_mats=local_rot_mats,
+        fps=fps,
+        compute_velocities=True,
+        velocity_max_horizon=3,  # Use multi-horizon minimum for noise-filtered velocities
+    )
+    # caching local rotation to disk file, in case anyone needs it later
+    motion.local_rigid_body_rot = matrix_to_quaternion(local_rot_mats, w_last=True)
+
+    # calc dof pos and dof vel
+    qpos = extract_qpos_from_transforms(
+        kinematic_info=kinematic_info,
+        root_pos=root_pos,
+        joint_rot_mats=local_rot_mats,
+        multi_dof_decomposition_method="exp_map",
+    )
+    motion.dof_pos = qpos[:, 7:]  # (T, 22 * 3)
+
+    local_angular_vels = compute_angular_velocity(
+        batched_robot_rot_mats=local_rot_mats[:, 1:, :, :],
+        fps=fps,
+    )
+    assert local_angular_vels.shape[1] == 22  # (T, 22, 3)
+    # because we know all joints are 3 dof exp_map joints...
+    motion.dof_vel = local_angular_vels.reshape(-1, 22 * 3)
+
+    # compute contacts using position and velocity thresholds
+    motion.rigid_body_contacts = compute_contact_labels_from_pos_and_vel(
+        positions=motion.rigid_body_pos,
+        velocity=motion.rigid_body_vel,
+        vel_thres=0.15,
+        height_thresh=0.1,
+    ).to(torch.bool)
+
+    return motion
 
 
 @app.command()
