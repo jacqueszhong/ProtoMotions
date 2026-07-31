@@ -619,6 +619,10 @@ def extract_control_info(
         # Extract actuator force range if available
         effort_limit = getattr(joint, "actuatorfrcrange", DEFAULT_EFFORT_LIMIT)
 
+        # Convert from array to float (MJCF parsing bug?)
+        if isinstance(stiffness, np.ndarray):
+            stiffness = stiffness.item()
+
         # Convert to float if they're strings (common in MJCF)
         if isinstance(stiffness, str):
             stiffness = float(stiffness)
@@ -678,6 +682,9 @@ def extract_control_info(
             effort_limit=effort_limit,
             velocity_limit=velocity_limit,
         )
+
+        # print("dof_info extracted=", dof_control_info.damping)
+        # print("dof_info extracted=", dof_control_info.stiffness)
 
         return dof_control_info
 

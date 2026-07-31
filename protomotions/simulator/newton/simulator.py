@@ -22,6 +22,7 @@ from protomotions.simulator.base_simulator.simulator_state import (
     ResetState,
 )
 from protomotions.simulator.newton.config import NewtonSimulatorConfig
+from protomotions.utils import rotations
 from protomotions.simulator.newton.contact_utils import (
     get_contact_sensor_body_patterns,
     validate_contact_sensor_match,
@@ -133,6 +134,7 @@ class NewtonSimulator(Simulator):
         self._zero_passive_forces()
         self._setup_robot()
         self._setup_sim()
+        self._setup_markers(self._visualization_markers)
         if self.robot_config.contact_bodies is not None:
             self._setup_contact_sensors()
         self._create_contacts()
@@ -662,8 +664,43 @@ class NewtonSimulator(Simulator):
     def _setup_markers(
         self, visualization_markers: Dict[str, VisualizationMarkerConfig]
     ) -> None:
-        """Setup visualization markers."""
-        return
+        """Build and cache per-marker rendering metadata.
+
+        Newton's viewer has no native marker/arrow primitive, so spheres are
+        rendered via ``viewer.log_points`` (per-instance radius) and arrows are
+        approximated as a line segment along each marker's local +X axis via
+        ``viewer.log_lines`` (same idiom Newton's own contact-normal viz uses).
+        """
+        self._visualization_markers = {}
+        if visualization_markers is None or self.viewer is None:
+            return
+
+        for marker_name, markers_cfg in visualization_markers.items():
+            if markers_cfg.type not in ("sphere", "arrow"):
+                raise ValueError(f"Marker type {markers_cfg.type} not supported")
+
+            scale_list = []
+            for marker in markers_cfg.markers:
+                if markers_cfg.type == "sphere":
+                    if marker.size == "tiny":
+                        scale_list.append(0.007)
+                    elif marker.size == "small":
+                        scale_list.append(0.01)
+                    else:
+                        scale_list.append(0.05)
+                else:  # arrow
+                    scale_list.append(0.1 if marker.size == "small" else 0.5)
+
+            if len(scale_list) == 0:
+                continue
+
+            self._visualization_markers[marker_name] = {
+                "type": markers_cfg.type,
+                "color": markers_cfg.color,
+                "scale": torch.tensor(
+                    scale_list, device=self.device, dtype=torch.float32
+                ).repeat(self.num_envs),
+            }
 
     @staticmethod
     def _get_contact_sensor_body_patterns(body_name: str) -> List[str]:
@@ -1304,5 +1341,53 @@ class NewtonSimulator(Simulator):
     def _update_simulator_markers(
         self, markers_state: Optional[Dict[str, MarkerState]] = None
     ) -> None:
-        """Updates visualization markers."""
-        pass
+        """Updates visualization markers.
+
+        Args:
+            markers_state (Dict[str, MarkerState]): Dictionary mapping marker names to their state (translation and orientation, xyzw).
+        """
+
+        if markers_state is None or self.viewer is None:
+            return
+
+        for marker_name, markers_state_item in markers_state.items():
+            if markers_state_item.translation.numel() == 0:
+                continue
+            assert (
+                marker_name in self._visualization_markers
+            ), f"Marker {marker_name} passed to update_markers but not defined at instantiation"
+            marker_cfg = self._visualization_markers[marker_name]
+
+            translation = markers_state_item.translation.reshape(-1, 3).contiguous()
+            scale = marker_cfg["scale"]
+
+            if marker_cfg["type"] == "sphere":
+                points_wp = wp.from_torch(translation, dtype=wp.vec3)
+                radii_wp = wp.from_torch(scale.contiguous(), dtype=wp.float32)
+                colors = (
+                    torch.tensor(
+                        marker_cfg["color"], device=self.device, dtype=torch.float32
+                    )
+                    .repeat(translation.shape[0], 1)
+                    .contiguous()
+                )
+                colors_wp = wp.from_torch(colors, dtype=wp.vec3)
+                self.viewer.log_points(
+                    f"/markers/{marker_name}", points_wp, radii_wp, colors_wp
+                )
+            else:  # arrow
+                orientation = markers_state_item.orientation.reshape(-1, 4)
+                local_x = torch.zeros_like(translation)
+                local_x[:, 0] = 1.0
+                direction = rotations.quat_rotate(orientation, local_x, w_last=True)
+                ends = (translation + direction * scale.unsqueeze(-1)).contiguous()
+
+                starts_wp = wp.from_torch(translation, dtype=wp.vec3)
+                ends_wp = wp.from_torch(ends, dtype=wp.vec3)
+                self.viewer.log_lines(
+                    f"/markers/{marker_name}",
+                    starts_wp,
+                    ends_wp,
+                    marker_cfg["color"],
+                    width=0.2 * float(scale.mean()),
+                )
