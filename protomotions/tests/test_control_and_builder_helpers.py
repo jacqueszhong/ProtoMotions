@@ -518,7 +518,9 @@ def test_component_builder_constructs_dependency_classes_and_scene_weights(monke
     assert built[1] == ("weights", "/tmp/checkpoint", "motions.yaml", device)
     assert built[2][0] == "scene"
     assert built[2][1]["scene_weights"] == [0.1, 0.9]
-    assert built[2][1]["scenes"] is None
+    # SceneLib resolves inline_scenes from the config itself; forwarding them as a
+    # `scenes` kwarg too is rejected as an ambiguous scene source.
+    assert "scenes" not in built[2][1]
     assert built[3] == ("motion", {"config": motion_cfg, "device": device})
 
 

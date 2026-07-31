@@ -348,6 +348,42 @@ def test_reward_factories_and_bundles_bind_expected_context_paths():
         assert _params(component) == {"weight": 0.9, "sigma": 1.3}
 
 
+def test_object_pos_rew_factory_binds_scene_paths():
+    component = factories.object_pos_rew_factory(
+        weight=0.9, sigma=0.2, object_index=1
+    )
+
+    bindings = _bindings(component)
+    assert bindings["object_pos"] == "scene.object_pos"
+    assert bindings["ref_object_pos"] == "scene.ref_object_pos"
+    assert bindings["object_valid_mask"] == "scene.object_valid_mask"
+    assert _params(component) == {
+        "weight": 0.9,
+        "sigma": 0.2,
+        "object_index": 1,
+        "zero_during_grace_period": False,
+    }
+
+
+def test_object_error_term_and_metric_factories_bind_scene_paths():
+    scene_paths = {
+        "object_pos": "scene.object_pos",
+        "ref_object_pos": "scene.ref_object_pos",
+        "object_valid_mask": "scene.object_valid_mask",
+    }
+
+    term = factories.object_pos_error_term_factory(threshold=0.4, object_index=1)
+    assert _bindings(term) == scene_paths
+    assert _params(term) == {"threshold": 0.4, "object_index": 1}
+
+    metric = factories.object_pos_error_metric_factory(threshold=0.25)
+    assert _bindings(metric) == scene_paths
+    assert _params(metric) == {"threshold": 0.25, "object_index": 0}
+
+    # Threshold is optional for metrics: without it the evaluator only logs values.
+    assert "threshold" not in _params(factories.object_pos_error_metric_factory())
+
+
 def test_termination_and_metric_factories_bind_metadata_and_wrappers():
     tracking_term = factories.tracking_error_term_factory(threshold=0.6)
     assert _bindings(tracking_term)["current_rigid_body_pos"] == "current.rigid_body_pos"

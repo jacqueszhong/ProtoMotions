@@ -315,6 +315,86 @@ def test_tracking_values_and_terminations_cover_global_and_relative_errors():
     )
 
 
+def test_object_pos_error_value_measures_distance_and_masks_padding():
+    object_pos = torch.tensor([[[0.0, 0.0, 1.0]], [[0.0, 3.0, 1.0]]])
+    ref_object_pos = torch.tensor([[[0.0, 0.0, 1.0]], [[0.0, 0.0, 1.0]]])
+    valid = torch.ones(2, 1, dtype=torch.bool)
+
+    assert torch.allclose(
+        tracking.object_pos_error_value(object_pos, ref_object_pos, valid),
+        torch.tensor([0.0, 3.0]),
+    )
+
+    # Padding slots report no error rather than a spurious failure.
+    assert torch.allclose(
+        tracking.object_pos_error_value(
+            object_pos, ref_object_pos, torch.zeros(2, 1, dtype=torch.bool)
+        ),
+        torch.zeros(2),
+    )
+
+    # Envs without scene objects bind zero-width tensors rather than crash.
+    assert torch.allclose(
+        tracking.object_pos_error_value(
+            torch.zeros(3, 0, 3), torch.zeros(3, 0, 3), torch.zeros(3, 0, dtype=torch.bool)
+        ),
+        torch.zeros(3),
+    )
+
+
+def test_object_pos_error_term_fires_above_threshold_only_for_valid_objects():
+    object_pos = torch.tensor(
+        [[[0.0, 0.0, 1.0]], [[0.0, 0.2, 1.0]], [[0.0, 3.0, 1.0]]]
+    )
+    ref_object_pos = torch.zeros(3, 1, 3)
+    ref_object_pos[:, 0, 2] = 1.0
+    valid = torch.ones(3, 1, dtype=torch.bool)
+
+    assert torch.equal(
+        tracking.compute_object_pos_error_term(
+            object_pos, ref_object_pos, valid, threshold=0.3
+        ),
+        torch.tensor([False, False, True]),
+    )
+
+    # An invalid slot never terminates, however far the object appears to be.
+    assert torch.equal(
+        tracking.compute_object_pos_error_term(
+            object_pos, ref_object_pos, torch.zeros(3, 1, dtype=torch.bool), threshold=0.3
+        ),
+        torch.tensor([False, False, False]),
+    )
+
+    assert torch.equal(
+        tracking.compute_object_pos_error_term(
+            torch.zeros(2, 0, 3),
+            torch.zeros(2, 0, 3),
+            torch.zeros(2, 0, dtype=torch.bool),
+            threshold=0.3,
+        ),
+        torch.tensor([False, False]),
+    )
+
+
+def test_object_pos_error_term_selects_object_index():
+    object_pos = torch.tensor([[[5.0, 0.0, 0.0], [0.0, 0.0, 0.0]]])
+    ref_object_pos = torch.zeros(1, 2, 3)
+    valid = torch.ones(1, 2, dtype=torch.bool)
+
+    assert torch.equal(
+        tracking.compute_object_pos_error_term(
+            object_pos, ref_object_pos, valid, threshold=0.3, object_index=1
+        ),
+        torch.tensor([False]),
+    )
+    assert torch.equal(
+        tracking.compute_object_pos_error_term(
+            object_pos, ref_object_pos, valid, threshold=0.3, object_index=0
+        ),
+        torch.tensor([True]),
+    )
+
+
 def test_motion_clip_done_uses_motion_lib_lengths():
     class _MotionLib:
         def get_motion_length(self, motion_ids):

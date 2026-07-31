@@ -401,6 +401,40 @@ def compute_global_body_ang_vel_rew(
     )
 
 
+def compute_object_pos_rew(
+    object_pos: Tensor,
+    ref_object_pos: Tensor,
+    object_valid_mask: Tensor,
+    sigma: float = 0.1,
+    object_index: int = 0,
+) -> Tensor:
+    """Scene-object position tracking reward.
+
+    Rewards a scene object for following the trajectory its scene motion
+    prescribes, which is what distinguishes an object the humanoid actually
+    moved from one it merely reached toward.
+
+    Args:
+        object_pos: Current object positions [num_envs, num_objects, 3].
+        ref_object_pos: Reference object positions [num_envs, num_objects, 3].
+        object_valid_mask: Per-object validity [num_envs, num_objects]. Padding
+            slots are False and contribute no reward.
+        sigma: Gaussian kernel width.
+        object_index: Which object in the scene to track.
+
+    Returns:
+        Reward: exp(-||object_pos - ref_object_pos||^2 / sigma^2), zeroed where
+        the object slot is invalid. Zeros when the env has no scene objects.
+    """
+    if object_pos.shape[1] <= object_index:
+        return torch.zeros(object_pos.shape[0], device=object_pos.device)
+
+    reward = compute_global_position_error_exp(
+        object_pos[:, object_index], ref_object_pos[:, object_index], sigma
+    )
+    return reward * object_valid_mask[:, object_index].to(reward.dtype)
+
+
 def compute_gt_rel_rew(
     current_rigid_body_pos: Tensor,
     ref_rigid_body_pos: Tensor,
@@ -498,4 +532,5 @@ __all__ = [
     "compute_relative_body_ori_rew",
     "compute_global_body_lin_vel_rew",
     "compute_global_body_ang_vel_rew",
+    "compute_object_pos_rew",
 ]

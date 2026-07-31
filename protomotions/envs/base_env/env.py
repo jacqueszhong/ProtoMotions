@@ -972,11 +972,18 @@ class BaseEnv:
         Nearest-surface observations bind these fields unconditionally. Envs
         without object pointclouds receive empty tensors, which lets the compute
         kernel naturally fall back to terrain-only behavior.
+
+        Reference object poses require a motion manager to supply the current
+        motion time, so envs without one also take the empty path.
         """
         has_object_pointclouds = (
             getattr(self.scene_lib, "_object_pointclouds", None) is not None
         )
-        if self.scene_lib.num_objects_per_scene <= 0 or not has_object_pointclouds:
+        if (
+            self.scene_lib.num_objects_per_scene <= 0
+            or not has_object_pointclouds
+            or self.motion_manager is None
+        ):
             object_pos = torch.zeros(self.num_envs, 0, 3, device=self.device)
             object_rot = torch.zeros(self.num_envs, 0, 4, device=self.device)
             neutral_pointclouds = torch.zeros(
@@ -988,15 +995,31 @@ class BaseEnv:
             return SceneSurfaceContext(
                 object_pos=object_pos,
                 object_rot=object_rot,
+                ref_object_pos=torch.zeros(self.num_envs, 0, 3, device=self.device),
+                ref_object_rot=torch.zeros(self.num_envs, 0, 4, device=self.device),
                 neutral_pointclouds=neutral_pointclouds,
                 object_valid_mask=object_valid_mask,
             )
 
         env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
         object_state = self.simulator.get_object_root_state()
+
+        # Reference object pose for the current motion time, moved into world
+        # frame the same way compute_ref_reset_state places objects at reset.
+        # respawn_offset stays 0: it is a spawn-time lift against ground
+        # interpenetration, not part of the reference trajectory.
+        ref_object_state = self.scene_lib.get_scene_pose(
+            env_ids, self.motion_manager.motion_times, respawn_offset=0.0
+        )
+        ref_object_pos = ref_object_state.root_pos + self.respawn_root_offset.unsqueeze(
+            1
+        )
+
         return SceneSurfaceContext(
             object_pos=object_state.root_pos,
             object_rot=object_state.root_rot,
+            ref_object_pos=ref_object_pos,
+            ref_object_rot=ref_object_state.root_rot,
             neutral_pointclouds=self.scene_lib.get_scene_neutral_pointcloud(env_ids),
             object_valid_mask=self.scene_lib.get_per_object_valid_mask(env_ids),
         )
