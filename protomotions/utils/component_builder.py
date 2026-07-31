@@ -55,11 +55,12 @@ def build_scene_lib_from_config(
     """
     from protomotions.components.scene_lib import SceneLib
 
-    # Create SceneLib (config required, handles None scene_file - creates empty)
+    # Create SceneLib (config required, handles None scene_file - creates empty).
+    # inline_scenes is resolved by SceneLib from the config; passing it as `scenes`
+    # as well is rejected as an ambiguous scene source.
     return SceneLib(
         config=scene_lib_config,
         num_envs=num_envs,
-        scenes=scene_lib_config.inline_scenes,
         device=device,
         terrain=terrain,
         scene_weights=scene_weights,

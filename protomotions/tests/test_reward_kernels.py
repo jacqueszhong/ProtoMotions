@@ -456,3 +456,55 @@ def test_tracking_rewards_cover_standard_and_beyond_mimic_variants():
         ),
         torch.ones(2),
     )
+
+
+def test_object_pos_rew_tracks_reference_and_respects_valid_mask():
+    object_pos = torch.tensor([[[0.0, 0.0, 1.0]], [[0.0, 0.0, 1.0]]])
+    ref_object_pos = torch.tensor([[[0.0, 0.0, 1.0]], [[0.0, 0.0, 2.0]]])
+    valid = torch.ones(2, 1, dtype=torch.bool)
+
+    # Env 0 sits on its reference, env 1 is 1m away.
+    assert torch.allclose(
+        tracking.compute_object_pos_rew(object_pos, ref_object_pos, valid, sigma=1.0),
+        torch.tensor([1.0, math.exp(-1.0)]),
+    )
+
+    # Padding slots contribute nothing even when they match their reference.
+    assert torch.allclose(
+        tracking.compute_object_pos_rew(
+            object_pos,
+            ref_object_pos,
+            torch.zeros(2, 1, dtype=torch.bool),
+            sigma=1.0,
+        ),
+        torch.zeros(2),
+    )
+
+
+def test_object_pos_rew_selects_object_index_and_handles_empty_scenes():
+    object_pos = torch.tensor([[[0.0, 0.0, 0.0], [0.0, 0.0, 5.0]]])
+    ref_object_pos = torch.tensor([[[9.0, 0.0, 0.0], [0.0, 0.0, 5.0]]])
+    valid = torch.ones(1, 2, dtype=torch.bool)
+
+    # Object 1 matches its reference; object 0 does not.
+    assert torch.allclose(
+        tracking.compute_object_pos_rew(
+            object_pos, ref_object_pos, valid, sigma=1.0, object_index=1
+        ),
+        torch.ones(1),
+    )
+    mismatched = tracking.compute_object_pos_rew(
+        object_pos, ref_object_pos, valid, sigma=1.0, object_index=0
+    )
+    assert mismatched[0] < 1.0
+
+    # Envs without scene objects bind zero-width tensors rather than crash.
+    assert torch.allclose(
+        tracking.compute_object_pos_rew(
+            torch.zeros(3, 0, 3),
+            torch.zeros(3, 0, 3),
+            torch.zeros(3, 0, dtype=torch.bool),
+            sigma=1.0,
+        ),
+        torch.zeros(3),
+    )

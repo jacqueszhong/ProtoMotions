@@ -24,18 +24,25 @@ def test_nearest_surface_factory_binds_scene_object_surfaces():
 def test_scene_surface_context_exposes_object_surface_tensors():
     object_pos = torch.zeros(2, 3, 3)
     object_rot = torch.zeros(2, 3, 4)
+    ref_object_pos = torch.ones(2, 3, 3)
+    ref_object_rot = torch.ones(2, 3, 4)
     neutral_pointclouds = torch.zeros(2, 3, 5, 3)
     object_valid_mask = torch.ones(2, 3, dtype=torch.bool)
 
     context = SceneSurfaceContext(
         object_pos=object_pos,
         object_rot=object_rot,
+        ref_object_pos=ref_object_pos,
+        ref_object_rot=ref_object_rot,
         neutral_pointclouds=neutral_pointclouds,
         object_valid_mask=object_valid_mask,
     )
 
     assert context.object_pos is object_pos
     assert context.object_rot is object_rot
+    assert context.ref_object_pos is ref_object_pos
+    assert context.ref_object_rot is ref_object_rot
     assert context.neutral_pointclouds is neutral_pointclouds
     assert context.object_valid_mask is object_valid_mask
     assert EnvContext.scene.object_pos.path == "scene.object_pos"
+    assert EnvContext.scene.ref_object_pos.path == "scene.ref_object_pos"

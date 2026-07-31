@@ -1011,6 +1011,108 @@ def global_anchor_pos_rew_factory(
     )
 
 
+def object_pos_rew_factory(
+    weight: float = 1.0,
+    sigma: float = 0.1,
+    object_index: int = 0,
+    zero_during_grace_period: bool = False,
+) -> MdpComponent:
+    """Factory for scene-object position tracking reward.
+
+    Requires ``pointcloud_samples_per_object`` to be set on the scene lib config.
+    Object state is only populated in the context when pointclouds exist, so the
+    reward silently sees no objects otherwise.
+
+    Args:
+        weight: Reward weight.
+        sigma: Gaussian kernel width.
+        object_index: Which object in the scene to track.
+        zero_during_grace_period: Skip the reward for the first
+            ``EnvConfig.reset_grace_period`` steps after a reset, while the
+            object is still settling against a reset-perturbed robot.
+
+    Returns:
+        MdpComponent configured for scene-object position tracking.
+    """
+    from protomotions.envs.rewards import compute_object_pos_rew
+
+    return MdpComponent(
+        compute_func=compute_object_pos_rew,
+        dynamic_vars={
+            "object_pos": EnvContext.scene.object_pos,
+            "ref_object_pos": EnvContext.scene.ref_object_pos,
+            "object_valid_mask": EnvContext.scene.object_valid_mask,
+        },
+        static_params={
+            "weight": weight,
+            "sigma": sigma,
+            "object_index": object_index,
+            "zero_during_grace_period": zero_during_grace_period,
+        },
+    )
+
+
+def object_pos_error_term_factory(
+    threshold: float = 0.3, object_index: int = 0
+) -> MdpComponent:
+    """Factory for scene-object position error termination.
+
+    Ends the episode when the tracked object leaves its reference trajectory, so
+    a dropped object costs the remainder of the rollout instead of only the
+    object reward.  Never fires for padding slots or envs without scene objects.
+
+    Requires ``pointcloud_samples_per_object`` on the scene lib config, same as
+    ``object_pos_rew_factory``.
+
+    Args:
+        threshold: Maximum allowed distance from the reference in meters.
+        object_index: Which object in the scene to check.
+
+    Returns:
+        MdpComponent configured for scene-object position error termination.
+    """
+    from protomotions.envs.terminations import compute_object_pos_error_term
+
+    return MdpComponent(
+        compute_func=compute_object_pos_error_term,
+        dynamic_vars={
+            "object_pos": EnvContext.scene.object_pos,
+            "ref_object_pos": EnvContext.scene.ref_object_pos,
+            "object_valid_mask": EnvContext.scene.object_valid_mask,
+        },
+        static_params={"threshold": threshold, "object_index": object_index},
+    )
+
+
+def object_pos_error_metric_factory(
+    threshold: float = None, object_index: int = 0
+) -> MdpComponent:
+    """Factory for scene-object position error evaluation metric.
+
+    Args:
+        threshold: If set, the evaluator counts the motion as failed when the
+            error exceeds it.
+        object_index: Which object in the scene to measure.
+
+    Returns:
+        MdpComponent configured for scene-object position error evaluation.
+    """
+    from protomotions.envs.terminations import object_pos_error_value
+
+    static_params = {"object_index": object_index}
+    if threshold is not None:
+        static_params["threshold"] = threshold
+    return MdpComponent(
+        compute_func=object_pos_error_value,
+        dynamic_vars={
+            "object_pos": EnvContext.scene.object_pos,
+            "ref_object_pos": EnvContext.scene.ref_object_pos,
+            "object_valid_mask": EnvContext.scene.object_valid_mask,
+        },
+        static_params=static_params,
+    )
+
+
 def global_anchor_ori_rew_factory(
     weight: float = 0.5, sigma: float = 0.4
 ) -> MdpComponent:
@@ -1534,11 +1636,13 @@ __all__ = [
     # BeyondMimic reward factories
     "global_anchor_pos_rew_factory",
     "global_anchor_ori_rew_factory",
+    "object_pos_rew_factory",
     "relative_body_pos_rew_factory",
     "relative_body_ori_rew_factory",
     "global_body_lin_vel_rew_factory",
     "global_body_ang_vel_rew_factory",
     # Termination factories
+    "object_pos_error_term_factory",
     "tracking_error_term_factory",
     "anchor_pos_error_term_factory",
     "anchor_ori_error_term_factory",
@@ -1553,6 +1657,7 @@ __all__ = [
     "anchor_pos_metric_factory",
     "anchor_ori_metric_factory",
     "relative_body_pos_metric_factory",
+    "object_pos_error_metric_factory",
     "path_distance_error_factory",
     "steering_velocity_error_factory",
 ]

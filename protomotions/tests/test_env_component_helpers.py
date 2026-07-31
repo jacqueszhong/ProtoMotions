@@ -139,6 +139,52 @@ def test_mdp_component_resolves_dynamic_paths_and_filters_metadata():
     assert serialized["weight"] == 3.0
 
 
+def _threshold_kernel(value: torch.Tensor, threshold: float = 99.0) -> torch.Tensor:
+    return value > threshold
+
+
+def _kwargs_kernel(**kwargs) -> torch.Tensor:
+    return kwargs["value"]
+
+
+def test_mdp_component_forwards_metadata_keys_the_kernel_declares():
+    """A termination's threshold must reach its kernel, not just combine_*.
+
+    ``threshold`` is evaluator metadata for value kernels but a real argument for
+    termination kernels. Filtering it unconditionally made every termination run
+    at its kernel default and silently ignore the configured threshold.
+    """
+    component = MdpComponent(
+        compute_func=_threshold_kernel,
+        dynamic_vars={"value": _TestContext.current.value},
+        static_params={"threshold": 2.5, "weight": 3.0},
+    )
+    ctx = _make_context()
+
+    _, func_params = component.resolve_args(ctx)
+
+    assert func_params == {"threshold": 2.5}
+    # Kernel default of 99.0 would make this all-False.
+    assert torch.equal(
+        component.compute(ctx), torch.tensor([False, False, True])
+    )
+    # Still exposed as metadata for combine_rewards / the evaluator.
+    assert component.get_params()["threshold"] == 2.5
+
+
+def test_mdp_component_keeps_metadata_from_kwargs_kernels():
+    """``**kwargs`` wrappers cannot be inspected, so keep the conservative split."""
+    component = MdpComponent(
+        compute_func=_kwargs_kernel,
+        dynamic_vars={"value": _TestContext.current.value},
+        static_params={"threshold": 2.5},
+    )
+
+    _, func_params = component.resolve_args(_make_context())
+
+    assert func_params == {}
+
+
 def test_mdp_component_moves_static_tensor_params_to_runtime_device():
     component = MdpComponent(
         compute_func=_affine_value,
