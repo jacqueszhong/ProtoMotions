@@ -128,6 +128,7 @@ AppLauncher = import_simulator_before_torch(args.simulator)
 from pathlib import Path  # noqa: E402
 import logging  # noqa: E402
 import importlib.util  # noqa: E402
+import sys  # noqa: E402
 import torch  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -143,6 +144,12 @@ def main():
     experiment_path = Path(args.experiment_path)
     if not experiment_path.exists():
         raise FileNotFoundError(f"Experiment file not found: {experiment_path}")
+
+    # Ensure the repo root is on sys.path so that experiment configs can import
+    # from sibling packages (e.g. `from examples.experiments.mimic... import ...`).
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
 
     spec = importlib.util.spec_from_file_location("experiment_module", experiment_path)
     experiment_module = importlib.util.module_from_spec(spec)
