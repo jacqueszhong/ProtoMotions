@@ -11,7 +11,7 @@ This is the Isaac Sim counterpart of ``export_bm_tracker_onnx.py``.  The
 exported network is identical -- the observation pipeline and policy are
 simulator-agnostic -- but the ``timing`` block of the emitted YAML advertises
 Isaac-family (PhysX) rates rather than MuJoCo's 1 kHz / decimation-20.  That
-matters because ``deployment/isaacsim_tracker.py`` re-derives its substep
+matters because ``deployment/test_tracker_isaacsim.py`` re-derives its substep
 count as ``control_dt / physics_dt``; handing it MuJoCo timing makes it take
 20 PhysX substeps per control tick instead of 4.
 
@@ -247,7 +247,7 @@ def export_tracker(
 
     # Resolve Isaac Sim (PhysX) timing.
     #
-    # `deployment/isaacsim_tracker.py` re-derives its substep count as
+    # `deployment/test_tracker_isaacsim.py` re-derives its substep count as
     # `control_dt / physics_dt`, so `physics_dt` is load-bearing: a MuJoCo
     # value (1 kHz) would make the Isaac Sim runner take 20 substeps per
     # control tick instead of the 4 the Isaac backends are configured for.
