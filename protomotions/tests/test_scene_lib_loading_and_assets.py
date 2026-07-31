@@ -80,6 +80,29 @@ def test_inline_scenes_config_constructs_library_without_scenes_argument():
     assert scene_lib.get_humanoid_motion_ids() == [4, 5, 4]
 
 
+def test_component_builder_constructs_library_from_inline_scenes():
+    """The builder must not forward inline_scenes as `scenes` (ambiguous source)."""
+    from protomotions.utils.component_builder import build_scene_lib_from_config
+
+    scene_lib = build_scene_lib_from_config(
+        SceneLibConfig(
+            scene_file=None,
+            inline_scenes=[Scene(objects=[_box(width=1.0)], humanoid_motion_id=4)],
+            replicate_method=ReplicationMethod.SEQUENTIAL,
+        ),
+        num_envs=3,
+        device="cpu",
+        terrain=None,
+    )
+
+    assert scene_lib.num_scenes() == 3
+    assert all(
+        isinstance(obj, BoxSceneObject)
+        for scene in scene_lib.scenes
+        for obj in scene.objects
+    )
+
+
 def test_inline_scenes_rejects_explicit_scenes_argument():
     scenes = [Scene(objects=[_box()])]
 

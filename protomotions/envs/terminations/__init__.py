@@ -34,6 +34,7 @@ from protomotions.envs.terminations.tracking import (
     compute_anchor_ori_error_term,
     compute_relative_body_pos_error_term,
     compute_anchor_height_error_term,
+    compute_object_pos_error_term,
     motion_clip_done,
     # Value functions (for evaluation metrics)
     mean_body_pos_error,
@@ -43,6 +44,7 @@ from protomotions.envs.terminations.tracking import (
     anchor_ori_error_value,
     anchor_height_error_value,
     relative_body_pos_max_error,
+    object_pos_error_value,
 )
 
 # Task terminations
@@ -70,6 +72,7 @@ __all__ = [
     "compute_anchor_ori_error_term",
     "compute_relative_body_pos_error_term",
     "compute_anchor_height_error_term",
+    "compute_object_pos_error_term",
     "motion_clip_done",
     # Value functions
     "mean_body_pos_error",
@@ -79,6 +82,7 @@ __all__ = [
     "anchor_ori_error_value",
     "anchor_height_error_value",
     "relative_body_pos_max_error",
+    "object_pos_error_value",
     # Task functions
     "check_path_distance_term",
     "check_path_height_term",

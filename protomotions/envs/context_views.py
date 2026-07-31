@@ -491,15 +491,21 @@ class TerrainContext:
 
 
 class SceneSurfaceContext:
-    """View for scene-object surface tensors used by observations.
+    """View for scene-object surface tensors used by observations and rewards.
 
     Empty tensors are used when the environment has no scene objects, so
     factories can bind these paths unconditionally while compute kernels decide
     whether object surfaces are present from the tensor shapes.
+
+    The ``ref_object_*`` fields carry the reference pose the object motion in the
+    scene library prescribes for the current motion time, in world frame. They
+    are the object-side counterpart of ``EnvContext.mimic.ref_state``.
     """
 
     object_pos: Tensor = FieldPath()
     object_rot: Tensor = FieldPath()
+    ref_object_pos: Tensor = FieldPath()
+    ref_object_rot: Tensor = FieldPath()
     neutral_pointclouds: Tensor = FieldPath()
     object_valid_mask: Tensor = FieldPath()
 
@@ -507,11 +513,15 @@ class SceneSurfaceContext:
         self,
         object_pos: Tensor,
         object_rot: Tensor,
+        ref_object_pos: Tensor,
+        ref_object_rot: Tensor,
         neutral_pointclouds: Tensor,
         object_valid_mask: Tensor,
     ):
         self.object_pos = object_pos
         self.object_rot = object_rot
+        self.ref_object_pos = ref_object_pos
+        self.ref_object_rot = ref_object_rot
         self.neutral_pointclouds = neutral_pointclouds
         self.object_valid_mask = object_valid_mask
 

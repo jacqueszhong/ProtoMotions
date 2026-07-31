@@ -478,15 +478,17 @@ def export_tracker(
         float(robot_config.control.control_info[j].damping) for j in joint_names
     ]
 
-    # Effort limits (if available)
+    # Effort limits (if available). The field is `effort_limit` -- reading
+    # `.effort` here silently produced `effort_limits: null` in every export,
+    # which left deployment backends running the joints with unbounded torque.
     effort_limits = None
     try:
         effort_limits = [
-            float(robot_config.control.control_info[j].effort)
+            float(robot_config.control.control_info[j].effort_limit)
             for j in joint_names
         ]
-    except (AttributeError, KeyError):
-        pass
+    except (AttributeError, KeyError, TypeError) as e:
+        log.warning(f"Could not resolve per-joint effort limits: {e}")
 
     mjcf_path = robot_config.asset.asset_file_name
 

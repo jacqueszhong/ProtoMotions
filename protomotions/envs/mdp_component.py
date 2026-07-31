@@ -80,7 +80,8 @@ Example
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, TYPE_CHECKING
+import inspect
+from typing import Any, Callable, Dict, FrozenSet, TYPE_CHECKING
 
 from torch import Tensor
 
@@ -98,6 +99,42 @@ _METADATA_KEYS = frozenset({
     "min_value", "max_value",
     "threshold", "fail_above", "use_region_weights",
 })
+
+
+def kernel_forwarded_metadata_keys(compute_func: Callable[..., Tensor]) -> FrozenSet[str]:
+    """Metadata keys the kernel itself declares, and therefore must receive.
+
+    A few names are metadata for one consumer and a real argument for another:
+    ``threshold`` is evaluator metadata for value kernels such as
+    ``anchor_height_error_value``, but a genuine parameter of termination kernels
+    such as ``compute_anchor_height_error_term``.  Blanket-filtering it made every
+    termination run at its kernel default and silently ignore the threshold its
+    factory was given.  Forward a metadata key only when the kernel declares it by
+    name; ``**kwargs`` wrappers keep the conservative split, since what they accept
+    cannot be read from the signature.
+
+    Args:
+        compute_func: The kernel that will be called with the static params.
+
+    Returns:
+        Frozen set of metadata key names to forward to ``compute_func``.
+    """
+    try:
+        parameters = inspect.signature(compute_func).parameters
+    except (TypeError, ValueError):
+        # jit-scripted or builtin callables expose no inspectable signature.
+        return frozenset()
+
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return frozenset()
+
+    return frozenset(
+        name
+        for name, param in parameters.items()
+        if name in _METADATA_KEYS
+        and param.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    )
 
 
 class MdpComponent:
@@ -172,11 +209,24 @@ class MdpComponent:
         if not self._device_ready:
             self._ensure_device(resolved)
 
+        forwarded = self._forwarded_metadata_keys()
         func_params = {
             k: v for k, v in self.static_params.items()
-            if k not in _METADATA_KEYS
+            if k not in _METADATA_KEYS or k in forwarded
         }
         return resolved, func_params
+
+    def _forwarded_metadata_keys(self) -> FrozenSet[str]:
+        """Cached metadata keys this component's kernel declares.
+
+        Resolved lazily rather than in ``__init__`` so components restored from a
+        pickled ``resolved_configs.pt`` (which bypasses ``__init__``) also get it.
+        """
+        keys = self.__dict__.get("_metadata_keys_cache")
+        if keys is None:
+            keys = kernel_forwarded_metadata_keys(self.compute_func)
+            self._metadata_keys_cache = keys
+        return keys
 
     def compute(self, ctx: "EnvContext") -> Tensor:
         """Resolve dynamic_vars from context and call compute_func.

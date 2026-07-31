@@ -230,6 +230,74 @@ def anchor_height_error_value(
     return torch.abs(current_height - ref_anchor_height)
 
 
+def object_pos_error_value(
+    object_pos: Tensor,
+    ref_object_pos: Tensor,
+    object_valid_mask: Tensor,
+    object_index: int = 0,
+) -> Tensor:
+    """Scene-object position error against its reference trajectory.
+
+    Counterpart of ``compute_object_pos_rew``: the same distance, unsquashed, so
+    it can drive a termination or an evaluation metric.  Padding slots and envs
+    without scene objects report zero error rather than a spurious failure.
+
+    Args:
+        object_pos: Current object positions [num_envs, num_objects, 3].
+        ref_object_pos: Reference object positions [num_envs, num_objects, 3].
+        object_valid_mask: Per-object validity [num_envs, num_objects].
+        object_index: Which object in the scene to measure.
+
+    Returns:
+        Distance per env [num_envs] in meters, zeroed on invalid slots.
+    """
+    if object_pos.shape[1] <= object_index:
+        return torch.zeros(object_pos.shape[0], device=object_pos.device)
+
+    distance = (
+        (object_pos[:, object_index] - ref_object_pos[:, object_index])
+        .pow(2)
+        .sum(-1)
+        .sqrt()
+    )
+    return distance * object_valid_mask[:, object_index].to(distance.dtype)
+
+
+def compute_object_pos_error_term(
+    object_pos: Tensor,
+    ref_object_pos: Tensor,
+    object_valid_mask: Tensor,
+    threshold: float = 0.3,
+    object_index: int = 0,
+) -> Tensor:
+    """Scene-object position error termination.
+
+    Ends the episode once the object has left the trajectory its scene motion
+    prescribes — a dropped box is a failed rollout, not a rollout that merely
+    stops collecting the object reward.
+
+    Args:
+        object_pos: Current object positions [num_envs, num_objects, 3].
+        ref_object_pos: Reference object positions [num_envs, num_objects, 3].
+        object_valid_mask: Per-object validity [num_envs, num_objects].
+        threshold: Maximum allowed distance in meters.
+        object_index: Which object in the scene to check.
+
+    Returns:
+        Boolean tensor [num_envs]. Always False where the object slot is invalid
+        or the env has no scene objects.
+    """
+    if object_pos.shape[1] <= object_index:
+        return torch.zeros(
+            object_pos.shape[0], dtype=torch.bool, device=object_pos.device
+        )
+
+    distance = object_pos_error_value(
+        object_pos, ref_object_pos, object_valid_mask, object_index
+    )
+    return (distance > threshold) & object_valid_mask[:, object_index]
+
+
 def compute_anchor_pos_error_term(
     current_anchor_pos: Tensor,
     ref_rigid_body_pos: Tensor,
