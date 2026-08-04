@@ -79,18 +79,37 @@ Isaac Sim specifics (read before pointing this at a new robot)
   track the live simulation, so nothing looks broken.  Override with
   ``--root-prim-name`` if a new asset needs it.
 
-- **PD gains must be authored on the USD drives before the sim starts.**
+- **USD angular drive gains are per-*degree*; the policy's are per-radian.**
   ``usd_convert`` writes ``drive:angular:physics:stiffness`` and ``damping`` as
   **0** -- training supplies them (IsaacLab does it through its actuator configs
-  at spawn time).  ``ArticulationView.set_gains()`` after startup is *not* a
-  substitute: the write lands in the view's buffer and reads back as the value
-  you set, but PhysX keeps solving with the parsed-at-startup zeros.  The robot
-  then ragdolls: it sags to the floor and every run is bit-identical no matter
-  what the policy commands, because no action reaches the joints.
-  :meth:`TrackerPolicy._author_drive_gains` writes them onto the stage instead.
+  at spawn time).  :meth:`TrackerPolicy._author_drive_gains` fills them in so the
+  drives are sane during the physics steps between ``world.reset()`` and the
+  first ``set_gains()``, but it must convert: ``UsdPhysics`` angular drives are
+  authored in Nm/deg, and Isaac Sim's own ``set_gains(save_to_usd=True)`` writes
+  ``kp * pi/180`` (``isaacsim/core/prims/impl/articulation.py``).  Writing the raw
+  Nm/rad number instead makes PhysX solve at **57.2958x** the intended stiffness.
   Armature and effort limits do *not* need this -- ``usd_convert`` already
   authors ``physxJoint:armature`` and ``drive:angular:physics:maxForce``
-  correctly.
+  correctly, and those are not angle-unit scaled.
+
+  ``ArticulationView.set_gains()`` *does* reach PhysX (read back after
+  ``initialize()`` it reports the configured values, and the robot responds to
+  actions), so the USD authoring is belt-and-braces, not the mechanism that makes
+  control work.  An earlier version of this docstring claimed the opposite; that
+  was an artifact of wrapping the wrong prim before ``_find_articulation_root``
+  existed -- see the articulation-root note above.
+
+- **The default experience has no physics *authoring* UI.**  ``SimulationApp`` with
+  no ``experience=`` falls back to ``isaacsim.exp.base.python.kit``, a trimmed
+  "app for python samples" that enables the physics *runtime*
+  (``omni.physics.physx``, ``omni.physx.tensors``) but nothing to author it
+  with -- no ``Create > Physics`` menu, no ``+ Add > Physics`` section in the
+  Property window.  Those come from ``omni.physx.bundle`` (``omni.physx.ui``,
+  ``omni.kit.property.physx``, ``omni.physx.commands``, ...), which only
+  ``isaacsim.exp.full.kit`` lists.  Windowed runs enable that bundle at runtime
+  right after boot (see ``--no-physics-ui``); booting ``full.kit`` instead also
+  works but drags in ``isaacsim.app.setup``, the examples browser and the
+  replicator UI, which take over the window layout for no benefit here.
 
 - **``post_reset()`` reverts gains.**  ``ArticulationView._on_post_reset()``
   (``isaacsim/core/prims/impl/articulation.py``) calls
@@ -116,12 +135,18 @@ Usage
     python deployment/test_tracker_isaacsim.py \
         --onnx data/pretrained_models/motion_tracker/g1-bones-deploy/compiled_models/unified_pipeline.onnx \
         --motion data/motion_for_trackers/g1_random_subset_tiny.pt
+
+    python deployment/test_tracker_isaacsim.py \
+        --onnx results/g1_walk_box/compiled_models/unified_pipeline.onnx \
+        --motion results/g1_walk_box/g1_walk_box.pt
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import math
 import os
 import sys
 import time
@@ -193,6 +218,38 @@ def _parse_args() -> argparse.Namespace:
         "--headless", action="store_true", default=False, help="Run without a viewport"
     )
     p.add_argument(
+        "--no-physics-ui",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip loading the physics authoring UI extensions (omni.physx.bundle) "
+            "in windowed runs -- slightly faster startup, but no 'Create > Physics' "
+            "menu and no '+ Add > Physics' in the Property window. --headless never "
+            "loads them."
+        ),
+    )
+    p.add_argument(
+        "--trace-out",
+        type=str,
+        default=None,
+        help=(
+            "Write a per-control-step tracking trace (root height, torso tilt and "
+            "joint error against the reference, plus joint velocities) as JSON, and "
+            "print the summary table. Comparable to the IsaacLab/MuJoCo numbers in "
+            "docs/isaacsim_g1_tracker_instability_findings.md."
+        ),
+    )
+    p.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help=(
+            "Physics device, e.g. 'cuda:0'. Default (unset) runs PhysX on the CPU "
+            "with the numpy backend -- a different solver path from the GPU "
+            "pipeline used in training. Pass cuda:0 to match training."
+        ),
+    )
+    p.add_argument(
         "--no-realtime",
         action="store_true",
         default=False,
@@ -241,6 +298,17 @@ from isaacsim import SimulationApp  # noqa: E402
 
 simulation_app = SimulationApp({"headless": args.headless})
 
+# The default experience (isaacsim.exp.base.python.kit) enables the physics *runtime*
+# but none of the physics *authoring* UI, so the viewport has no "Create > Physics"
+# menu and the Property panel no "+ Add > Physics" section. Both come from
+# omni.physx.bundle, which only isaacsim.exp.full.kit lists -- pull it in here rather
+# than booting the whole editor experience. See the module docstring.
+if not args.headless and not args.no_physics_ui:
+    from isaacsim.core.utils.extensions import enable_extension  # noqa: E402
+
+    if enable_extension("omni.physx.bundle"):
+        simulation_app.update()  # let the extensions register their menus
+
 import numpy as np  # noqa: E402
 import onnxruntime as ort  # noqa: E402
 import yaml  # noqa: E402
@@ -251,7 +319,7 @@ from isaacsim.core.utils.stage import add_reference_to_stage  # noqa: E402
 from isaacsim.core.utils.types import ArticulationAction  # noqa: E402
 from isaacsim.core.utils.stage import get_current_stage  # noqa: E402
 from isaacsim.core.utils.viewports import set_camera_view  # noqa: E402
-from pxr import Usd, UsdPhysics  # noqa: E402
+from pxr import PhysxSchema, Usd, UsdPhysics  # noqa: E402
 
 from deployment.motion_utils import MotionPlayer  # noqa: E402
 from deployment.state_utils import (  # noqa: E402
@@ -287,6 +355,31 @@ def _to_numpy(array) -> np.ndarray:
     if hasattr(array, "numpy"):  # warp.array
         return array.numpy()
     return np.asarray(array)
+
+
+def _tilt_deg_xyzw(quat_xyzw) -> float:
+    """Angle in degrees between the body's local +z axis and world +z."""
+    x, y, _z, _w = np.asarray(quat_xyzw, dtype=np.float64)
+    # R[2, 2] -- the z component of the body's z axis in world coordinates.
+    cos_tilt = 1.0 - 2.0 * (x * x + y * y)
+    return float(np.degrees(np.arccos(np.clip(cos_tilt, -1.0, 1.0))))
+
+
+def _set_prim_attr(prim, name: str, value) -> bool:
+    """Set an already-declared USD attribute, creating it only if the schema knows it.
+
+    ``Apply()``-ing the PhysX API adds the attribute declarations but leaves them
+    unauthored, so ``GetAttribute()`` returns a valid-but-empty handle that
+    ``Set()`` authors correctly. If a given Isaac Sim version does not declare the
+    attribute at all, skip it rather than authoring a stray property PhysX will
+    ignore.
+    """
+    attr = prim.GetAttribute(name)
+    if not attr:
+        log.debug(f"{prim.GetPath()}: no attribute '{name}' to set")
+        return False
+    attr.Set(value)
+    return True
 
 
 def resolve_usd_path(usd_path: str) -> str:
@@ -341,7 +434,9 @@ def load_robot_joint_properties(robot_name: str, joint_names: list) -> dict:
     Returns:
         Dict with ``armature`` / ``effort_limit`` / ``velocity_limit`` arrays in
         *policy* joint order (or ``None`` per entry if the config does not
-        define that property for every joint), plus solver iteration counts.
+        define that property for every joint), plus the solver iteration counts,
+        the IsaacLab physics rate/decimation, and the rigid-body and collision
+        properties training spawns the robot with.
     """
     config = build_robot_config(robot_name)
     control_info = config.control.control_info
@@ -356,13 +451,30 @@ def load_robot_joint_properties(robot_name: str, joint_names: list) -> dict:
             values.append(float(value))
         return np.asarray(values, dtype=np.float32)
 
-    physx = getattr(getattr(config.simulation_params, "isaaclab", None), "physx", None)
+    sim = getattr(config.simulation_params, "isaaclab", None)
+    physx = getattr(sim, "physx", None)
+    asset = config.asset
     return {
         "armature": _column("armature"),
         "effort_limit": _column("effort_limit"),
         "velocity_limit": _column("velocity_limit"),
         "solver_position_iterations": getattr(physx, "num_position_iterations", None),
         "solver_velocity_iterations": getattr(physx, "num_velocity_iterations", None),
+        # Timing: training's IsaacLab rate, not the YAML's MuJoCo-flavoured one.
+        "sim_fps": getattr(sim, "fps", None),
+        "sim_decimation": getattr(sim, "decimation", None),
+        # RigidBodyPropertiesCfg / CollisionPropertiesCfg equivalents -- the USD
+        # ships different values for several of these (see _author_body_properties).
+        "linear_damping": getattr(asset, "linear_damping", None),
+        "angular_damping": getattr(asset, "angular_damping", None),
+        "max_linear_velocity": getattr(asset, "max_linear_velocity", None),
+        "max_angular_velocity": getattr(asset, "max_angular_velocity", None),
+        "max_depenetration_velocity": getattr(
+            physx, "max_depenetration_velocity", None
+        ),
+        "contact_offset": getattr(physx, "contact_offset", None),
+        "rest_offset": getattr(physx, "rest_offset", None),
+        "bounce_threshold_velocity": getattr(physx, "bounce_threshold_velocity", None),
     }
 
 
@@ -538,6 +650,7 @@ class TrackerPolicy:
             articulation_path = self._find_articulation_root(prim_path)
         log.info(f"Articulation root prim: {articulation_path}")
         self._author_drive_gains(prim_path)
+        self._author_body_properties(prim_path)
         self.robot = SingleArticulation(
             prim_path=articulation_path, name="tracker_robot"
         )
@@ -548,6 +661,12 @@ class TrackerPolicy:
         self._total_steps = 0
         self.num_loops = 1
         self.done = False
+        # Per-control-step tracking trace; None disables recording (see --trace-out).
+        self.trace: list | None = None
+        # Set from inside the physics callback, consumed by the main loop between
+        # world.step() calls -- see reset_episode()'s note on why the reset itself
+        # must not happen mid-step.
+        self._pending_reset = False
 
         # Run-wide statistics for the end-of-run summary (never reset per episode).
         self.total_ort_ms = 0.0
@@ -572,17 +691,23 @@ class TrackerPolicy:
         """Write the PD gains onto the USD joint drives, before the sim starts.
 
         ``usd_convert`` authors these assets with ``drive:angular:physics:stiffness``
-        and ``damping`` at **0** -- the gains are expected to come from the training
+        and ``damping`` at **0**; the gains are expected to come from the training
         framework (IsaacLab applies them through its actuator configs at spawn time).
-        Setting them later through ``ArticulationView.set_gains()`` is not enough:
-        that write lands in the view's buffer (and reads back correctly) but PhysX
-        keeps solving with the parsed-at-startup values, so the robot ragdolls no
-        matter what the policy commands. Author them here instead, while the stage
-        is still being built.
+        ``initialize()``/``post_reset()`` do apply them through
+        ``ArticulationView.set_gains()``, but that only takes effect once the
+        physics view exists -- every physics step in between runs on whatever the
+        stage says. Author them here so that window is not spent at zero gain.
+
+        Units: ``UsdPhysics`` **angular** drives are per-degree, while the policy's
+        gains (and ``set_gains()``) are per-radian. Isaac Sim's own
+        ``set_gains(save_to_usd=True)`` writes ``kp * pi/180``
+        (``isaacsim/core/prims/impl/articulation.py``), so do the same -- writing
+        the raw Nm/rad value makes PhysX solve at 57.2958x the intended stiffness.
         """
         stage = get_current_stage()
+        deg = math.pi / 180.0  # Nm/rad -> Nm/deg, matching set_gains(save_to_usd=True)
         by_name = {
-            name: (float(kp), float(kd))
+            name: (float(kp) * deg, float(kd) * deg)
             for name, kp, kd in zip(self.joint_names, self.stiffness, self.damping)
         }
         applied = 0
@@ -596,7 +721,82 @@ class TrackerPolicy:
             drive.CreateStiffnessAttr().Set(gains[0])
             drive.CreateDampingAttr().Set(gains[1])
             applied += 1
-        log.info(f"Authored PD gains on {applied}/{len(by_name)} USD joint drives.")
+        log.info(
+            f"Authored PD gains on {applied}/{len(by_name)} USD joint drives "
+            "(converted Nm/rad -> Nm/deg)."
+        )
+
+    def _author_body_properties(self, prim_path: str) -> None:
+        """Apply training's RigidBodyPropertiesCfg / CollisionPropertiesCfg to the stage.
+
+        ``protomotions/simulator/isaaclab/utils/scene.py`` spawns the robot with
+        explicit rigid-body and collision properties taken from the robot config;
+        this script previously spawned the USD as-authored, so several of them
+        differed from training. The measured gaps on the G1 asset were a per-link
+        ``angularDamping`` of 0.05 (a global drag that exists in neither training
+        nor MuJoCo), a ``maxDepenetrationVelocity`` of 3.0 vs training's 1.0, and
+        unpinned contact/rest offsets.
+
+        Units: PhysX authors ``maxAngularVelocity`` in **deg/s**, and IsaacLab
+        writes the config value into it verbatim (``sim/schemas/schemas.py`` does
+        no conversion -- assets that want rad/s scale it themselves, cf.
+        ``isaaclab_assets/robots/allegro.py``). So the raw config number is passed
+        through here too, which is what training actually runs with.
+        """
+        props = self.joint_properties or {}
+        rigid_body_attrs = {
+            "physxRigidBody:linearDamping": props.get("linear_damping"),
+            "physxRigidBody:angularDamping": props.get("angular_damping"),
+            "physxRigidBody:maxLinearVelocity": props.get("max_linear_velocity"),
+            "physxRigidBody:maxAngularVelocity": props.get("max_angular_velocity"),
+            "physxRigidBody:maxDepenetrationVelocity": props.get(
+                "max_depenetration_velocity"
+            ),
+            "physxRigidBody:retainAccelerations": False,
+        }
+        collision_attrs = {
+            "physxCollision:contactOffset": props.get("contact_offset"),
+            "physxCollision:restOffset": props.get("rest_offset"),
+        }
+        rigid_body_attrs = {k: v for k, v in rigid_body_attrs.items() if v is not None}
+        collision_attrs = {k: v for k, v in collision_attrs.items() if v is not None}
+
+        stage = get_current_stage()
+        root_prim = stage.GetPrimAtPath(prim_path)
+
+        # The colliders are USD *instances*: each body's `collisions` scope is an
+        # instanceable prim, so its children are instance proxies. A default
+        # Usd.PrimRange does not descend into them (159 prims vs 320 for this
+        # asset) and authoring on one raises "authoring to an instance proxy is
+        # not allowed" -- which is why the collision offsets silently reached
+        # zero colliders before. De-instancing exposes them and makes the writes
+        # legal; for a single robot the lost instancing costs nothing.
+        if collision_attrs:
+            for prim in Usd.PrimRange.Stage(
+                stage, Usd.TraverseInstanceProxies(Usd.PrimAllPrimsPredicate)
+            ):
+                if (
+                    prim.GetPath().HasPrefix(root_prim.GetPath())
+                    and prim.IsInstanceable()
+                ):
+                    prim.SetInstanceable(False)
+
+        n_bodies = n_colliders = 0
+        for prim in Usd.PrimRange(root_prim):
+            if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+                for name, value in rigid_body_attrs.items():
+                    _set_prim_attr(prim, name, value)
+                n_bodies += 1
+            if prim.HasAPI(UsdPhysics.CollisionAPI):
+                PhysxSchema.PhysxCollisionAPI.Apply(prim)
+                for name, value in collision_attrs.items():
+                    _set_prim_attr(prim, name, value)
+                n_colliders += 1
+        log.info(
+            f"Authored rigid-body properties on {n_bodies} bodies and collision "
+            f"offsets on {n_colliders} colliders."
+        )
 
     def _find_articulation_root(self, prim_path: str) -> str:
         """Locate the prim carrying ``UsdPhysics.ArticulationRootAPI``.
@@ -698,7 +898,7 @@ class TrackerPolicy:
         return out
 
     def _apply_joint_properties(self, view) -> None:
-        """Apply PD gains, armature and effort limits in Isaac Sim DOF order."""
+        """Apply PD gains, armature, effort and velocity limits in Isaac Sim DOF order."""
         stiffness_isaac = self._to_isaac_order(self.stiffness)
         damping_isaac = self._to_isaac_order(self.damping)
 
@@ -736,6 +936,19 @@ class TrackerPolicy:
                 "No armature available -- joint dynamics will not match training."
             )
 
+        # Joint velocity limits. Training passes these as `velocity_limit_sim`
+        # (scene.py); the USD leaves them at the MJCF/PhysX default. Measured
+        # peaks on this policy reach 22-34 rad/s against limits of 20-37, so the
+        # clamp is active and its absence is a real difference from training.
+        velocity_limits = props.get("velocity_limit")
+        if velocity_limits is not None:
+            view.set_max_joint_velocities(self._to_isaac_order(velocity_limits)[None])
+            log.info("Applied per-joint velocity limits.")
+        else:
+            log.warning(
+                "No velocity limits available -- joints run unclamped, unlike training."
+            )
+
     # ------------------------------------------------------------------
     # Episode lifecycle
     # ------------------------------------------------------------------
@@ -750,7 +963,16 @@ class TrackerPolicy:
         self.reset_episode()
 
     def reset_episode(self) -> None:
-        """Reset robot state to the first motion frame and clear episode-local filters."""
+        """Reset robot state to the first motion frame and clear episode-local filters.
+
+        **Call this only from outside the physics step.** ``set_world_pose`` /
+        ``set_joint_positions`` / ``update_articulations_kinematic()`` write the
+        articulation state directly; doing that from within a physics callback
+        (i.e. part-way through ``world.step()``) is not well-defined in Isaac Sim
+        and shows up as a jitter-then-fall at every clip restart. The callback
+        therefore only raises ``_pending_reset``; the main loop drains it between
+        steps.
+        """
         frame0 = self.motion_player.get_state_at_frame(0)
         root_pos = frame0["body_pos"][0]
         root_quat_xyzw = frame0["body_rot"][0]
@@ -759,9 +981,20 @@ class TrackerPolicy:
 
         dof_pos_isaac = self._to_isaac_order(frame0["dof_pos"])
         self.robot.set_joint_positions(dof_pos_isaac)
-        self.robot.set_joint_velocities(np.zeros(self.num_dofs, dtype=np.float32))
-        self.robot.set_linear_velocity(np.zeros(3, dtype=np.float32))
-        self.robot.set_angular_velocity(np.zeros(3, dtype=np.float32))
+
+        # Start from the reference *velocities*, not from rest. ProtoMotions'
+        # reference-state initialization seeds root and joint velocities from the
+        # motion (compute_ref_reset_state), and the policy was trained on that
+        # distribution -- dropping a moving clip in at zero velocity is off-
+        # distribution for exactly the first few control steps that decide whether
+        # the episode stays on its feet.
+        self.robot.set_joint_velocities(self._to_isaac_order(frame0["dof_vel"]))
+        self.robot.set_linear_velocity(
+            np.asarray(frame0["body_vel"][0], dtype=np.float32)
+        )
+        self.robot.set_angular_velocity(
+            np.asarray(frame0["body_ang_vel"][0], dtype=np.float32)
+        )
 
         # Link transforms lag the joint state we just wrote until the kinematics
         # are refreshed. Without this the first _compute_action() -- which is
@@ -925,6 +1158,7 @@ class TrackerPolicy:
         self._pd_targets_isaac = self._to_isaac_order(pd_targets)
 
         self._log_progress(dof_pos)
+        self._record_trace(dof_pos, dof_vel, anchor_rot)
 
         self._frame_idx += 1
         self._total_steps += 1
@@ -933,7 +1167,10 @@ class TrackerPolicy:
             if self._loop_idx >= self.num_loops:
                 self.done = True
             else:
-                self.reset_episode()
+                # Do NOT reset here: this runs inside the physics callback, and
+                # writing articulation root/joint state mid-step is undefined in
+                # Isaac Sim. Defer to the main loop.
+                self._pending_reset = True
 
     def _log_progress(self, dof_pos: np.ndarray) -> None:
         """Periodically report root height + tracking error (cf. the MuJoCo driver)."""
@@ -951,6 +1188,33 @@ class TrackerPolicy:
             f"  step={self._total_steps:5d}  frame={self._frame_idx:4d}  "
             f"root_h={float(np.asarray(root_pos)[2]):.3f}  "
             f"max_ref_err={self._max_ref_err:.4f}"
+        )
+
+    def _record_trace(
+        self, dof_pos: np.ndarray, dof_vel: np.ndarray, anchor_rot: np.ndarray
+    ) -> None:
+        """Append this control step's tracking error to the trace buffer.
+
+        Columns match the cross-simulator comparison table in
+        ``docs/isaacsim_g1_tracker_instability_findings.md`` so a run here is
+        directly comparable to the IsaacLab and MuJoCo numbers.
+        """
+        if self.trace is None:
+            return
+        ref = self.motion_player.get_state_at_frame(self._frame_idx)
+        root_pos, _ = self.robot.get_world_pose()
+        self.trace.append(
+            {
+                "loop": self._loop_idx,
+                "frame": self._frame_idx,
+                "root_h": float(np.asarray(root_pos)[2]),
+                "ref_h": float(ref["body_pos"][0][2]),
+                "tilt": _tilt_deg_xyzw(anchor_rot),
+                "ref_tilt": _tilt_deg_xyzw(ref["body_rot"][self.anchor_body_index]),
+                "joint_err": float(np.abs(dof_pos - ref["dof_pos"]).mean()),
+                "dof_vel_rms": float(np.sqrt(np.mean(dof_vel**2))),
+                "dof_vel_peak": float(np.abs(dof_vel).max()),
+            }
         )
 
     def forward(self, dt: float) -> None:
@@ -983,10 +1247,59 @@ class TrackerPolicy:
             f"  max joint ref error: {self.max_ref_err_run:.4f} rad"
         )
 
+    def write_trace(self, path: str) -> None:
+        """Dump the per-control-step trace and print its summary."""
+        if not self.trace:
+            log.warning("No trace recorded -- nothing written.")
+            return
+        with open(path, "w") as f:
+            json.dump(self.trace, f)
+
+        col = {k: np.array([r[k] for r in self.trace]) for k in self.trace[0]}
+        log.info(
+            f"\n=== Tracking trace ({len(self.trace)} control steps) -> {path} ===\n"
+            f"  mean joint err      : {col['joint_err'].mean():.4f} rad\n"
+            f"  mean |root_h - ref| : {np.abs(col['root_h'] - col['ref_h']).mean():.4f} m\n"
+            f"  mean |tilt - ref|   : {np.abs(col['tilt'] - col['ref_tilt']).mean():.2f} deg\n"
+            f"  mean rms dof_vel    : {col['dof_vel_rms'].mean():.3f}\n"
+            f"  peak dof_vel        : {col['dof_vel_peak'].max():.1f} rad/s"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Scene dressing
 # ---------------------------------------------------------------------------
+
+
+def _configure_physics_scene(world, robot_props: dict) -> None:
+    """Match the PhysX scene settings training runs with.
+
+    ``World``'s defaults differ from both ``physx_env.yaml`` and ProtoMotions'
+    IsaacLab config in three ways that matter: contact stabilization is off, CCD
+    is on, and the bounce threshold is 0 (so every contact is treated as
+    bouncing). Solver type, friction offset and correlation distance already
+    agree.
+
+    Must be called **after** ``world.reset()``: ``PhysicsContext`` re-applies its
+    own cached values when the sim starts playing, so anything written on the
+    ``/physicsScene`` prim beforehand is silently dropped.
+    """
+    ctx = world.get_physics_context()
+
+    # Training (and physx_env.yaml) run with stabilization on and CCD off.
+    ctx.enable_stablization(True)  # NB: Isaac Sim spells it this way
+    ctx.enable_ccd(False)
+    ctx.set_solver_type("TGS")
+
+    bounce = robot_props.get("bounce_threshold_velocity")
+    if bounce is not None:
+        ctx.set_bounce_threshold(float(bounce))
+
+    log.info(
+        "PhysX scene: stabilization=True ccd=False solver=TGS "
+        f"bounce_threshold={ctx.get_bounce_threshold():.3f} "
+        f"gpu_dynamics={ctx.is_gpu_dynamics_enabled()}"
+    )
 
 
 def setup_lighting_and_camera(target_pos) -> None:
@@ -1027,11 +1340,44 @@ def main() -> None:
     with open(yaml_path) as f:
         meta = yaml.safe_load(f)
 
-    physics_dt = args.physics_dt or meta["timing"]["physics_dt"]
     control_dt = meta["timing"]["control_dt"]
 
+    # Timing. The exported YAML carries the *MuJoCo* rate (1 kHz / decimation 20)
+    # because that is the driver it was written for; IsaacLab trains this policy at
+    # 200 Hz / decimation 4 (`g1.py: isaaclab=IsaacLabSimParams(fps=200, decimation=4)`).
+    # Prefer the robot config's Isaac rate, and let --physics-dt override both.
+    robot_props = (
+        load_robot_joint_properties(args.robot, meta["robot"]["joint_names"])
+        if args.robot
+        else {}
+    )
+    sim_fps = robot_props.get("sim_fps")
+    if args.physics_dt:
+        physics_dt = args.physics_dt
+        log.info(f"physics_dt={physics_dt}s (from --physics-dt)")
+    elif sim_fps:
+        physics_dt = 1.0 / float(sim_fps)
+        log.info(
+            f"physics_dt={physics_dt}s (from the robot config's IsaacLab rate, "
+            f"{sim_fps} Hz); the YAML's {meta['timing']['physics_dt']}s is MuJoCo's."
+        )
+    else:
+        physics_dt = meta["timing"]["physics_dt"]
+        log.warning(
+            f"physics_dt={physics_dt}s taken from the YAML -- this is the MuJoCo "
+            "rate. Pass --robot to resolve training's Isaac rate instead."
+        )
+
+    # Device: World defaults to the CPU/numpy backend, a different PhysX solver
+    # path from the GPU pipeline training uses. --device cuda:0 selects that one.
+    world_kwargs = {}
+    if args.device:
+        world_kwargs = {"device": args.device, "backend": "torch"}
     world = World(
-        stage_units_in_meters=1.0, physics_dt=physics_dt, rendering_dt=control_dt
+        stage_units_in_meters=1.0,
+        physics_dt=physics_dt,
+        rendering_dt=control_dt,
+        **world_kwargs,
     )
     world.scene.add_default_ground_plane(
         z_position=0.0,
@@ -1058,6 +1404,8 @@ def main() -> None:
     policy.num_loops = (
         args.loops if args.loops is not None else (1 if args.headless else 10_000_000)
     )
+    if args.trace_out:
+        policy.trace = []
 
     if not args.headless:
         # Frame the pelvis at its motion-frame-0 pose; the robot starts there.
@@ -1066,6 +1414,9 @@ def main() -> None:
         )
 
     world.reset()
+    # Must come after reset(): PhysicsContext re-applies its own values when the
+    # sim starts playing, silently discarding anything written on the stage before.
+    _configure_physics_scene(world, robot_props)
     policy.initialize()
     policy.post_reset()
     world.add_physics_callback("tracker_policy_step", callback_fn=policy.forward)
@@ -1080,12 +1431,19 @@ def main() -> None:
         world.step(render=not args.headless)
         step_s = time.perf_counter() - t0
         total_sim_ms += step_s * 1000.0
+        # Clip restarts are deferred out of the physics callback -- see
+        # TrackerPolicy.reset_episode(). This is the only safe place to run them.
+        if policy._pending_reset:
+            policy._pending_reset = False
+            policy.reset_episode()
         if realtime:
             sleep_time = physics_dt - step_s
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
     policy.log_summary(total_sim_ms)
+    if args.trace_out:
+        policy.write_trace(args.trace_out)
 
     simulation_app.close()
 

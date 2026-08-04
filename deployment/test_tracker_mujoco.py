@@ -120,6 +120,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import time
 from pathlib import Path
@@ -141,6 +142,7 @@ if _REPO_ROOT not in sys.path:
 from deployment.state_utils import (
     mujoco_wxyz_to_xyzw,
     compute_anchor_rot_np,
+    compute_root_local_ang_vel_np,
     compute_yaw_offset_np,
     apply_heading_offset_np,
 )
@@ -319,6 +321,13 @@ def load_mujoco_model(
     return model, data
 
 
+def _tilt_deg_xyzw(quat_xyzw) -> float:
+    """Angle in degrees between the body's local +z axis and world +z."""
+    x, y, _z, _w = np.asarray(quat_xyzw, dtype=np.float64)
+    cos_tilt = 1.0 - 2.0 * (x * x + y * y)
+    return float(np.degrees(np.arccos(np.clip(cos_tilt, -1.0, 1.0))))
+
+
 def read_robot_state(data, anchor_body_index: int, root_body_index: int = 0):
     """Read raw robot state from MuJoCo data buffers.
 
@@ -372,7 +381,20 @@ def set_initial_pose(model, data, motion_player: MotionPlayer) -> None:
     data.qpos[3:7] = root_quat[[3, 0, 1, 2]]  # xyzw -> wxyz
     data.qpos[7:]  = frame0["dof_pos"]
 
-    data.qvel[:] = 0.0
+    # Start from the reference *velocities*, not from rest. ProtoMotions'
+    # reference-state initialization seeds root and joint velocities from the
+    # motion, and the policy was trained on that distribution -- dropping a moving
+    # clip in at zero velocity is off-distribution for exactly the first few
+    # control steps. Frames: a free joint's qvel is linear in the **world** frame
+    # but angular in the **body-local** frame, while the motion stores both in
+    # world -- so only the angular part gets rotated.
+    data.qvel[0:3] = frame0["body_vel"][0]
+    data.qvel[3:6] = compute_root_local_ang_vel_np(
+        rigid_body_rot=root_quat[None, :],
+        rigid_body_ang_vel=frame0["body_ang_vel"][0][None, :],
+        root_body_index=0,
+    )
+    data.qvel[6:] = frame0["dof_vel"]
     mujoco.mj_forward(model, data)
     log.info(
         f"  Initial pose set: root_pos={root_pos.round(3).tolist()}, "
@@ -450,6 +472,8 @@ def run(
     render: bool = False,
     realtime: bool = True,
     action_ema_alpha: float | None = None,
+    trace_out: str | None = None,
+    motion_index: int = 0,
 ) -> None:
     """Run the tracker policy in a MuJoCo simulation loop.
 
@@ -475,6 +499,14 @@ def run(
         ``a_applied = alpha * a_policy + (1 - alpha) * a_prev``.
         Set to 1.0 to disable filtering.  If None, loads from the YAML
         metadata (``control.action_ema_alpha``).
+    trace_out:
+        If given, write a per-control-step tracking trace (root height, torso
+        tilt and joint error against the reference, plus joint velocities) to
+        this path as JSON and print its summary.  Same columns as
+        ``test_tracker_isaacsim.py --trace-out``, so runs are directly
+        comparable across the two backends.
+    motion_index:
+        Clip index within a multi-motion ``.pt`` library.
     """
     onnx_path  = str(onnx_path)
     yaml_path  = onnx_path.replace(".onnx", ".yaml")
@@ -546,7 +578,7 @@ def run(
     # ------------------------------------------------------------------
     # Load motion
     # ------------------------------------------------------------------
-    player = MotionPlayer(motion_file, control_dt=control_dt)
+    player = MotionPlayer(motion_file, motion_index=motion_index, control_dt=control_dt)
 
     if cache_motion:
         motion_p = Path(motion_file)
@@ -649,6 +681,9 @@ def run(
     prev_pd: np.ndarray | None = None
     prev_prev_pd: np.ndarray | None = None
 
+    # Per-control-step tracking trace; None disables recording (see --trace-out).
+    trace: list | None = [] if trace_out else None
+
     loop_idx = 0
     while loop_idx < num_loops:
         loop_label = f"{loop_idx + 1}/{num_loops}" if num_loops < 1_000_000 else f"{loop_idx + 1}"
@@ -731,10 +766,25 @@ def run(
             total_sim_ms += (time.perf_counter() - t0) * 1000.0
 
             # ---- optional: track PD error vs reference ----
-            ref_dof_pos = player.get_state_at_frame(frame_idx)["dof_pos"]
+            ref = player.get_state_at_frame(frame_idx)
+            ref_dof_pos = ref["dof_pos"]
             diff = float(np.abs(data.qpos[7:] - ref_dof_pos).max())
             if diff > max_pd_diff:
                 max_pd_diff = diff
+
+            if trace is not None:
+                anchor_quat = mujoco_wxyz_to_xyzw(data.xquat[anchor_body_index + 1])
+                trace.append({
+                    "loop":         loop_idx,
+                    "frame":        frame_idx,
+                    "root_h":       float(data.qpos[2]),
+                    "ref_h":        float(ref["body_pos"][0][2]),
+                    "tilt":         _tilt_deg_xyzw(anchor_quat),
+                    "ref_tilt":     _tilt_deg_xyzw(ref["body_rot"][anchor_body_index]),
+                    "joint_err":    float(np.abs(data.qpos[7:] - ref_dof_pos).mean()),
+                    "dof_vel_rms":  float(np.sqrt(np.mean(data.qvel[6:] ** 2))),
+                    "dof_vel_peak": float(np.abs(data.qvel[6:]).max()),
+                })
 
             # ---- viewer ----
             if viewer is not None:
@@ -780,6 +830,19 @@ def run(
         f"  max joint ref error: {max_pd_diff:.4f} rad"
     )
 
+    if trace:
+        with open(trace_out, "w") as f:
+            json.dump(trace, f)
+        col = {k: np.array([r[k] for r in trace]) for k in trace[0]}
+        log.info(
+            f"\n=== Tracking trace ({len(trace)} control steps) -> {trace_out} ===\n"
+            f"  mean joint err      : {col['joint_err'].mean():.4f} rad\n"
+            f"  mean |root_h - ref| : {np.abs(col['root_h'] - col['ref_h']).mean():.4f} m\n"
+            f"  mean |tilt - ref|   : {np.abs(col['tilt'] - col['ref_tilt']).mean():.2f} deg\n"
+            f"  mean rms dof_vel    : {col['dof_vel_rms'].mean():.3f}\n"
+            f"  peak dof_vel        : {col['dof_vel_peak'].max():.1f} rad/s"
+        )
+
     if viewer is not None:
         try:
             viewer.close()
@@ -806,6 +869,12 @@ def _parse_args():
         "--motion",
         required=True,
         help="Path to motion .pt file (raw ProtoMotions or pre-cached)",
+    )
+    p.add_argument(
+        "--motion-index",
+        type=int,
+        default=0,
+        help="Clip index in multi-motion .pt library",
     )
     p.add_argument(
         "--cache-motion",
@@ -843,6 +912,17 @@ def _parse_args():
             "(control.action_ema_alpha). 1.0 = no filtering, lower = more smoothing."
         ),
     )
+    p.add_argument(
+        "--trace-out",
+        type=str,
+        default=None,
+        help=(
+            "Write a per-control-step tracking trace (root height, torso tilt and "
+            "joint error against the reference, plus joint velocities) as JSON, and "
+            "print the summary table. Same columns as test_tracker_isaacsim.py's "
+            "--trace-out, so the two backends compare directly."
+        ),
+    )
     return p.parse_args()
 
 
@@ -858,6 +938,8 @@ if __name__ == "__main__":
         render=args.render,
         realtime=not args.no_realtime,
         action_ema_alpha=args.action_ema_alpha,
+        trace_out=args.trace_out,
+        motion_index=args.motion_index,
     )
     # Force clean exit — avoids GLXBadContext segfault from MuJoCo's
     # atexit GL context teardown on some Linux drivers.
