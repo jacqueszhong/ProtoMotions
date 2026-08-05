@@ -61,14 +61,37 @@ Isaac Sim specifics (read before pointing this at a new robot)
   unlike every other Isaac Sim pose API here (which is wxyz).  Do not run it
   through :func:`wxyz_to_xyzw`.
 
-- **Joint properties**: training applies per-joint armature, effort limits
-  and solver iteration counts from the ProtoMotions robot config (see
+- **Joint properties**: training applies per-joint armature, effort limits,
+  velocity limits, Coulomb friction and solver iteration counts from the
+  ProtoMotions robot config (see
   ``protomotions/simulator/isaaclab/utils/scene.py``).  The exported
   deployment YAML does not carry all of these, so when a robot name is
   available they are resolved from ``protomotions.robot_configs`` at runtime
   by :func:`load_robot_joint_properties`.  This matters for the G1, whose PD
   gains are *derived from* armature (``kp = armature * w_n**2``), so the
   closed-loop joint dynamics are wrong without it.
+
+- **What training overrides in the USD is not always an unset default.**  The
+  G1 asset *explicitly authors*
+  ``physxArticulation:enabledSelfCollisions = False``, while training spawns it
+  with ``enabled_self_collisions=True`` (``scene.py`` ←
+  ``g1.py: self_collisions``).  Inheriting the asset's value therefore made this
+  driver solve a different collision problem from training -- limbs passed
+  through each other -- which a robust pretrained policy absorbed and a
+  locally-trained one did not (it fell after ~84 control steps).
+  :meth:`TrackerPolicy._author_articulation_properties` now authors it from the
+  robot config.  The lesson generalises: diff against what training *configures*,
+  not against what the USD leaves unauthored.  ``--dump-physx-properties``
+  prints both sides of that diff.
+
+- **Debugging a policy that works in IsaacLab but not here**: record IsaacLab's
+  own trajectory with ``deployment/trace_tracker_isaaclab.py``, check the export
+  against it with ``deployment/check_onnx_parity.py``, then replay its actions
+  open-loop here with ``--action-tape``/``--init-state`` to separate physics
+  from feedback.  Calibrate first -- ``trace_tracker_isaaclab.py --action-tape``
+  replaying into IsaacLab must return 0.0, which is what makes a nonzero number
+  here meaningful.  Full write-up:
+  ``logs/isaacsim_g1_tracker_instability_findings.md``.
 
 - **Root articulation prim**: found by searching for
   ``UsdPhysics.ArticulationRootAPI`` (:meth:`TrackerPolicy._find_articulation_root`),
@@ -136,9 +159,6 @@ Usage
         --onnx data/pretrained_models/motion_tracker/g1-bones-deploy/compiled_models/unified_pipeline.onnx \
         --motion data/motion_for_trackers/g1_random_subset_tiny.pt
 
-    python deployment/test_tracker_isaacsim.py \
-        --onnx results/g1_walk_box/compiled_models/unified_pipeline.onnx \
-        --motion results/g1_walk_box/g1_walk_box.pt
 """
 
 from __future__ import annotations
@@ -281,6 +301,68 @@ def _parse_args() -> argparse.Namespace:
         default=1.0,
         help="Ground plane static/dynamic friction (training default: 1.0)",
     )
+    p.add_argument(
+        "--joint-friction",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help=(
+            "Apply the robot config's per-joint Coulomb friction "
+            "(control_info[j].friction, 0.1 on every G1 joint). Training passes "
+            "it to ImplicitActuatorCfg; leaving it off makes the joints "
+            "under-damped relative to training. 'auto' applies it whenever the "
+            "robot config supplies it."
+        ),
+    )
+    p.add_argument(
+        "--action-tape",
+        type=str,
+        default=None,
+        help=(
+            "Replay a recorded processed_action sequence open-loop instead of "
+            "running the policy; the ONNX session is never called. Takes the "
+            ".npz written by deployment/trace_tracker_isaaclab.py. Isolates "
+            "physics/actuator differences from closed-loop feedback."
+        ),
+    )
+    p.add_argument(
+        "--init-state",
+        type=str,
+        default=None,
+        help=(
+            "Start from the post-reset state in this init_state.json (written by "
+            "deployment/trace_tracker_isaaclab.py) instead of motion frame 0."
+        ),
+    )
+    p.add_argument(
+        "--init-z-offset",
+        type=float,
+        default=0.0,
+        help=(
+            "Add this to the spawn height. ProtoMotions resets with "
+            "env.config.ref_respawn_offset = 0.05 m above the reference; the "
+            "driver spawns flush. Use to test that difference empirically."
+        ),
+    )
+    p.add_argument(
+        "--dump-physx-properties",
+        action="store_true",
+        default=False,
+        help=(
+            "After post_reset(), read every per-joint property back from the "
+            "live physics view, diff it element-wise against the robot config, "
+            "and exit. The last-resort check when an open-loop replay diverges "
+            "and no single ablation explains it."
+        ),
+    )
+    p.add_argument(
+        "--tape-divergence-out",
+        type=str,
+        default=None,
+        help=(
+            "With --action-tape, write the per-step divergence against the "
+            "recorded IsaacLab trajectory as JSON."
+        ),
+    )
     return p.parse_args()
 
 
@@ -326,6 +408,8 @@ from deployment.state_utils import (  # noqa: E402
     apply_heading_offset_np,
     compute_root_local_ang_vel_np,
     compute_yaw_offset_np,
+    make_trace_row,
+    summarize_trace,
 )
 
 # `force=True` is load-bearing: SimulationApp has already installed Kit's
@@ -355,14 +439,6 @@ def _to_numpy(array) -> np.ndarray:
     if hasattr(array, "numpy"):  # warp.array
         return array.numpy()
     return np.asarray(array)
-
-
-def _tilt_deg_xyzw(quat_xyzw) -> float:
-    """Angle in degrees between the body's local +z axis and world +z."""
-    x, y, _z, _w = np.asarray(quat_xyzw, dtype=np.float64)
-    # R[2, 2] -- the z component of the body's z axis in world coordinates.
-    cos_tilt = 1.0 - 2.0 * (x * x + y * y)
-    return float(np.degrees(np.arccos(np.clip(cos_tilt, -1.0, 1.0))))
 
 
 def _set_prim_attr(prim, name: str, value) -> bool:
@@ -458,6 +534,8 @@ def load_robot_joint_properties(robot_name: str, joint_names: list) -> dict:
         "armature": _column("armature"),
         "effort_limit": _column("effort_limit"),
         "velocity_limit": _column("velocity_limit"),
+        # Coulomb joint friction; training passes this to ImplicitActuatorCfg.
+        "friction": _column("friction"),
         "solver_position_iterations": getattr(physx, "num_position_iterations", None),
         "solver_velocity_iterations": getattr(physx, "num_velocity_iterations", None),
         # Timing: training's IsaacLab rate, not the YAML's MuJoCo-flavoured one.
@@ -472,6 +550,9 @@ def load_robot_joint_properties(robot_name: str, joint_names: list) -> dict:
         "max_depenetration_velocity": getattr(
             physx, "max_depenetration_velocity", None
         ),
+        # ArticulationRootPropertiesCfg equivalent. The G1 USD authors
+        # enabledSelfCollisions=False; training overrides it to True.
+        "self_collisions": getattr(asset, "self_collisions", None),
         "contact_offset": getattr(physx, "contact_offset", None),
         "rest_offset": getattr(physx, "rest_offset", None),
         "bounce_threshold_velocity": getattr(physx, "bounce_threshold_velocity", None),
@@ -552,6 +633,10 @@ class TrackerPolicy:
         robot_name: str | None = None,
         physics_dt: float | None = None,
         log_every: int = 100,
+        joint_friction_mode: str = "auto",
+        action_tape: str | None = None,
+        init_state: str | None = None,
+        init_z_offset: float = 0.0,
     ) -> None:
         robot_meta = meta["robot"]
         timing = meta["timing"]
@@ -648,9 +733,11 @@ class TrackerPolicy:
             articulation_path = f"{prim_path}/{root_prim_name}"
         else:
             articulation_path = self._find_articulation_root(prim_path)
+        self._articulation_path = articulation_path
         log.info(f"Articulation root prim: {articulation_path}")
         self._author_drive_gains(prim_path)
         self._author_body_properties(prim_path)
+        self._author_articulation_properties(articulation_path)
         self.robot = SingleArticulation(
             prim_path=articulation_path, name="tracker_robot"
         )
@@ -672,6 +759,17 @@ class TrackerPolicy:
         self.total_ort_ms = 0.0
         self.max_ref_err_run = 0.0
 
+        # Open-loop replay + initial-condition overrides (all inert by default,
+        # so the closed-loop path stays byte-for-byte what it was).
+        self.joint_friction_mode = joint_friction_mode
+        self.init_z_offset = float(init_z_offset)
+        self._init_state = self._load_init_state(init_state)
+        # Populated by _load_action_tape with the IsaacLab trajectory the replay
+        # is scored against; stays empty when running closed-loop.
+        self._tape_ref: dict = {}
+        self._action_tape = self._load_action_tape(action_tape)
+        self.divergence: list | None = None
+
         # Episode-local filter/history state -- reset every episode in reset_episode().
         self._isaac_to_policy: np.ndarray | None = None
         self._anchor_link_index: int | None = None
@@ -682,6 +780,150 @@ class TrackerPolicy:
         self._heading_offset: np.ndarray | None = None
         self._pd_targets_isaac: np.ndarray | None = None
         self._max_ref_err = 0.0
+
+    # ------------------------------------------------------------------
+    # Open-loop replay setup
+    # ------------------------------------------------------------------
+
+    def _load_init_state(self, path: str | None) -> dict | None:
+        """Load an ``init_state.json`` and check its joint order against ours.
+
+        The joint-name assertion is a hard error on purpose. A silent reorder
+        here would write every DOF's target onto the wrong joint, and the result
+        -- a robot that flails and falls -- looks exactly like the physics bug
+        this replay exists to isolate.
+        """
+        if path is None:
+            return None
+        with open(path) as f:
+            init = json.load(f)
+        names = list(init.get("joint_names", []))
+        if names != self.joint_names:
+            raise ValueError(
+                f"--init-state joint order does not match the policy's.\n"
+                f"  init_state: {names}\n"
+                f"  policy:     {self.joint_names}"
+            )
+        log.info(
+            f"Init state from {path}: root_pos="
+            f"{np.round(init['root_pos'], 4).tolist()} "
+            f"(recorded respawn offset {init.get('respawn_root_offset')})"
+        )
+        return init
+
+    def _load_action_tape(self, path: str | None) -> np.ndarray | None:
+        """Load the recorded ``processed_action`` sequence for open-loop replay.
+
+        Args:
+            path: Path to ``context_isaaclab.npz`` from
+                ``deployment/trace_tracker_isaaclab.py``.
+
+        Returns:
+            ``[steps, num_dofs]`` float32 array in *policy* joint order, or None.
+        """
+        if path is None:
+            return None
+        data = np.load(path, allow_pickle=True)
+        if "processed_action" not in data.files:
+            raise ValueError(f"{path} has no 'processed_action' array")
+        tape = np.asarray(data["processed_action"], dtype=np.float32)
+        if tape.ndim != 2 or tape.shape[1] != self.num_dofs:
+            raise ValueError(
+                f"Action tape has shape {tape.shape}; expected [steps, {self.num_dofs}]"
+            )
+        if "meta__joint_names" in data.files:
+            names = [str(n) for n in data["meta__joint_names"]]
+            if names != self.joint_names:
+                raise ValueError(
+                    f"Action tape joint order does not match the policy's.\n"
+                    f"  tape:   {names}\n"
+                    f"  policy: {self.joint_names}"
+                )
+        # The reference trajectory the replay is scored against.
+        self._tape_ref = {
+            k: np.asarray(data[k])
+            for k in ("state__dof_pos", "state__dof_vel", "state__root_pos")
+            if k in data.files
+        }
+        log.info(
+            f"Action tape from {path}: {tape.shape[0]} control steps, "
+            "policy is out of the loop."
+        )
+        return tape
+
+    def _replay_tape_step(self) -> None:
+        """Record the current state, then apply the next recorded action. No policy.
+
+        **Phase alignment is the whole point of this method's shape.** Isaac
+        Sim's physics callback fires *after* the substep it is passed (measured;
+        ``SimulationContext.add_physics_callback``'s "called before each physics
+        step" docstring is wrong), so a naive replay applies tape action *k* over
+        ``[5 + 20k, 25 + 20k]`` ms while IsaacLab applied it over
+        ``[20k, 20k + 20]``. That constant one-substep lead is enough on its own
+        to make an open-loop replay of a fast clip diverge, which would be read
+        as an actuator difference that is not there.
+
+        So the tape is anchored at reset instead: frame 0 is recorded and
+        ``tape[0]`` applied *before* any physics runs (see ``reset_episode``),
+        and every later call lands on a whole control-step boundary
+        (``t = 20k`` ms) -- exactly IsaacLab's read/apply points.
+
+        Deliberately does **not** advance ``_prev_actions`` / ``_prev_pd`` /
+        ``_prev_prev_pd`` / ``_ema_prev_targets`` / the heading offset: there is
+        no feedback loop to maintain, and touching them would let the filter
+        state of a run with no policy diverge from one with a policy for reasons
+        unrelated to physics.
+        """
+        if self._frame_idx >= len(self._action_tape):
+            self.done = True
+            return
+
+        dof_pos_isaac = _to_numpy(self.robot.get_joint_positions())
+        dof_vel_isaac = _to_numpy(self.robot.get_joint_velocities())
+        dof_pos = dof_pos_isaac[self._isaac_to_policy].astype(np.float32)
+        dof_vel = dof_vel_isaac[self._isaac_to_policy].astype(np.float32)
+
+        if self.divergence is not None and "state__dof_pos" in self._tape_ref:
+            ref_dof_pos = self._tape_ref["state__dof_pos"][self._frame_idx]
+            delta = np.abs(dof_pos - ref_dof_pos)
+            row = {
+                "frame": self._frame_idx,
+                "max_dof_delta": float(delta.max()),
+                "mean_dof_delta": float(delta.mean()),
+                "worst_joint": self.joint_names[int(delta.argmax())],
+                "dof_vel_rms": float(np.sqrt(np.mean(dof_vel**2))),
+            }
+            if "state__dof_vel" in self._tape_ref:
+                ref_vel = self._tape_ref["state__dof_vel"][self._frame_idx]
+                row["ref_dof_vel_rms"] = float(np.sqrt(np.mean(ref_vel**2)))
+            if "state__root_pos" in self._tape_ref:
+                root_pos, _ = self.robot.get_world_pose()
+                row["root_h"] = float(_to_numpy(root_pos)[2])
+                row["ref_root_h"] = float(
+                    self._tape_ref["state__root_pos"][self._frame_idx][2]
+                )
+            self.divergence.append(row)
+
+        self._record_trace(
+            dof_pos,
+            dof_vel,
+            self._read_anchor_rot(
+                wxyz_to_xyzw(_to_numpy(self.robot.get_world_pose()[1])).astype(
+                    np.float32
+                )
+            ),
+        )
+
+        # Apply this frame's action only after its state has been recorded, so
+        # the recorded state is the one the action acts on -- IsaacLab's order.
+        self._pd_targets_isaac = self._to_isaac_order(
+            self._action_tape[self._frame_idx]
+        )
+
+        self._frame_idx += 1
+        self._total_steps += 1
+        if self._frame_idx >= len(self._action_tape):
+            self.done = True
 
     # ------------------------------------------------------------------
     # Setup
@@ -798,6 +1040,45 @@ class TrackerPolicy:
             f"offsets on {n_colliders} colliders."
         )
 
+    def _author_articulation_properties(self, articulation_path: str) -> None:
+        """Apply training's ``ArticulationRootPropertiesCfg`` to the articulation root.
+
+        Only ``enabled_self_collisions`` needs handling here -- the solver
+        iteration counts in the same IsaacLab config block are already applied
+        through the physics view in :meth:`_apply_solver_iterations`.
+
+        This one is not a case of an unauthored attribute falling back to a
+        default that happens to differ. The G1 USD authors
+        ``physxArticulation:enabledSelfCollisions = False`` **explicitly**, while
+        ``protomotions/simulator/isaaclab/utils/scene.py`` passes
+        ``enabled_self_collisions=robot_config.asset.self_collisions``, which is
+        ``True`` for the G1. So training simulates leg-against-leg and
+        arm-against-torso contact and this driver did not -- the two solve
+        different collision problems for any motion where limbs come close.
+        """
+        props = self.joint_properties or {}
+        self_collisions = props.get("self_collisions")
+        if self_collisions is None:
+            return
+
+        stage = get_current_stage()
+        prim = stage.GetPrimAtPath(articulation_path)
+        if not prim.IsValid():
+            log.warning(
+                f"Cannot author articulation properties: '{articulation_path}' is "
+                "not a valid prim."
+            )
+            return
+
+        PhysxSchema.PhysxArticulationAPI.Apply(prim)
+        applied = _set_prim_attr(
+            prim, "physxArticulation:enabledSelfCollisions", bool(self_collisions)
+        )
+        log.info(
+            f"Articulation self-collisions -> {bool(self_collisions)} "
+            f"({'applied' if applied else 'attribute not declared'})."
+        )
+
     def _find_articulation_root(self, prim_path: str) -> str:
         """Locate the prim carrying ``UsdPhysics.ArticulationRootAPI``.
 
@@ -882,11 +1163,15 @@ class TrackerPolicy:
         vel_iters = props.get("solver_velocity_iterations")
         if pos_iters is not None:
             view.set_solver_position_iteration_counts(
-                np.array([int(pos_iters)], dtype=np.int32)
+                self._for_view(
+                    view, np.array([int(pos_iters)], dtype=np.int32), "int32"
+                )
             )
         if vel_iters is not None:
             view.set_solver_velocity_iteration_counts(
-                np.array([int(vel_iters)], dtype=np.int32)
+                self._for_view(
+                    view, np.array([int(vel_iters)], dtype=np.int32), "int32"
+                )
             )
         if pos_iters is not None or vel_iters is not None:
             log.info(f"Solver iterations: position={pos_iters} velocity={vel_iters}")
@@ -897,6 +1182,28 @@ class TrackerPolicy:
         out[self._isaac_to_policy] = np.asarray(policy_ordered, dtype=np.float32)
         return out
 
+    @staticmethod
+    def _for_view(view, array, dtype: str = "float32"):
+        """Convert a NumPy array to whatever tensor type the view's backend wants.
+
+        ``World(device="cuda:0", backend="torch")`` swaps the view's
+        ``_backend_utils`` for the torch implementation, whose helpers call
+        ``.cpu()`` on whatever they are handed -- so passing a NumPy array into
+        any ``set_*`` raises ``AttributeError: 'numpy.ndarray' object has no
+        attribute 'cpu'`` deep inside Isaac Sim. The default CPU/numpy backend
+        accepts NumPy directly, which is why the GPU path stayed broken while
+        the default one worked.
+        """
+        backend = getattr(view, "_backend_utils", None)
+        convert = getattr(backend, "convert", None)
+        if convert is None:
+            return array
+        return convert(array, device=getattr(view, "_device", None), dtype=dtype)
+
+    def _robot_array(self, array, dtype: str = "float32"):
+        """Convert an array for this articulation's backend. See :meth:`_for_view`."""
+        return self._for_view(self.robot._articulation_view, array, dtype)
+
     def _apply_joint_properties(self, view) -> None:
         """Apply PD gains, armature, effort and velocity limits in Isaac Sim DOF order."""
         stiffness_isaac = self._to_isaac_order(self.stiffness)
@@ -906,7 +1213,10 @@ class TrackerPolicy:
         controller.set_effort_modes("force")
         controller.switch_control_mode("position")
         # switch_control_mode() restores the USD default gains, so set ours after.
-        view.set_gains(stiffness_isaac[None], damping_isaac[None])
+        view.set_gains(
+            self._for_view(view, stiffness_isaac[None]),
+            self._for_view(view, damping_isaac[None]),
+        )
 
         props = self.joint_properties or {}
 
@@ -917,7 +1227,9 @@ class TrackerPolicy:
         if effort_limits is None:
             effort_limits = props.get("effort_limit")
         if effort_limits is not None:
-            view.set_max_efforts(self._to_isaac_order(effort_limits)[None])
+            view.set_max_efforts(
+                self._for_view(view, self._to_isaac_order(effort_limits)[None])
+            )
             log.info("Applied per-joint effort limits.")
         else:
             log.warning(
@@ -929,7 +1241,9 @@ class TrackerPolicy:
         # from it, e.g. the G1's BeyondMimic gains (kp = armature * w_n**2).
         armature = props.get("armature")
         if armature is not None:
-            view.set_armatures(self._to_isaac_order(armature)[None])
+            view.set_armatures(
+                self._for_view(view, self._to_isaac_order(armature)[None])
+            )
             log.info("Applied per-joint armature.")
         else:
             log.warning(
@@ -942,12 +1256,53 @@ class TrackerPolicy:
         # clamp is active and its absence is a real difference from training.
         velocity_limits = props.get("velocity_limit")
         if velocity_limits is not None:
-            view.set_max_joint_velocities(self._to_isaac_order(velocity_limits)[None])
+            view.set_max_joint_velocities(
+                self._for_view(view, self._to_isaac_order(velocity_limits)[None])
+            )
             log.info("Applied per-joint velocity limits.")
         else:
             log.warning(
                 "No velocity limits available -- joints run unclamped, unlike training."
             )
+
+        self._apply_joint_friction(view, props)
+
+    def _apply_joint_friction(self, view, props: dict) -> None:
+        """Apply the robot config's per-joint Coulomb friction.
+
+        Training passes ``friction=control_info[j].friction`` into
+        ``ImplicitActuatorCfg`` (``protomotions/simulator/isaaclab/utils/scene.py``),
+        and every G1 joint resolves to 0.1 from the MJCF
+        (``protomotions/robot_configs/base.py``). This driver did not apply it at
+        all, which leaves the joints with strictly less dissipation than
+        training -- the under-damped, oscillating-distal-limb signature.
+
+        The read-back is not decoration: ``ArticulationView._on_post_reset()``
+        re-applies the articulation's *default* gains, and anything set before it
+        runs is silently reverted. Logging what PhysX actually holds is the only
+        way to know this landed -- the same trap ``post_reset()`` already
+        documents for the gains.
+        """
+        friction = props.get("friction")
+        if self.joint_friction_mode == "off" or friction is None:
+            if self.joint_friction_mode == "on":
+                log.warning(
+                    "--joint-friction on, but the robot config supplies no "
+                    "per-joint friction; joints run frictionless, unlike training."
+                )
+            return
+
+        view.set_friction_coefficients(
+            self._for_view(view, self._to_isaac_order(friction)[None])
+        )
+        try:
+            readback = _to_numpy(view.get_friction_coefficients()).reshape(-1)
+            log.info(
+                f"Applied per-joint friction (PhysX read-back: "
+                f"min={readback.min():.4f} max={readback.max():.4f})."
+            )
+        except Exception as e:  # pragma: no cover - depends on Isaac Sim version
+            log.warning(f"Applied per-joint friction, but read-back failed: {e}")
 
     # ------------------------------------------------------------------
     # Episode lifecycle
@@ -973,14 +1328,41 @@ class TrackerPolicy:
         therefore only raises ``_pending_reset``; the main loop drains it between
         steps.
         """
-        frame0 = self.motion_player.get_state_at_frame(0)
-        root_pos = frame0["body_pos"][0]
-        root_quat_xyzw = frame0["body_rot"][0]
-        root_quat_wxyz = root_quat_xyzw[[3, 0, 1, 2]]
-        self.robot.set_world_pose(position=root_pos, orientation=root_quat_wxyz)
+        if self._init_state is not None:
+            # Replay IsaacLab's own post-reset state, read back from its
+            # simulator. Preserves the write order below exactly -- pose, then
+            # joint positions, then velocities, then the FK refresh.
+            init = self._init_state
+            root_pos = np.asarray(init["root_pos"], dtype=np.float32)
+            root_quat_xyzw = np.asarray(init["root_rot_xyzw"], dtype=np.float32)
+            dof_pos_policy = np.asarray(init["dof_pos"], dtype=np.float32)
+            dof_vel_policy = np.asarray(init["dof_vel"], dtype=np.float32)
+            root_lin_vel = np.asarray(init["root_lin_vel"], dtype=np.float32)
+            root_ang_vel = np.asarray(init["root_ang_vel"], dtype=np.float32)
+        else:
+            frame0 = self.motion_player.get_state_at_frame(0)
+            root_pos = np.asarray(frame0["body_pos"][0], dtype=np.float32)
+            root_quat_xyzw = frame0["body_rot"][0]
+            dof_pos_policy = frame0["dof_pos"]
+            dof_vel_policy = frame0["dof_vel"]
+            root_lin_vel = np.asarray(frame0["body_vel"][0], dtype=np.float32)
+            root_ang_vel = np.asarray(frame0["body_ang_vel"][0], dtype=np.float32)
 
-        dof_pos_isaac = self._to_isaac_order(frame0["dof_pos"])
-        self.robot.set_joint_positions(dof_pos_isaac)
+        # ProtoMotions resets the robot ref_respawn_offset (0.05 m) above the
+        # reference pose; this driver spawns flush. --init-z-offset makes that
+        # difference testable instead of assumed.
+        if self.init_z_offset:
+            root_pos = root_pos.copy()
+            root_pos[2] += self.init_z_offset
+
+        root_quat_wxyz = np.asarray(root_quat_xyzw)[[3, 0, 1, 2]]
+        self.robot.set_world_pose(
+            position=self._robot_array(root_pos),
+            orientation=self._robot_array(root_quat_wxyz),
+        )
+
+        dof_pos_isaac = self._to_isaac_order(dof_pos_policy)
+        self.robot.set_joint_positions(self._robot_array(dof_pos_isaac))
 
         # Start from the reference *velocities*, not from rest. ProtoMotions'
         # reference-state initialization seeds root and joint velocities from the
@@ -988,13 +1370,11 @@ class TrackerPolicy:
         # distribution -- dropping a moving clip in at zero velocity is off-
         # distribution for exactly the first few control steps that decide whether
         # the episode stays on its feet.
-        self.robot.set_joint_velocities(self._to_isaac_order(frame0["dof_vel"]))
-        self.robot.set_linear_velocity(
-            np.asarray(frame0["body_vel"][0], dtype=np.float32)
+        self.robot.set_joint_velocities(
+            self._robot_array(self._to_isaac_order(dof_vel_policy))
         )
-        self.robot.set_angular_velocity(
-            np.asarray(frame0["body_ang_vel"][0], dtype=np.float32)
-        )
+        self.robot.set_linear_velocity(self._robot_array(root_lin_vel))
+        self.robot.set_angular_velocity(self._robot_array(root_ang_vel))
 
         # Link transforms lag the joint state we just wrote until the kinematics
         # are refreshed. Without this the first _compute_action() -- which is
@@ -1011,6 +1391,12 @@ class TrackerPolicy:
         self._heading_offset = None
         self._pd_targets_isaac = dof_pos_isaac.copy()
         self._max_ref_err = 0.0
+
+        # Open-loop replay is anchored here, before any physics runs: record
+        # frame 0 from the reset state and load tape[0], so the tape's action k
+        # spans the same window IsaacLab applied it over. See _replay_tape_step.
+        if self._action_tape is not None:
+            self._replay_tape_step()
 
         log.info(
             f"--- Loop {self._loop_idx + 1}"
@@ -1059,12 +1445,13 @@ class TrackerPolicy:
 
     def _read_robot_state(self):
         """Read current DOF state (reordered to policy order) + anchor/root orientation."""
-        dof_pos_isaac = np.asarray(self.robot.get_joint_positions())
-        dof_vel_isaac = np.asarray(self.robot.get_joint_velocities())
+        dof_pos_isaac = _to_numpy(self.robot.get_joint_positions())
+        dof_vel_isaac = _to_numpy(self.robot.get_joint_velocities())
         dof_pos = dof_pos_isaac[self._isaac_to_policy].astype(np.float32)
         dof_vel = dof_vel_isaac[self._isaac_to_policy].astype(np.float32)
 
         _, root_quat_wxyz = self.robot.get_world_pose()
+        root_quat_wxyz = _to_numpy(root_quat_wxyz)
         root_quat = wxyz_to_xyzw(root_quat_wxyz).astype(np.float32)
 
         # Angular-velocity frame: `SingleArticulation.get_angular_velocity()` returns
@@ -1075,7 +1462,7 @@ class TrackerPolicy:
         # has no body-frame variant of this getter; if a future API returns body-frame
         # velocity, the inverse rotation below must be dropped, not kept.)
         root_ang_vel_world = np.asarray(
-            self.robot.get_angular_velocity(), dtype=np.float32
+            _to_numpy(self.robot.get_angular_velocity()), dtype=np.float32
         )
         root_local_ang_vel = compute_root_local_ang_vel_np(
             rigid_body_rot=root_quat[None, :],
@@ -1088,7 +1475,9 @@ class TrackerPolicy:
         return dof_pos, dof_vel, anchor_rot, root_local_ang_vel
 
     def _compute_action(self) -> None:
-
+        # Never reached under --action-tape: forward() routes the open-loop
+        # replay to _replay_tape_step instead, so the ONNX session is never
+        # called and no filter state is touched.
         dof_pos, dof_vel, anchor_rot, root_local_ang_vel = self._read_robot_state()
 
         # Heading offset: aligns the reference motion's yaw to the robot's yaw at
@@ -1186,7 +1575,7 @@ class TrackerPolicy:
         root_pos, _ = self.robot.get_world_pose()
         log.info(
             f"  step={self._total_steps:5d}  frame={self._frame_idx:4d}  "
-            f"root_h={float(np.asarray(root_pos)[2]):.3f}  "
+            f"root_h={float(_to_numpy(root_pos)[2]):.3f}  "
             f"max_ref_err={self._max_ref_err:.4f}"
         )
 
@@ -1195,38 +1584,54 @@ class TrackerPolicy:
     ) -> None:
         """Append this control step's tracking error to the trace buffer.
 
-        Columns match the cross-simulator comparison table in
-        ``docs/isaacsim_g1_tracker_instability_findings.md`` so a run here is
-        directly comparable to the IsaacLab and MuJoCo numbers.
+        Columns come from ``deployment.state_utils.make_trace_row``, shared with
+        the MuJoCo and IsaacLab harnesses, so a run here is directly comparable
+        to the numbers in ``logs/isaacsim_g1_tracker_instability_findings.md``.
         """
         if self.trace is None:
             return
         ref = self.motion_player.get_state_at_frame(self._frame_idx)
         root_pos, _ = self.robot.get_world_pose()
         self.trace.append(
-            {
-                "loop": self._loop_idx,
-                "frame": self._frame_idx,
-                "root_h": float(np.asarray(root_pos)[2]),
-                "ref_h": float(ref["body_pos"][0][2]),
-                "tilt": _tilt_deg_xyzw(anchor_rot),
-                "ref_tilt": _tilt_deg_xyzw(ref["body_rot"][self.anchor_body_index]),
-                "joint_err": float(np.abs(dof_pos - ref["dof_pos"]).mean()),
-                "dof_vel_rms": float(np.sqrt(np.mean(dof_vel**2))),
-                "dof_vel_peak": float(np.abs(dof_vel).max()),
-            }
+            make_trace_row(
+                loop=self._loop_idx,
+                frame=self._frame_idx,
+                root_h=float(_to_numpy(root_pos)[2]),
+                ref_h=float(ref["body_pos"][0][2]),
+                anchor_rot_xyzw=anchor_rot,
+                ref_anchor_rot_xyzw=ref["body_rot"][self.anchor_body_index],
+                dof_pos=dof_pos,
+                ref_dof_pos=ref["dof_pos"],
+                dof_vel=dof_vel,
+            )
         )
 
     def forward(self, dt: float) -> None:
-        """Physics-callback entry point -- called once per physics substep."""
+        """Physics-callback entry point -- called once per physics substep.
+
+        Note the callback fires *after* the substep it is passed, despite
+        ``SimulationContext.add_physics_callback``'s docstring saying otherwise
+        (measured). The closed-loop path is unaffected -- it reads state and
+        immediately applies the resulting target, so it is self-consistent
+        whatever the phase -- but the open-loop replay has to count completed
+        substeps to land on IsaacLab's control-step boundaries, hence the
+        separate branch.
+        """
         if self.done:
             return
-        if self._decimation_counter % self.decimation == 0:
-            self._compute_action()
+        if self._action_tape is not None:
+            self._decimation_counter += 1
+            if self._decimation_counter % self.decimation == 0:
+                self._replay_tape_step()
+        else:
+            if self._decimation_counter % self.decimation == 0:
+                self._compute_action()
+            self._decimation_counter += 1
         self.robot.apply_action(
-            ArticulationAction(joint_positions=self._pd_targets_isaac)
+            ArticulationAction(
+                joint_positions=self._robot_array(self._pd_targets_isaac)
+            )
         )
-        self._decimation_counter += 1
 
     # ------------------------------------------------------------------
     # Summary
@@ -1247,6 +1652,133 @@ class TrackerPolicy:
             f"  max joint ref error: {self.max_ref_err_run:.4f} rad"
         )
 
+    def dump_physx_properties(self) -> None:
+        """Diff every per-joint property PhysX holds against the robot config.
+
+        Must run **after** ``post_reset()``: ``ArticulationView._on_post_reset()``
+        re-applies the articulation's USD-authored defaults, so anything read
+        before it is not what the solver will actually use.
+
+        Reads are reported in *policy* joint order so a row lines up with the
+        joint names the ONNX contract uses.
+        """
+        view = self.robot._articulation_view
+        props = self.joint_properties or {}
+
+        def _getter(name: str):
+            """Resolve a view getter lazily; not every setter has a matching one.
+
+            ``set_max_joint_velocities`` exists with no ``get_`` counterpart in
+            this Isaac Sim version, so resolving the whole table eagerly makes
+            one missing getter abort the entire dump.
+            """
+
+            def call():
+                fn = getattr(view, name, None)
+                if fn is None:
+                    raise AttributeError(f"view has no {name}()")
+                return fn()
+
+            return call
+
+        readers = {
+            "stiffness": (lambda: view.get_gains()[0], np.asarray(self.stiffness)),
+            "damping": (lambda: view.get_gains()[1], np.asarray(self.damping)),
+            "armature": (_getter("get_armatures"), props.get("armature")),
+            "effort_limit": (_getter("get_max_efforts"), props.get("effort_limit")),
+            "velocity_limit": (
+                _getter("get_max_joint_velocities"),
+                props.get("velocity_limit"),
+            ),
+            "friction": (
+                _getter("get_friction_coefficients"),
+                props.get("friction"),
+            ),
+        }
+
+        # Articulation-level settings. IsaacLab authors these through
+        # ArticulationRootPropertiesCfg (scene.py); the USD leaves
+        # enabledSelfCollisions unauthored, so the driver inherits PhysX's
+        # default rather than the configured value.
+        stage = get_current_stage()
+        root_prim = stage.GetPrimAtPath(self._articulation_path)
+        for attr_name in (
+            "physxArticulation:enabledSelfCollisions",
+            "physxArticulation:solverPositionIterationCount",
+            "physxArticulation:solverVelocityIterationCount",
+            "physxArticulation:sleepThreshold",
+            "physxArticulation:stabilizationThreshold",
+        ):
+            attr = root_prim.GetAttribute(attr_name)
+            if attr:
+                log.info(
+                    f"  {attr_name:52s} = {attr.Get()} (authored={attr.IsAuthored()})"
+                )
+            else:
+                log.info(f"  {attr_name:52s} = <not declared>")
+
+        log.info("\n=== PhysX read-back vs robot config (policy joint order) ===")
+        for name, (reader, expected) in readers.items():
+            try:
+                actual = _to_numpy(reader()).reshape(-1)[self._isaac_to_policy]
+            except Exception as e:  # pragma: no cover - version dependent
+                log.warning(f"  {name:15s} read-back failed: {e}")
+                continue
+            if expected is None:
+                log.info(
+                    f"  {name:15s} physx=[{actual.min():.4f}, {actual.max():.4f}] "
+                    "  (config supplies no value to compare)"
+                )
+                continue
+            expected = np.asarray(expected, dtype=np.float64).reshape(-1)
+            delta = np.abs(actual - expected)
+            worst = int(delta.argmax())
+            verdict = "OK" if delta.max() < 1e-4 else "MISMATCH"
+            log.info(
+                f"  {name:15s} {verdict:8s} max|d|={delta.max():.6f} "
+                f"(worst {self.joint_names[worst]}: physx={actual[worst]:.4f} "
+                f"config={expected[worst]:.4f})"
+            )
+
+    def write_divergence(self, path: str) -> None:
+        """Dump the open-loop divergence against the IsaacLab trajectory.
+
+        Reports the first control step at which ``|Δdof_pos|∞`` crosses 0.02,
+        0.05 and 0.10 rad, and which joint led. Contact-rich open-loop replay
+        always diverges eventually; **when** and on which joint is the signal,
+        not whether.
+        """
+        if not self.divergence:
+            log.warning("No divergence recorded -- nothing written.")
+            return
+        with open(path, "w") as f:
+            json.dump(self.divergence, f)
+
+        delta = np.array([r["max_dof_delta"] for r in self.divergence])
+        lines = []
+        for threshold in (0.02, 0.05, 0.10):
+            crossed = np.nonzero(delta > threshold)[0]
+            if len(crossed):
+                k = int(crossed[0])
+                lines.append(
+                    f"  first |d dof|inf > {threshold:.2f} rad : step {k:4d} "
+                    f"({k * self.control_dt:.2f}s, joint "
+                    f"{self.divergence[k]['worst_joint']})"
+                )
+            else:
+                lines.append(f"  first |d dof|inf > {threshold:.2f} rad : never")
+
+        rms = np.array([r["dof_vel_rms"] for r in self.divergence])
+        ref_rms = np.array([r.get("ref_dof_vel_rms", np.nan) for r in self.divergence])
+        log.info(
+            f"\n=== Open-loop divergence ({len(self.divergence)} steps) -> {path} ===\n"
+            + "\n".join(lines)
+            + f"\n  mean |d dof|inf     : {delta.mean():.4f} rad\n"
+            f"  final |d dof|inf    : {delta[-1]:.4f} rad\n"
+            f"  mean dof_vel_rms    : driver {rms.mean():.3f}  "
+            f"isaaclab {np.nanmean(ref_rms):.3f}"
+        )
+
     def write_trace(self, path: str) -> None:
         """Dump the per-control-step trace and print its summary."""
         if not self.trace:
@@ -1255,14 +1787,9 @@ class TrackerPolicy:
         with open(path, "w") as f:
             json.dump(self.trace, f)
 
-        col = {k: np.array([r[k] for r in self.trace]) for k in self.trace[0]}
         log.info(
             f"\n=== Tracking trace ({len(self.trace)} control steps) -> {path} ===\n"
-            f"  mean joint err      : {col['joint_err'].mean():.4f} rad\n"
-            f"  mean |root_h - ref| : {np.abs(col['root_h'] - col['ref_h']).mean():.4f} m\n"
-            f"  mean |tilt - ref|   : {np.abs(col['tilt'] - col['ref_tilt']).mean():.2f} deg\n"
-            f"  mean rms dof_vel    : {col['dof_vel_rms'].mean():.3f}\n"
-            f"  peak dof_vel        : {col['dof_vel_peak'].max():.1f} rad/s"
+            + summarize_trace(self.trace)
         )
 
 
@@ -1274,11 +1801,24 @@ class TrackerPolicy:
 def _configure_physics_scene(world, robot_props: dict) -> None:
     """Match the PhysX scene settings training runs with.
 
-    ``World``'s defaults differ from both ``physx_env.yaml`` and ProtoMotions'
-    IsaacLab config in three ways that matter: contact stabilization is off, CCD
-    is on, and the bounce threshold is 0 (so every contact is treated as
-    bouncing). Solver type, friction offset and correlation distance already
-    agree.
+    ``World``'s defaults differ from ProtoMotions' IsaacLab config in two ways
+    that matter: CCD is on, and the bounce threshold is 0 (so every contact is
+    treated as bouncing). Solver type, friction offset and correlation distance
+    already agree.
+
+    **Stabilization is deliberately not touched here.** Every layer of the stack
+    leaves ``physxScene:enableStabilization`` off -- the USD schema default is 0,
+    ``PhysicsContext`` sets ``False`` on the ``set_defaults=True, sim_params=None``
+    path that ``World(...)`` takes, ``isaaclab/sim/simulation_cfg.py`` defaults it
+    to ``False``, and ProtoMotions never overrides it. An earlier revision of this
+    function turned it *on*, which was a unilateral deviation from training, not a
+    match to it. (``PhysicsContext``'s class docstring lists
+    ``stabilization_enabled`` among its defaults; the docstring is wrong, the code
+    is right -- do not trust it.)
+
+    The ``enable_ccd(False)`` call below is load-bearing for the same reason in
+    reverse: the ``set_defaults`` path enables CCD on the CPU pipeline, which
+    training does not.
 
     Must be called **after** ``world.reset()``: ``PhysicsContext`` re-applies its
     own cached values when the sim starts playing, so anything written on the
@@ -1286,8 +1826,6 @@ def _configure_physics_scene(world, robot_props: dict) -> None:
     """
     ctx = world.get_physics_context()
 
-    # Training (and physx_env.yaml) run with stabilization on and CCD off.
-    ctx.enable_stablization(True)  # NB: Isaac Sim spells it this way
     ctx.enable_ccd(False)
     ctx.set_solver_type("TGS")
 
@@ -1296,7 +1834,8 @@ def _configure_physics_scene(world, robot_props: dict) -> None:
         ctx.set_bounce_threshold(float(bounce))
 
     log.info(
-        "PhysX scene: stabilization=True ccd=False solver=TGS "
+        "PhysX scene: ccd=False solver=TGS "
+        f"stabilization={ctx.is_stablization_enabled()} "
         f"bounce_threshold={ctx.get_bounce_threshold():.3f} "
         f"gpu_dynamics={ctx.is_gpu_dynamics_enabled()}"
     )
@@ -1400,12 +1939,20 @@ def main() -> None:
         motion_index=args.motion_index,
         robot_name=args.robot or None,
         physics_dt=physics_dt,
+        joint_friction_mode=args.joint_friction,
+        action_tape=args.action_tape,
+        init_state=args.init_state,
+        init_z_offset=args.init_z_offset,
     )
     policy.num_loops = (
         args.loops if args.loops is not None else (1 if args.headless else 10_000_000)
     )
     if args.trace_out:
         policy.trace = []
+    if args.tape_divergence_out:
+        if args.action_tape is None:
+            raise SystemExit("--tape-divergence-out requires --action-tape")
+        policy.divergence = []
 
     if not args.headless:
         # Frame the pelvis at its motion-frame-0 pose; the robot starts there.
@@ -1419,6 +1966,10 @@ def main() -> None:
     _configure_physics_scene(world, robot_props)
     policy.initialize()
     policy.post_reset()
+    if args.dump_physx_properties:
+        policy.dump_physx_properties()
+        simulation_app.close()
+        return
     world.add_physics_callback("tracker_policy_step", callback_fn=policy.forward)
 
     # Real-time pacing only makes sense when there is something to watch; a
@@ -1444,6 +1995,8 @@ def main() -> None:
     policy.log_summary(total_sim_ms)
     if args.trace_out:
         policy.write_trace(args.trace_out)
+    if args.tape_divergence_out:
+        policy.write_divergence(args.tape_divergence_out)
 
     simulation_app.close()
 

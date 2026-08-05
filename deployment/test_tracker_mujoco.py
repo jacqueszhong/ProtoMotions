@@ -145,6 +145,8 @@ from deployment.state_utils import (
     compute_root_local_ang_vel_np,
     compute_yaw_offset_np,
     apply_heading_offset_np,
+    make_trace_row,
+    summarize_trace,
 )
 from deployment.motion_utils import MotionPlayer
 
@@ -319,13 +321,6 @@ def load_mujoco_model(
     log.info(f"  {num_actuators} actuators configured with implicit PD")
     log.info(f"  {model.nbody} bodies, {model.nq} qpos, {model.nv} qvel")
     return model, data
-
-
-def _tilt_deg_xyzw(quat_xyzw) -> float:
-    """Angle in degrees between the body's local +z axis and world +z."""
-    x, y, _z, _w = np.asarray(quat_xyzw, dtype=np.float64)
-    cos_tilt = 1.0 - 2.0 * (x * x + y * y)
-    return float(np.degrees(np.arccos(np.clip(cos_tilt, -1.0, 1.0))))
 
 
 def read_robot_state(data, anchor_body_index: int, root_body_index: int = 0):
@@ -774,17 +769,17 @@ def run(
 
             if trace is not None:
                 anchor_quat = mujoco_wxyz_to_xyzw(data.xquat[anchor_body_index + 1])
-                trace.append({
-                    "loop":         loop_idx,
-                    "frame":        frame_idx,
-                    "root_h":       float(data.qpos[2]),
-                    "ref_h":        float(ref["body_pos"][0][2]),
-                    "tilt":         _tilt_deg_xyzw(anchor_quat),
-                    "ref_tilt":     _tilt_deg_xyzw(ref["body_rot"][anchor_body_index]),
-                    "joint_err":    float(np.abs(data.qpos[7:] - ref_dof_pos).mean()),
-                    "dof_vel_rms":  float(np.sqrt(np.mean(data.qvel[6:] ** 2))),
-                    "dof_vel_peak": float(np.abs(data.qvel[6:]).max()),
-                })
+                trace.append(make_trace_row(
+                    loop=loop_idx,
+                    frame=frame_idx,
+                    root_h=float(data.qpos[2]),
+                    ref_h=float(ref["body_pos"][0][2]),
+                    anchor_rot_xyzw=anchor_quat,
+                    ref_anchor_rot_xyzw=ref["body_rot"][anchor_body_index],
+                    dof_pos=data.qpos[7:],
+                    ref_dof_pos=ref_dof_pos,
+                    dof_vel=data.qvel[6:],
+                ))
 
             # ---- viewer ----
             if viewer is not None:
@@ -833,14 +828,9 @@ def run(
     if trace:
         with open(trace_out, "w") as f:
             json.dump(trace, f)
-        col = {k: np.array([r[k] for r in trace]) for k in trace[0]}
         log.info(
             f"\n=== Tracking trace ({len(trace)} control steps) -> {trace_out} ===\n"
-            f"  mean joint err      : {col['joint_err'].mean():.4f} rad\n"
-            f"  mean |root_h - ref| : {np.abs(col['root_h'] - col['ref_h']).mean():.4f} m\n"
-            f"  mean |tilt - ref|   : {np.abs(col['tilt'] - col['ref_tilt']).mean():.2f} deg\n"
-            f"  mean rms dof_vel    : {col['dof_vel_rms'].mean():.3f}\n"
-            f"  peak dof_vel        : {col['dof_vel_peak'].max():.1f} rad/s"
+            + summarize_trace(trace)
         )
 
     if viewer is not None:
