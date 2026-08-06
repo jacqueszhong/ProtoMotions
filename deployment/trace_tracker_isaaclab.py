@@ -113,6 +113,17 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--seed", type=int, default=0, help="Seed for torch/numpy")
     p.add_argument(
+        "--dump-material-stack",
+        action="store_true",
+        default=False,
+        help=(
+            "After env.reset(), read the robot/ground physics materials and "
+            "collider offsets back from the live stage and physics view, then "
+            "exit. The IsaacLab half of test_tracker_isaacsim.py's "
+            "--dump-physx-properties; the two logs are meant to be diffed."
+        ),
+    )
+    p.add_argument(
         "--action-tape",
         default=None,
         help=(
@@ -356,6 +367,198 @@ class TraceRecorder:
         log.info(f"Context/state arrays ({len(self.trace)} steps) -> {npz_path}")
 
 
+def dump_material_stack(env) -> None:
+    """Read back both operands of every foot-ground friction pair (E1).
+
+    The IsaacLab half of ``test_tracker_isaacsim.py --dump-physx-properties``.
+    Effective friction at a footfall is
+    ``combine(robot_shape_material, ground_material)``, and neither operand is
+    written in any ProtoMotions config file for the robot side: the G1 USD binds
+    no physics material to its 29 colliders, and IsaacLab silently supplies the
+    missing one by spawning ``SimulationCfg.physics_material`` and binding it to
+    the ``/physicsScene`` prim -- PhysX's documented fallback for unbound shapes.
+    That binding is half of every friction calculation the policy ever saw during
+    training, so it has to be read back rather than assumed.
+
+    Printed in the same shape as the driver's dump so the two logs diff by eye.
+
+    Uses ``print`` rather than ``log``: booting Kit reconfigures Python logging
+    out from under this module (see the note at the AppLauncher call), and this
+    dump is the whole output of the run -- it must not be the thing that gets
+    swallowed.
+    """
+    from pxr import Usd, UsdPhysics, UsdShade
+    from isaacsim.core.utils.stage import get_current_stage
+
+    def emit(msg: str) -> None:
+        print(msg, flush=True)
+
+    def bound_material(prim):
+        try:
+            api = UsdShade.MaterialBindingAPI(prim)
+            material, _rel = api.ComputeBoundMaterial(
+                UsdShade.Tokens.physics
+                if hasattr(UsdShade.Tokens, "physics")
+                else "physics"
+            )
+        except Exception as e:  # pragma: no cover - USD version dependent
+            log.debug(f"{prim.GetPath()}: material binding query failed: {e}")
+            return None
+        if not material:
+            return None
+        mat_prim = material.GetPrim()
+        if not mat_prim.IsValid() or not mat_prim.HasAPI(UsdPhysics.MaterialAPI):
+            return None
+        return mat_prim
+
+    def describe_material(mat_prim) -> str:
+        if mat_prim is None:
+            return "<no material bound -- PhysX built-in fallback>"
+        fields = []
+        for attr_name in (
+            "physics:staticFriction",
+            "physics:dynamicFriction",
+            "physics:restitution",
+            "physxMaterial:frictionCombineMode",
+            "physxMaterial:restitutionCombineMode",
+        ):
+            attr = mat_prim.GetAttribute(attr_name)
+            short = attr_name.split(":")[-1]
+            if not attr:
+                fields.append(f"{short}=<undeclared>")
+                continue
+            value = attr.Get()
+            mark = "" if attr.IsAuthored() else "*"
+            fields.append(
+                f"{short}={value:.4g}{mark}"
+                if isinstance(value, float)
+                else f"{short}={value}{mark}"
+            )
+        return f"{mat_prim.GetPath()}  " + " ".join(fields)
+
+    def describe_offsets(prim) -> str:
+        fields = []
+        for attr_name in ("physxCollision:contactOffset", "physxCollision:restOffset"):
+            attr = prim.GetAttribute(attr_name)
+            short = attr_name.split(":")[-1]
+            if not attr:
+                fields.append(f"{short}=<undeclared>")
+                continue
+            mark = "" if attr.IsAuthored() else "*(auto)"
+            fields.append(f"{short}={attr.Get()}{mark}")
+        return " ".join(fields)
+
+    def colliders_under(stage, root_path: str) -> list:
+        root = stage.GetPrimAtPath(root_path)
+        if not root.IsValid():
+            return []
+        return [
+            p
+            for p in Usd.PrimRange(
+                root, Usd.TraverseInstanceProxies(Usd.PrimAllPrimsPredicate)
+            )
+            if p.HasAPI(UsdPhysics.CollisionAPI)
+        ]
+
+    stage = get_current_stage()
+    robot = env.simulator._robot
+
+    # --- per-joint solver properties, straight from PhysX ------------------
+    # The driver's --dump-physx-properties diffs PhysX against the *robot
+    # config*. That cannot catch a difference in how the two stacks get their
+    # numbers into PhysX -- a unit convention, an actuator model that rewrites
+    # them, a setter that silently no-ops. Reading the same tensor API on both
+    # sides and diffing PhysX-against-PhysX can.
+    emit("\n=== Per-joint PhysX properties (IsaacLab, sim joint order) ===")
+    view = robot.root_physx_view
+    emit(f"  sim joint order: {list(robot.data.joint_names)}")
+    readers = {
+        "stiffness": "get_dof_stiffnesses",
+        "damping": "get_dof_dampings",
+        "armature": "get_dof_armatures",
+        "friction": "get_dof_friction_coefficients",
+        "max_velocity": "get_dof_max_velocities",
+        "max_effort": "get_dof_max_forces",
+    }
+    for label, method in readers.items():
+        fn = getattr(view, method, None)
+        if fn is None:
+            emit(f"  {label:14s} <view has no {method}()>")
+            continue
+        try:
+            vals = np.asarray(fn().cpu().numpy()).reshape(-1)
+        except Exception as e:  # pragma: no cover - version dependent
+            emit(f"  {label:14s} read-back failed: {e}")
+            continue
+        emit(
+            f"  {label:14s} min={vals.min():.4f} max={vals.max():.4f} "
+            f"values={np.round(vals, 4).tolist()}"
+        )
+
+    emit("\n=== Material stack (foot-ground friction pair) ===")
+
+    try:
+        mats = robot.root_physx_view.get_material_properties().cpu().numpy()
+        flat = mats.reshape(-1, mats.shape[-1])
+        emit(
+            f"  robot physics-view materials: shape={tuple(mats.shape)} "
+            "(env x shape x [static, dynamic, restitution])"
+        )
+        for col, label in enumerate(
+            ("static_friction", "dynamic_friction", "restitution")
+        ):
+            if col >= flat.shape[1]:
+                break
+            vals = flat[:, col]
+            uniq = np.unique(np.round(vals, 6))
+            emit(
+                f"    {label:18s} min={vals.min():.4f} max={vals.max():.4f} "
+                f"unique={uniq[:8].tolist()}{' ...' if len(uniq) > 8 else ''}"
+            )
+    except Exception as e:  # pragma: no cover - version dependent
+        emit(f"  robot physics-view material read-back failed: {e}")
+
+    robot_root = str(robot.cfg.prim_path).replace(".*", "0")
+    robot_colliders = colliders_under(stage, robot_root)
+    bound = [p for p in robot_colliders if bound_material(p) is not None]
+    emit(
+        f"  robot root prim: {robot_root} -- {len(robot_colliders)} colliders, "
+        f"{len(bound)} with a bound physics material"
+    )
+    feet = [
+        p
+        for p in robot_colliders
+        if any(k in p.GetPath().pathString.lower() for k in ("ankle_roll", "foot"))
+    ]
+    sample = feet[0] if feet else (robot_colliders[0] if robot_colliders else None)
+    if sample is not None:
+        emit(f"  sample foot collider : {sample.GetPath()}")
+        emit(f"    material : {describe_material(bound_material(sample))}")
+        emit(f"    offsets  : {describe_offsets(sample)}")
+
+    for scene_prim in [
+        p for p in stage.Traverse() if p.GetTypeName() == "PhysicsScene"
+    ]:
+        emit(f"  physics scene prim   : {scene_prim.GetPath()}")
+        emit(
+            f"    scene default material : "
+            f"{describe_material(bound_material(scene_prim))}"
+        )
+
+    ground_colliders = colliders_under(stage, "/World/ground")
+    if not ground_colliders:
+        emit("  no collider found under /World/ground")
+    for prim in ground_colliders[:2]:
+        emit(f"  ground collider      : {prim.GetPath()} ({prim.GetTypeName()})")
+        emit(f"    material : {describe_material(bound_material(prim))}")
+        emit(f"    offsets  : {describe_offsets(prim)}")
+
+    emit(
+        "  (trailing '*' = value is the schema default, unauthored by any layer; "
+        "'*(auto)' = PhysX derives it from shape size)"
+    )
+
+
 def dump_init_state(env, out_dir: Path, joint_names: list) -> None:
     """Read the post-reset state back from the simulator and write it to JSON.
 
@@ -452,6 +655,22 @@ def main() -> None:
         {"headless": args.headless, "device": str(fabric.device)}
     )
 
+    # Booting Kit silences this module's logger two separate ways, so both have to
+    # be undone or everything logged below -- dump_init_state, the trace summary,
+    # the material dump -- is written to a logger nobody reads:
+    #   1. Kit installs its own `_CarbLogHandler` on the root logger, and a plain
+    #      basicConfig() is a documented no-op once the root logger has a handler;
+    #      hence `force=True` (test_tracker_isaacsim.py carries it for this reason).
+    #   2. the boot also runs a dictConfig with `disable_existing_loggers`, which
+    #      sets `.disabled` on every logger created before it -- including the
+    #      module-level one built at import time, above the AppLauncher line.
+    # `force=True` alone fixes only the first and leaves the module silent.
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s  %(message)s", force=True
+    )
+    log.disabled = False
+    log.setLevel(logging.INFO)
+
     from protomotions.simulator.base_simulator.utils import (
         convert_friction_for_simulator,
     )
@@ -515,6 +734,10 @@ def main() -> None:
     try:
         obs, _ = env.reset(None)
         dump_init_state(env, out_dir, joint_names)
+
+        if args.dump_material_stack:
+            dump_material_stack(env)
+            return
 
         step = 0
         while step < args.max_steps:

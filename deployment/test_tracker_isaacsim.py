@@ -26,6 +26,11 @@ standalone-script shape as NVIDIA's own policy examples, e.g.
 ``SimulationApp`` first, build a ``World``, spawn the robot, drive it from a
 physics callback, then ``world.step()`` in a loop.
 
+``--control-in-loop`` switches to IsaacLab's shape instead (decide once, then
+``decimation`` substeps), which removes a real quarter-control-period phase
+error against the motion reference but is less robust over repeated clips --
+see :meth:`TrackerPolicy.control_step`.
+
 Unlike the H1 example (which loads a TorchScript policy + IsaacLab-style
 ``env.yaml``), this script reuses the *same* ONNX + YAML deployment contract
 as the MuJoCo script, so a single export works for both simulators.
@@ -307,10 +312,12 @@ def _parse_args() -> argparse.Namespace:
         default="auto",
         help=(
             "Apply the robot config's per-joint Coulomb friction "
-            "(control_info[j].friction, 0.1 on every G1 joint). Training passes "
-            "it to ImplicitActuatorCfg; leaving it off makes the joints "
-            "under-damped relative to training. 'auto' applies it whenever the "
-            "robot config supplies it."
+            "(control_info[j].friction, 0.1 on every G1 joint). 'auto' (default) "
+            "applies it whenever the robot config supplies it. Note training's "
+            "PhysX actually holds 0.0 -- IsaacLab drops the actuator's non-'_sim' "
+            "friction field -- so 'off' is the training-parity setting; it is not "
+            "the default because the extra dissipation measurably helps this "
+            "driver stay upright. Pair 'off' with --control-in-loop."
         ),
     )
     p.add_argument(
@@ -341,6 +348,65 @@ def _parse_args() -> argparse.Namespace:
             "Add this to the spawn height. ProtoMotions resets with "
             "env.config.ref_respawn_offset = 0.05 m above the reference; the "
             "driver spawns flush. Use to test that difference empirically."
+        ),
+    )
+    p.add_argument(
+        "--onnx-inputs-out",
+        type=str,
+        default=None,
+        help=(
+            "Write every control step's assembled ONNX input tensors to this "
+            ".npz. Diff against trace_tracker_isaaclab.py's ctx__* arrays to "
+            "test observation *assembly* -- check_onnx_parity.py only tests the "
+            "graph. Most informative with --init-state, where step 0 starts "
+            "from IsaacLab's own post-reset state."
+        ),
+    )
+    p.add_argument(
+        "--ground",
+        choices=("plane", "trimesh"),
+        default="plane",
+        help=(
+            "Ground surface. 'plane' is an analytic ground plane -- the "
+            "deployment-faithful default, since the real robot walks on a floor. "
+            "'trimesh' rebuilds ProtoMotions' own terrain mesh, the surface "
+            "training and IsaacLab inference actually use, for parity ablation; "
+            "it needs --resolved-configs."
+        ),
+    )
+    p.add_argument(
+        "--resolved-configs",
+        type=str,
+        default=None,
+        help=(
+            "Path to a run's resolved_configs_inference.pt. Only used by "
+            "--ground trimesh, which reads the terrain config out of it."
+        ),
+    )
+    p.add_argument(
+        "--control-in-loop",
+        action="store_true",
+        default=False,
+        help=(
+            "Compute the action in the outer loop and then run `decimation` "
+            "physics substeps, the way IsaacLab does, instead of driving from a "
+            "physics callback. Removes the quarter-control-period phase offset "
+            "against the motion reference clock: worth 13%% of tracking error on "
+            "a single clip (0.0903 -> 0.0787 rad), but measurably *less robust* "
+            "over repeated clips, which is why it is not the default. See "
+            "TrackerPolicy.control_step."
+        ),
+    )
+    p.add_argument(
+        "--author-collider-offsets",
+        action="store_true",
+        default=False,
+        help=(
+            "Write the robot config's contact_offset/rest_offset onto every "
+            "collider. Off by default because training does not actually get "
+            "them: IsaacLab requests 0.02/0.0 but its writer cannot author "
+            "instance proxies, so PhysX auto-derives both there. Leaving this "
+            "off is what matches training; turn it on to ablate the difference."
         ),
     )
     p.add_argument(
@@ -401,7 +467,7 @@ from isaacsim.core.utils.stage import add_reference_to_stage  # noqa: E402
 from isaacsim.core.utils.types import ArticulationAction  # noqa: E402
 from isaacsim.core.utils.stage import get_current_stage  # noqa: E402
 from isaacsim.core.utils.viewports import set_camera_view  # noqa: E402
-from pxr import PhysxSchema, Usd, UsdPhysics  # noqa: E402
+from pxr import PhysxSchema, Usd, UsdPhysics, UsdShade  # noqa: E402
 
 from deployment.motion_utils import MotionPlayer  # noqa: E402
 from deployment.state_utils import (  # noqa: E402
@@ -456,6 +522,114 @@ def _set_prim_attr(prim, name: str, value) -> bool:
         return False
     attr.Set(value)
     return True
+
+
+def _bound_physics_material(prim):
+    """Return the physics material prim bound to ``prim``, or ``None``.
+
+    Physics material bindings live on the ``"physics"`` binding *purpose*
+    (``material:binding:physics``), not the default (render) purpose, and USD
+    resolves them by walking up the namespace -- a binding on an ancestor
+    scope applies to every collider beneath it. ``ComputeBoundMaterial`` does
+    that walk; a plain ``GetDirectBinding`` on the shape would miss it and
+    report "unbound" for assets that bind at the robot root.
+
+    Note what this can *not* see: PhysX's own compiled-in fallback material,
+    used when a shape resolves to no material at all. That value is not in the
+    stage, so an empty result here means "falls back to whatever PhysX ships",
+    which is the open question this dump exists to settle.
+    """
+    try:
+        binding_api = UsdShade.MaterialBindingAPI(prim)
+        material, _rel = binding_api.ComputeBoundMaterial(
+            UsdShade.Tokens.physics
+            if hasattr(UsdShade.Tokens, "physics")
+            else "physics"
+        )
+    except Exception as e:  # pragma: no cover - USD version dependent
+        log.debug(f"{prim.GetPath()}: material binding query failed: {e}")
+        return None
+    if not material:
+        return None
+    mat_prim = material.GetPrim()
+    if not mat_prim.IsValid() or not mat_prim.HasAPI(UsdPhysics.MaterialAPI):
+        return None
+    return mat_prim
+
+
+def _describe_physics_material(mat_prim) -> str:
+    """One-line summary of a physics material prim's friction/restitution stack.
+
+    Prints ``authored`` per attribute because an unauthored attribute is the
+    whole point of this dump: it means the value shown is a schema default that
+    no layer of the stack chose, and that the other simulator may well have
+    chosen differently.
+    """
+    if mat_prim is None:
+        return "<no material bound -- PhysX built-in fallback>"
+    fields = []
+    for attr_name in (
+        "physics:staticFriction",
+        "physics:dynamicFriction",
+        "physics:restitution",
+        "physxMaterial:frictionCombineMode",
+        "physxMaterial:restitutionCombineMode",
+    ):
+        attr = mat_prim.GetAttribute(attr_name)
+        short = attr_name.split(":")[-1]
+        if not attr:
+            fields.append(f"{short}=<undeclared>")
+            continue
+        value = attr.Get()
+        mark = "" if attr.IsAuthored() else "*"
+        if isinstance(value, float):
+            fields.append(f"{short}={value:.4g}{mark}")
+        else:
+            fields.append(f"{short}={value}{mark}")
+    return f"{mat_prim.GetPath()}  " + " ".join(fields)
+
+
+def _describe_collider_offsets(prim) -> str:
+    """Report a collider's contact/rest offsets and whether anyone authored them.
+
+    PhysX **sums** a contacting pair's offsets, so an unauthored offset on
+    either shape is auto-derived from that shape's size -- and auto-derivation
+    differs between an analytic plane and a triangle mesh. Two sims can pin the
+    robot side identically and still disagree about where the floor is.
+    """
+    fields = []
+    for attr_name in ("physxCollision:contactOffset", "physxCollision:restOffset"):
+        attr = prim.GetAttribute(attr_name)
+        short = attr_name.split(":")[-1]
+        if not attr:
+            fields.append(f"{short}=<undeclared>")
+            continue
+        value = attr.Get()
+        mark = "" if attr.IsAuthored() else "*(auto)"
+        fields.append(f"{short}={value}{mark}")
+    return " ".join(fields)
+
+
+def _find_prims_with_api(stage, root_path: str, api, limit: int = 0) -> list:
+    """Collect prims under ``root_path`` that have ``api`` applied.
+
+    Traverses instance proxies: these robot assets are spawned
+    ``make_instanceable``, so the colliders are instance proxies that a default
+    ``Usd.PrimRange`` walks straight past -- the same trap documented in
+    ``_author_body_properties``.
+    """
+    found = []
+    root = stage.GetPrimAtPath(root_path)
+    if not root.IsValid():
+        return found
+    for prim in Usd.PrimRange(
+        root, Usd.TraverseInstanceProxies(Usd.PrimAllPrimsPredicate)
+    ):
+        if prim.HasAPI(api):
+            found.append(prim)
+            if limit and len(found) >= limit:
+                break
+    return found
 
 
 def resolve_usd_path(usd_path: str) -> str:
@@ -637,7 +811,9 @@ class TrackerPolicy:
         action_tape: str | None = None,
         init_state: str | None = None,
         init_z_offset: float = 0.0,
+        author_collider_offsets: bool = False,
     ) -> None:
+        self.author_collider_offsets = bool(author_collider_offsets)
         robot_meta = meta["robot"]
         timing = meta["timing"]
         motion_meta = meta["motion"]
@@ -750,6 +926,8 @@ class TrackerPolicy:
         self.done = False
         # Per-control-step tracking trace; None disables recording (see --trace-out).
         self.trace: list | None = None
+        # Per-control-step ONNX input tensors; None disables (see --onnx-inputs-out).
+        self.onnx_input_log: list | None = None
         # Set from inside the physics callback, consumed by the main loop between
         # world.step() calls -- see reset_episode()'s note on why the reset itself
         # must not happen mid-step.
@@ -996,10 +1174,29 @@ class TrackerPolicy:
             ),
             "physxRigidBody:retainAccelerations": False,
         }
-        collision_attrs = {
-            "physxCollision:contactOffset": props.get("contact_offset"),
-            "physxCollision:restOffset": props.get("rest_offset"),
-        }
+        # Collider offsets are opt-in because *training does not actually apply
+        # them* (E1, measured). IsaacLab asks for contact_offset=0.02 /
+        # rest_offset=0.0 (`isaaclab/utils/scene.py:177-180`, and they are in the
+        # resolved config), but `modify_collision_properties` is wrapped in
+        # `apply_nested`, which cannot author an instance proxy -- and every
+        # collider on this asset is one. IsaacLab logs it and moves on:
+        #   "Could not perform 'modify_collision_properties' on any prims under
+        #    '/World/envs/env_0/Robot' ... The desired attribute exists on an
+        #    instanced prim."
+        # Read back from a live training-config run, the foot collider's
+        # contactOffset/restOffset are *undeclared*, i.e. PhysX auto-derives both.
+        #
+        # This driver de-instances (below) so its writes succeed -- which means
+        # authoring them makes it diverge from training rather than match it. The
+        # A11 lesson said to diff against what training configures; this is its
+        # sharper form: diff against what training's solver actually receives.
+        if self.author_collider_offsets:
+            collision_attrs = {
+                "physxCollision:contactOffset": props.get("contact_offset"),
+                "physxCollision:restOffset": props.get("rest_offset"),
+            }
+        else:
+            collision_attrs = {}
         rigid_body_attrs = {k: v for k, v in rigid_body_attrs.items() if v is not None}
         collision_attrs = {k: v for k, v in collision_attrs.items() if v is not None}
 
@@ -1270,12 +1467,31 @@ class TrackerPolicy:
     def _apply_joint_friction(self, view, props: dict) -> None:
         """Apply the robot config's per-joint Coulomb friction.
 
-        Training passes ``friction=control_info[j].friction`` into
-        ``ImplicitActuatorCfg`` (``protomotions/simulator/isaaclab/utils/scene.py``),
-        and every G1 joint resolves to 0.1 from the MJCF
-        (``protomotions/robot_configs/base.py``). This driver did not apply it at
-        all, which leaves the joints with strictly less dissipation than
-        training -- the under-damped, oscillating-distal-limb signature.
+        **Training does not actually run with this** -- measured, not inferred.
+        ProtoMotions passes ``friction=control_info[j].friction`` (0.1 on every
+        G1 joint) into ``ImplicitActuatorCfg``
+        (``protomotions/simulator/isaaclab/utils/scene.py``), but IsaacLab only
+        forwards its ``*_sim``-suffixed actuator fields to PhysX; plain
+        ``friction`` stays in the actuator model, and the implicit actuator never
+        applies it because PhysX owns the PD loop. Reading
+        ``get_dof_friction_coefficients()`` on both stacks through the same
+        tensor API gives **driver 0.1 / IsaacLab 0.0 on all 29 joints** -- the
+        one per-joint property that does not agree.
+
+        It is applied by default anyway. Two reasons: real G1 joints do have
+        Coulomb friction, so 0.1 is a defensible hardware model and this driver's
+        job is to predict hardware; and empirically the extra dissipation keeps
+        this driver upright. Over 5 consecutive clips, ``--joint-friction off``
+        falls on two of them (root height 0.072 m, tilt 90 deg) where the default
+        never falls. ``--joint-friction off`` selects training parity instead.
+
+        Do not use ``off`` without ``--control-in-loop``: on a single clip,
+        removing friction while the physics-callback phase offset is still
+        present costs 0.0903 -> 0.1045 rad and tilt 2.71 -> 9.96 deg, because the
+        friction was damping the instability that phase error causes. With the
+        phase fixed the two score the same on one clip (0.0787 vs 0.0790 rad) --
+        but see :meth:`control_step` for why that pairing is still not the
+        default.
 
         The read-back is not decoration: ``ArticulationView._on_post_reset()``
         re-applies the articulation's *default* gains, and anything set before it
@@ -1506,6 +1722,21 @@ class TrackerPolicy:
             num_dofs=self.num_dofs,
             prev_actions=self._prev_actions,
         )
+        # Record the assembled inputs so they can be diffed against IsaacLab's
+        # recorded ctx__* arrays. check_onnx_parity.py proves the *graph* is
+        # right by feeding it IsaacLab's observations; it says nothing about
+        # whether this driver builds those observations the same way from its
+        # own state reads. Paired with --init-state, step 0 is the clean test:
+        # the physical state is identical by construction there, so any
+        # difference in these tensors is assembly, not physics.
+        if self.onnx_input_log is not None:
+            self.onnx_input_log.append(
+                {
+                    "frame": int(self._frame_idx),
+                    "inputs": {k: v.copy() for k, v in onnx_inputs.items()},
+                }
+            )
+
         t0 = time.perf_counter()
         ort_out = self.session.run(self.onnx_out_names, onnx_inputs)
         self.total_ort_ms += (time.perf_counter() - t0) * 1000.0
@@ -1560,6 +1791,80 @@ class TrackerPolicy:
                 # writing articulation root/joint state mid-step is undefined in
                 # Isaac Sim. Defer to the main loop.
                 self._pending_reset = True
+
+    def control_step(self, world, render: bool) -> None:
+        """Run one control step in IsaacLab's shape: decide once, then substep.
+
+        Opt in with ``--control-in-loop``; the default is still :meth:`forward`.
+        **Read the robustness caveat at the end before making this the default.**
+
+        The default path -- driving from ``world.add_physics_callback`` (see
+        :meth:`forward`) -- puts a fixed phase offset between the robot
+        and the motion reference. That callback fires *after* its substep, and
+        :meth:`forward` tests the decimation counter before incrementing, so
+        callback 0 computes reference frame 0 against the state at ``t = 1*dt``
+        and every later step inherits the same lag: the driver's state runs 5 ms
+        (a quarter of a control period) ahead of the reference clock.
+
+        That offset is harmless for the *controller* -- read-then-apply is
+        self-consistent at any phase -- but the motion reference is an exogenous
+        clock, so a fixed phase error against it is real tracking error rather
+        than a choice of coordinates.
+
+        IsaacLab's loop (``simulator.py:579-589``) computes the observation after
+        the last substep and applies the resulting target from the next one, with
+        the first observation taken at ``t = 0`` straight out of reset. Mirroring
+        it here means the reset also lands naturally between control steps, so
+        this path calls :meth:`reset_episode` directly instead of deferring
+        through ``_pending_reset``.
+
+        **Robustness caveat -- why this is not the default.** It scores better on
+        one clip and is *less robust over many*. Measured on ``g1_walk_box``,
+        5 consecutive loops, headless:
+
+        =============================== ======= ==================
+        config                          falls   mean joint err
+        =============================== ======= ==================
+        callback + friction (default)   none    0.0905 rad
+        this + ``--joint-friction auto``  loop 3  0.0795 rad
+        this + ``--joint-friction off``   loops 1,3  0.0837 rad
+        =============================== ======= ==================
+
+        A "fall" is the pelvis dropping to ~0.1 m with ~90 deg tilt. They happen
+        near the *end* of a clip (~step 240 of 253), and loop 0 is always clean --
+        so a single-loop score, which is what ``--headless`` runs by default,
+        cannot see this at all. That is exactly how it got made the default once
+        and had to be reverted; score ``--loops 5`` before touching it again.
+
+        Note the loops are not independent even though ``reset_episode`` rewrites
+        the full root/joint state: the per-loop errors differ (0.0787, 0.0770,
+        0.0773, 0.0868, 0.0776), so something in PhysX -- solver warm-start or
+        contact caches -- survives the reset. Whether the instability is inherent
+        to removing the phase lag or an artefact of that residue is unresolved.
+        """
+        if self.done:
+            return
+        if self._action_tape is not None:
+            self._replay_tape_step()
+        else:
+            self._compute_action()
+
+        action = ArticulationAction(
+            joint_positions=self._robot_array(self._pd_targets_isaac)
+        )
+        for substep in range(self.decimation):
+            self.robot.apply_action(action)
+            # Render only on the final substep: IsaacLab renders at the control
+            # rate, and rendering every substep would quadruple the frame cost
+            # for frames nobody asked for.
+            world.step(render=render and substep == self.decimation - 1)
+
+        # The clip boundary was reached inside _compute_action, which only raised
+        # the flag. Here we are between control steps, which is exactly where
+        # reset_episode() requires to be called.
+        if self._pending_reset:
+            self._pending_reset = False
+            self.reset_episode()
 
     def _log_progress(self, dof_pos: np.ndarray) -> None:
         """Periodically report root height + tracking error (cf. the MuJoCo driver)."""
@@ -1740,6 +2045,172 @@ class TrackerPolicy:
                 f"config={expected[worst]:.4f})"
             )
 
+        # Same read as trace_tracker_isaaclab.py's dump, through the same
+        # `_physics_view` tensor API and printed in *sim* joint order, so the two
+        # logs can be diffed PhysX-against-PhysX. The table above compares PhysX
+        # to the robot config, which by construction cannot catch a difference
+        # that is shared between the config and this driver's reading of it.
+        log.info("\n=== Per-joint PhysX properties (driver, sim joint order) ===")
+        physics_view = getattr(view, "_physics_view", None)
+        log.info(f"  sim joint order: {list(view.dof_names)}")
+        for label, method in (
+            ("stiffness", "get_dof_stiffnesses"),
+            ("damping", "get_dof_dampings"),
+            ("armature", "get_dof_armatures"),
+            ("friction", "get_dof_friction_coefficients"),
+            ("max_velocity", "get_dof_max_velocities"),
+            ("max_effort", "get_dof_max_forces"),
+        ):
+            fn = getattr(physics_view, method, None) if physics_view else None
+            if fn is None:
+                log.info(f"  {label:14s} <view has no {method}()>")
+                continue
+            try:
+                vals = _to_numpy(fn()).reshape(-1)
+            except Exception as e:  # pragma: no cover - version dependent
+                log.warning(f"  {label:14s} read-back failed: {e}")
+                continue
+            log.info(
+                f"  {label:14s} min={vals.min():.4f} max={vals.max():.4f} "
+                f"values={np.round(vals, 4).tolist()}"
+            )
+
+        self.dump_material_stack()
+
+    def dump_material_stack(self) -> None:
+        """Read back both operands of every foot-ground friction pair (E1).
+
+        Effective friction at a footfall is
+        ``combine(robot_shape_material, ground_material)``. This driver has
+        historically pinned only the ground operand: the G1 USD binds no
+        physics material to any of its colliders, and unlike IsaacLab -- which
+        spawns a ``RigidBodyMaterialCfg()`` (0.5 / 0.5 / 0.0, ``average``) and
+        binds it to the *physics scene prim* as the documented fallback for
+        unbound shapes -- ``World(..., set_defaults=True)`` authors no scene
+        default at all. The robot side therefore resolves to PhysX's compiled-in
+        fallback, whose value is not statically resolvable from the stage.
+
+        ``_physics_view.get_material_properties()`` reads what the solver
+        actually holds, so it settles that question directly: it is the same
+        read IsaacLab's simulator uses when it applies friction randomization.
+
+        Must run after ``post_reset()`` -- the physics view does not exist, and
+        USD-authored defaults are not yet re-applied, before then.
+        """
+        log.info("\n=== Material stack (foot-ground friction pair) ===")
+
+        stage = get_current_stage()
+        view = self.robot._articulation_view
+
+        # --- robot side, straight from the solver ---------------------------
+        try:
+            mats = _to_numpy(view._physics_view.get_material_properties())
+            flat = mats.reshape(-1, mats.shape[-1])
+            log.info(
+                f"  robot physics-view materials: shape={tuple(mats.shape)} "
+                f"(env x shape x [static, dynamic, restitution])"
+            )
+            for col, label in enumerate(
+                ("static_friction", "dynamic_friction", "restitution")
+            ):
+                if col >= flat.shape[1]:
+                    break
+                col_vals = flat[:, col]
+                uniq = np.unique(np.round(col_vals, 6))
+                log.info(
+                    f"    {label:18s} min={col_vals.min():.4f} max={col_vals.max():.4f} "
+                    f"unique={uniq[:8].tolist()}{' ...' if len(uniq) > 8 else ''}"
+                )
+        except Exception as e:  # pragma: no cover - version dependent
+            log.warning(f"  robot physics-view material read-back failed: {e}")
+
+        # --- robot side, as authored on the stage ---------------------------
+        robot_colliders = _find_prims_with_api(
+            stage, self._prim_path, UsdPhysics.CollisionAPI
+        )
+        bound = [p for p in robot_colliders if _bound_physics_material(p) is not None]
+        log.info(
+            f"  robot colliders: {len(robot_colliders)} total, "
+            f"{len(bound)} with a bound physics material"
+        )
+        # A foot shape is the one that matters; name-match rather than guess an index.
+        foot_prims = [
+            p
+            for p in robot_colliders
+            if any(k in p.GetPath().pathString.lower() for k in ("ankle_roll", "foot"))
+        ]
+        sample = (
+            foot_prims[0]
+            if foot_prims
+            else (robot_colliders[0] if robot_colliders else None)
+        )
+        if sample is not None:
+            log.info(f"  sample foot collider : {sample.GetPath()}")
+            log.info(
+                f"    material : {_describe_physics_material(_bound_physics_material(sample))}"
+            )
+            log.info(f"    offsets  : {_describe_collider_offsets(sample)}")
+
+        # --- scene-default material (IsaacLab's mechanism) ------------------
+        scene_prims = _find_prims_with_api(stage, "/", UsdPhysics.Scene, limit=4)
+        if not scene_prims:  # PhysicsScene is a typed prim, not an applied API
+            scene_prims = [
+                p for p in stage.Traverse() if p.GetTypeName() == "PhysicsScene"
+            ]
+        for scene_prim in scene_prims:
+            log.info(f"  physics scene prim   : {scene_prim.GetPath()}")
+            log.info(
+                f"    scene default material : "
+                f"{_describe_physics_material(_bound_physics_material(scene_prim))}"
+            )
+
+        # --- ground side ----------------------------------------------------
+        # Either ground works here: /World/GroundPlane for --ground plane,
+        # /World/ground for --ground trimesh (the path ProtoMotions uses).
+        ground_colliders = _find_prims_with_api(
+            stage, "/World/GroundPlane", UsdPhysics.CollisionAPI
+        ) or _find_prims_with_api(stage, "/World/ground", UsdPhysics.CollisionAPI)
+        if not ground_colliders:
+            log.warning("  no ground collider found")
+        for prim in ground_colliders[:2]:
+            log.info(
+                f"  ground collider      : {prim.GetPath()} ({prim.GetTypeName()})"
+            )
+            log.info(
+                f"    material : {_describe_physics_material(_bound_physics_material(prim))}"
+            )
+            log.info(f"    offsets  : {_describe_collider_offsets(prim)}")
+
+        # --- where is the floor, really? -----------------------------------
+        # The traces show the driver's robot sitting ~1.4 cm above its reference
+        # for a whole episode while IsaacLab's sits on it, which is a
+        # floor-position difference rather than a transient. Report the ground
+        # collider's world z and the resting foot height so that offset is read
+        # off directly instead of inferred from tracking error.
+        from pxr import UsdGeom
+
+        xform_cache = UsdGeom.XformCache()
+        for prim in ground_colliders[:2]:
+            tf = xform_cache.GetLocalToWorldTransform(prim)
+            log.info(
+                f"  ground collider world z: {tf.ExtractTranslation()[2]:.6f} "
+                f"({prim.GetPath()})"
+            )
+        try:
+            link_pos = _to_numpy(view._physics_view.get_link_transforms())[0, :, :3]
+            body_names = list(view.body_names)
+            for name in body_names:
+                if "ankle_roll" in name:
+                    z = float(link_pos[body_names.index(name)][2])
+                    log.info(f"  {name:24s} world z = {z:.6f}")
+        except Exception as e:  # pragma: no cover - version dependent
+            log.warning(f"  foot link height read-back failed: {e}")
+
+        log.info(
+            "  (trailing '*' = value is the schema default, unauthored by any layer; "
+            "'*(auto)' = PhysX derives it from shape size)"
+        )
+
     def write_divergence(self, path: str) -> None:
         """Dump the open-loop divergence against the IsaacLab trajectory.
 
@@ -1777,6 +2248,27 @@ class TrackerPolicy:
             f"  final |d dof|inf    : {delta[-1]:.4f} rad\n"
             f"  mean dof_vel_rms    : driver {rms.mean():.3f}  "
             f"isaaclab {np.nanmean(ref_rms):.3f}"
+        )
+
+    def write_onnx_inputs(self, path: str) -> None:
+        """Dump the recorded per-step ONNX input tensors as a stacked .npz."""
+        if not self.onnx_input_log:
+            log.warning("No ONNX inputs recorded -- nothing written.")
+            return
+        names = list(self.onnx_input_log[0]["inputs"].keys())
+        arrays = {
+            f"in__{name}": np.concatenate(
+                [row["inputs"][name] for row in self.onnx_input_log], axis=0
+            )
+            for name in names
+        }
+        arrays["frame"] = np.asarray(
+            [row["frame"] for row in self.onnx_input_log], dtype=np.int64
+        )
+        np.savez_compressed(path, **arrays)
+        log.info(
+            f"ONNX inputs ({len(self.onnx_input_log)} control steps, "
+            f"{len(names)} tensors) -> {path}"
         )
 
     def write_trace(self, path: str) -> None:
@@ -1838,6 +2330,105 @@ def _configure_physics_scene(world, robot_props: dict) -> None:
         f"stabilization={ctx.is_stablization_enabled()} "
         f"bounce_threshold={ctx.get_bounce_threshold():.3f} "
         f"gpu_dynamics={ctx.is_gpu_dynamics_enabled()}"
+    )
+
+
+def _add_physics_material(
+    stage, path: str, static_friction: float, dynamic_friction: float, combine: str
+):
+    """Author a physics material and return its prim, mirroring IsaacLab's terrain one.
+
+    ``RigidBodyMaterialCfg`` writes both the ``UsdPhysics`` friction values and
+    the ``PhysxMaterialAPI`` combine modes; ``add_default_ground_plane`` writes
+    only the former and leaves the combine modes at the schema default. They
+    agree today by luck -- the schema default happens to be ``average``, which is
+    what this terrain config asks for -- but PhysX arbitrates a mismatched pair by
+    taking the higher-priority mode (``average < min < multiply < max``), so an
+    unauthored mode flips the result silently the moment either side changes.
+    Author both explicitly here.
+    """
+    mat_prim = UsdShade.Material.Define(stage, path).GetPrim()
+    UsdPhysics.MaterialAPI.Apply(mat_prim)
+    PhysxSchema.PhysxMaterialAPI.Apply(mat_prim)
+    _set_prim_attr(mat_prim, "physics:staticFriction", float(static_friction))
+    _set_prim_attr(mat_prim, "physics:dynamicFriction", float(dynamic_friction))
+    _set_prim_attr(mat_prim, "physics:restitution", 0.0)
+    _set_prim_attr(mat_prim, "physxMaterial:frictionCombineMode", combine)
+    _set_prim_attr(mat_prim, "physxMaterial:restitutionCombineMode", combine)
+    return mat_prim
+
+
+def add_protomotions_trimesh_ground(
+    resolved_configs_path: str, friction: float
+) -> None:
+    """Spawn ProtoMotions' own flat terrain mesh instead of an analytic plane (E4).
+
+    Training and IsaacLab inference walk on ``/World/ground/terrain/mesh``, a
+    triangle mesh built by ``components/terrains/terrain.py``; this driver
+    defaults to an analytic ``Plane`` because that is the deployment-faithful
+    choice -- the real robot walks on a floor, not on a tessellated height field.
+    But box-vs-plane and box-vs-triangle-mesh are *different contact-generation
+    code paths* in PhysX (analytic manifold vs PCM triangle clipping), and both
+    shapes leave ``contactOffset``/``restOffset`` unauthored, so PhysX
+    auto-derives them per shape type. This reproduces training's surface exactly
+    so that difference can be measured rather than argued about.
+
+    For this config the terrain is flat, and the mesh optimizer merges coplanar
+    regions aggressively: the result is 56 vertices / 84 triangles spanning
+    280 x 310 m, all at z = 0. It is recentred on the origin here so the robot's
+    spawn (near XY = 0) lands well inside it -- on a flat terrain the XY offset
+    is not physically meaningful, but falling off the edge of the mesh would be.
+    """
+    import torch
+    from pxr import UsdGeom
+
+    from protomotions.components.terrains.terrain import Terrain
+
+    resolved = torch.load(resolved_configs_path, map_location="cpu", weights_only=False)
+    terrain_config = resolved["terrain"]
+    terrain = Terrain(config=terrain_config, num_envs=1, device=torch.device("cpu"))
+
+    vertices = np.asarray(terrain.vertices, dtype=np.float64).copy()
+    triangles = np.asarray(terrain.triangles, dtype=np.int32)
+    vertices[:, 2] += float(terrain_config.sim_config.height_offset)
+    # Recentre on the origin; the driver spawns the robot near XY = 0 while
+    # ProtoMotions spawns it in the middle of a 280 x 310 m terrain.
+    vertices[:, 0] -= 0.5 * (vertices[:, 0].min() + vertices[:, 0].max())
+    vertices[:, 1] -= 0.5 * (vertices[:, 1].min() + vertices[:, 1].max())
+
+    stage = get_current_stage()
+    mesh = UsdGeom.Mesh.Define(stage, "/World/ground/terrain/mesh")
+    mesh.CreatePointsAttr([tuple(v) for v in vertices])
+    mesh.CreateFaceVertexCountsAttr([3] * len(triangles))
+    mesh.CreateFaceVertexIndicesAttr(triangles.reshape(-1).tolist())
+
+    mesh_prim = mesh.GetPrim()
+    UsdPhysics.CollisionAPI.Apply(mesh_prim)
+    PhysxSchema.PhysxCollisionAPI.Apply(mesh_prim)
+    # A static triangle mesh collides as a triangle mesh; "none" is the USD token
+    # for "do not approximate", which is what the terrain importer relies on.
+    mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(mesh_prim)
+    mesh_collision.CreateApproximationAttr().Set("none")
+
+    sim_config = terrain_config.sim_config
+    combine = getattr(sim_config.combine_mode, "value", sim_config.combine_mode)
+    material = _add_physics_material(
+        stage,
+        "/World/ground/terrain/physicsMaterial",
+        static_friction=friction,
+        dynamic_friction=friction,
+        combine=str(combine),
+    )
+    binding_api = UsdShade.MaterialBindingAPI.Apply(mesh_prim)
+    binding_api.Bind(
+        UsdShade.Material(material),
+        bindingStrength=UsdShade.Tokens.weakerThanDescendants,
+        materialPurpose="physics",
+    )
+
+    log.info(
+        f"Ground: ProtoMotions trimesh ({len(vertices)} verts, {len(triangles)} tris, "
+        f"z={vertices[:, 2].min():.3f}) with friction {friction} / {combine}"
     )
 
 
@@ -1918,14 +2509,22 @@ def main() -> None:
         rendering_dt=control_dt,
         **world_kwargs,
     )
-    world.scene.add_default_ground_plane(
-        z_position=0.0,
-        name="ground_plane",
-        prim_path="/World/GroundPlane",
-        static_friction=args.ground_friction,
-        dynamic_friction=args.ground_friction,
-        restitution=0.0,
-    )
+    if args.ground == "trimesh":
+        if not args.resolved_configs:
+            raise SystemExit(
+                "--ground trimesh needs --resolved-configs pointing at the run's "
+                "resolved_configs_inference.pt (that is where the terrain config lives)"
+            )
+        add_protomotions_trimesh_ground(args.resolved_configs, args.ground_friction)
+    else:
+        world.scene.add_default_ground_plane(
+            z_position=0.0,
+            name="ground_plane",
+            prim_path="/World/GroundPlane",
+            static_friction=args.ground_friction,
+            dynamic_friction=args.ground_friction,
+            restitution=0.0,
+        )
 
     policy = TrackerPolicy(
         meta=meta,
@@ -1943,12 +2542,15 @@ def main() -> None:
         action_tape=args.action_tape,
         init_state=args.init_state,
         init_z_offset=args.init_z_offset,
+        author_collider_offsets=args.author_collider_offsets,
     )
     policy.num_loops = (
         args.loops if args.loops is not None else (1 if args.headless else 10_000_000)
     )
     if args.trace_out:
         policy.trace = []
+    if args.onnx_inputs_out:
+        policy.onnx_input_log = []
     if args.tape_divergence_out:
         if args.action_tape is None:
             raise SystemExit("--tape-divergence-out requires --action-tape")
@@ -1970,29 +2572,40 @@ def main() -> None:
         policy.dump_physx_properties()
         simulation_app.close()
         return
-    world.add_physics_callback("tracker_policy_step", callback_fn=policy.forward)
+    if not args.control_in_loop:
+        world.add_physics_callback("tracker_policy_step", callback_fn=policy.forward)
 
     # Real-time pacing only makes sense when there is something to watch; a
     # headless run is a measurement, so it always goes as fast as it can.
     realtime = not args.no_realtime and not args.headless
     total_sim_ms = 0.0
 
+    # Each iteration advances one *control* step in --control-in-loop mode and one
+    # *physics* substep otherwise, so the real-time budget differs by decimation.
+    loop_period = control_dt if args.control_in_loop else physics_dt
+
     while simulation_app.is_running() and not policy.done:
         t0 = time.perf_counter()
-        world.step(render=not args.headless)
+        if args.control_in_loop:
+            policy.control_step(world, render=not args.headless)
+        else:
+            world.step(render=not args.headless)
         step_s = time.perf_counter() - t0
         total_sim_ms += step_s * 1000.0
         # Clip restarts are deferred out of the physics callback -- see
         # TrackerPolicy.reset_episode(). This is the only safe place to run them.
+        # (control_step drains the flag itself, so this is a no-op there.)
         if policy._pending_reset:
             policy._pending_reset = False
             policy.reset_episode()
         if realtime:
-            sleep_time = physics_dt - step_s
+            sleep_time = loop_period - step_s
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
     policy.log_summary(total_sim_ms)
+    if args.onnx_inputs_out:
+        policy.write_onnx_inputs(args.onnx_inputs_out)
     if args.trace_out:
         policy.write_trace(args.trace_out)
     if args.tape_divergence_out:
