@@ -23,8 +23,12 @@ realignment notes). This script swaps MuJoCo physics for Isaac Sim
 standalone-script shape as NVIDIA's own policy examples, e.g.
 ``isaacsim.robot.policy.examples.robots.h1.H1FlatTerrainPolicy`` /
 ``isaacsim.robot.policy.examples.controllers.PolicyController``: create
-``SimulationApp`` first, build a ``World``, spawn the robot, drive it from a
-physics callback, then ``world.step()`` in a loop.
+``SimulationApp`` first, build a ``World``, spawn the robot, then step it in a
+loop. It departs from those examples in one place on purpose: the policy is
+driven from the **outer loop** (decide once, then ``decimation`` substeps, as
+IsaacLab does) rather than from a physics callback, because the callback fires
+after its substep and so runs the robot a quarter control period ahead of the
+motion reference. See :meth:`TrackerPolicy.control_step`.
 
 Unlike the H1 example (which loads a TorchScript policy + IsaacLab-style
 ``env.yaml``), this script reuses the *same* ONNX + YAML deployment contract
@@ -304,15 +308,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--joint-friction",
         choices=("auto", "on", "off"),
-        default="auto",
+        default="off",
         help=(
             "Apply the robot config's per-joint Coulomb friction "
-            "(control_info[j].friction, 0.1 on every G1 joint). 'auto' applies "
-            "it whenever the robot config supplies it. Note training's PhysX "
-            "actually holds 0.0 here -- IsaacLab drops the actuator's non-'_sim' "
-            "friction field -- so 'off' is the training-parity setting and the "
-            "default is the deployment-faithful one. Pair 'off' with "
-            "--control-in-loop; alone it is a large regression."
+            "(control_info[j].friction, 0.1 on every G1 joint). Defaults to "
+            "'off' because training's PhysX holds 0.0 -- IsaacLab drops the "
+            "actuator's non-'_sim' friction field, measured on both stacks. "
+            "'auto' applies it whenever the robot config supplies it, which is "
+            "arguably closer to real G1 hardware but is not what the policy was "
+            "trained against."
         ),
     )
     p.add_argument(
@@ -379,14 +383,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
-        "--control-in-loop",
+        "--control-in-callback",
         action="store_true",
         default=False,
         help=(
-            "Compute the action in the outer loop and then run `decimation` "
-            "physics substeps, the way IsaacLab does, instead of driving from a "
-            "physics callback. Removes the quarter-control-period phase offset "
-            "between the robot state and the motion reference clock."
+            "Drive the policy from a physics callback instead of the outer loop "
+            "(the pre-2026-08 behaviour). The callback fires *after* its substep, "
+            "which puts the robot state a quarter control period ahead of the "
+            "motion reference clock; measured, that costs 13%% of tracking error "
+            "(0.0787 -> 0.0903 rad). Kept only to ablate that difference."
         ),
     )
     p.add_argument(
@@ -1470,19 +1475,19 @@ class TrackerPolicy:
         tensor API gives **driver 0.1 / IsaacLab 0.0 on all 29 joints** -- the
         one per-joint property that does not agree.
 
-        It is kept on by default anyway, because the two simulators are being
-        asked for different things: real G1 joints do have Coulomb friction, so
-        0.1 is the deployment-faithful choice, and this driver's job is to
-        predict hardware. ``--joint-friction off`` selects training parity
-        instead.
+        So the default is ``off``, which matches training. ``--joint-friction
+        auto`` restores the config value; real G1 joints do have Coulomb
+        friction, so that is arguably the better hardware model, but it is not
+        what this policy was trained against.
 
-        Do not flip that default without also passing ``--control-in-loop``:
-        measured closed loop, removing friction while the physics-callback phase
-        offset is still present costs a lot (0.0903 -> 0.1045 rad, tilt
-        2.71 -> 9.96 deg), because the spurious friction was damping the
-        instability the phase error causes. With the phase fixed the two are
-        equivalent (0.0787 vs 0.0790 rad), which is what shows the friction was
-        compensation rather than physics.
+        **The default is only safe together with outer-loop control.** Measured
+        closed loop, removing friction while the physics-callback phase offset
+        is still present costs a lot (0.0903 -> 0.1045 rad, tilt 2.71 ->
+        9.96 deg), because the spurious friction was damping the instability
+        that phase error causes. With control in the outer loop the two are
+        equivalent (0.0787 vs 0.0790 rad) -- which is what showed the friction
+        was compensation rather than physics. Both defaults moved together for
+        that reason; ``--control-in-callback`` alone re-creates the bad pairing.
 
         The read-back is not decoration: ``ArticulationView._on_post_reset()``
         re-applies the articulation's *default* gains, and anything set before it
@@ -1786,9 +1791,10 @@ class TrackerPolicy:
     def control_step(self, world, render: bool) -> None:
         """Run one control step in IsaacLab's shape: decide once, then substep.
 
-        The alternative -- driving from ``world.add_physics_callback`` (see
-        :meth:`forward`) -- puts a fixed phase offset between the robot and the
-        motion reference. That callback fires *after* its substep, and
+        This is the default path. The alternative -- driving from
+        ``world.add_physics_callback`` (see :meth:`forward`, still reachable via
+        ``--control-in-callback``) -- puts a fixed phase offset between the robot
+        and the motion reference. That callback fires *after* its substep, and
         :meth:`forward` tests the decimation counter before incrementing, so
         callback 0 computes reference frame 0 against the state at ``t = 1*dt``
         and every later step inherits the same lag: the driver's state runs 5 ms
@@ -2536,7 +2542,7 @@ def main() -> None:
         policy.dump_physx_properties()
         simulation_app.close()
         return
-    if not args.control_in_loop:
+    if args.control_in_callback:
         world.add_physics_callback("tracker_policy_step", callback_fn=policy.forward)
 
     # Real-time pacing only makes sense when there is something to watch; a
@@ -2544,16 +2550,17 @@ def main() -> None:
     realtime = not args.no_realtime and not args.headless
     total_sim_ms = 0.0
 
-    # Each iteration advances one *control* step in --control-in-loop mode and one
-    # *physics* substep otherwise, so the real-time budget differs by decimation.
-    loop_period = control_dt if args.control_in_loop else physics_dt
+    # Each iteration advances one *control* step by default and one *physics*
+    # substep under --control-in-callback, so the real-time budget differs by
+    # decimation.
+    loop_period = physics_dt if args.control_in_callback else control_dt
 
     while simulation_app.is_running() and not policy.done:
         t0 = time.perf_counter()
-        if args.control_in_loop:
-            policy.control_step(world, render=not args.headless)
-        else:
+        if args.control_in_callback:
             world.step(render=not args.headless)
+        else:
+            policy.control_step(world, render=not args.headless)
         step_s = time.perf_counter() - t0
         total_sim_ms += step_s * 1000.0
         # Clip restarts are deferred out of the physics callback -- see
