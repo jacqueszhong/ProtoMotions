@@ -99,6 +99,17 @@ def create_parser():
         "--scenes-file", type=str, default=None, help="Path to scenes file (optional)"
     )
     parser.add_argument(
+        "--log-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory for IsaacLab artifacts. When set (isaaclab only), the resolved "
+            "SimulationCfg/SceneCfg are exported to <log-dir>/params/env.yaml in "
+            "IsaacLab workflow format, and IsaacLab's own text log is written there "
+            "instead of the temp directory."
+        ),
+    )
+    parser.add_argument(
         "--overrides",
         nargs="*",
         default=[],
@@ -315,6 +326,16 @@ def main():
     if args.headless is not None:
         log.info(f"CLI override: headless = {args.headless}")
         simulator_config.headless = args.headless
+
+    if args.log_dir is not None:
+        if args.simulator == "isaaclab":
+            log.info(f"CLI override: log_dir = {args.log_dir}")
+            simulator_config.log_dir = args.log_dir
+        else:
+            log.warning(
+                f"--log-dir is only supported by the isaaclab simulator, ignoring it "
+                f"for '{args.simulator}'"
+            )
 
     # Parse and apply general CLI overrides
     from protomotions.utils.config_utils import (
