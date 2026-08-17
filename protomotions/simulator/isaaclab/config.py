@@ -4,7 +4,7 @@
 """Configuration classes for IsaacLab simulator."""
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 from protomotions.simulator.base_simulator.config import SimParams, SimulatorConfig
 from protomotions.simulator.isaacgym.config import IsaacGymPhysXParams
 import torch
@@ -68,4 +68,12 @@ class IsaacLabSimulatorConfig(SimulatorConfig):
     sim: IsaacLabSimParams = field(
         default_factory=IsaacLabSimParams,
         metadata={"help": "IsaacLab-specific simulation parameters."}
+    )
+    log_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Directory for IsaacLab artifacts. When set, the resolved "
+            "SimulationCfg/SceneCfg are exported to <log_dir>/params/env.yaml and "
+            "IsaacLab's own text log is written here instead of the temp directory."
+        }
     )

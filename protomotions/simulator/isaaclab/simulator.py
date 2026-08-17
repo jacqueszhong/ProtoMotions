@@ -102,7 +102,14 @@ class IsaacLabSimulator(Simulator):
                 gpu_max_rigid_patch_count=self.config.sim.physx.gpu_max_rigid_patch_count,
             ),
         )
+        # Redirect IsaacLab's own text log (isaaclab_<timestamp>.log) next to our
+        # artifacts. Set after construction so we stay compatible with IsaacLab
+        # versions whose SimulationCfg has no log_dir field.
+        if self.config.log_dir is not None and hasattr(sim_cfg, "log_dir"):
+            sim_cfg.log_dir = self.config.log_dir
+
         self._simulation_app = simulation_app
+        self._sim_cfg = sim_cfg
         self._sim = SimulationContext(sim_cfg)
         self._sim.set_camera_view([2.5, 0.0, 4.0], [0.0, 0.0, 2.0])
 
@@ -110,6 +117,20 @@ class IsaacLabSimulator(Simulator):
         self._resolve_proj_config()
 
         scene_cfg = self._get_scene_cfg()
+        self._scene_cfg = scene_cfg
+
+        if self.config.log_dir is not None:
+            from protomotions.simulator.isaaclab.utils.config_export import (
+                export_env_cfg_yaml,
+            )
+
+            export_env_cfg_yaml(
+                log_dir=self.config.log_dir,
+                sim_cfg=sim_cfg,
+                scene_cfg=scene_cfg,
+                decimation=self.config.sim.decimation,
+                robot_config=robot_config,
+            )
 
         self._scene = InteractiveScene(scene_cfg)
         if not self.headless:

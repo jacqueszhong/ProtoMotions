@@ -72,6 +72,11 @@ __all__ = [
     # Heading alignment (NumPy)
     "compute_yaw_offset_np",
     "apply_heading_offset_np",
+    # Cross-driver tracking trace
+    "TRACE_COLUMNS",
+    "tilt_deg_xyzw",
+    "make_trace_row",
+    "summarize_trace",
     # PyTorch versions -- used during ONNX export / first-run deploy
     "compute_anchor_rot",
     "compute_root_local_ang_vel",
@@ -180,6 +185,165 @@ def _quat_rotate_inverse_np(q_xyzw: np.ndarray, v: np.ndarray) -> np.ndarray:
     b = np.cross(q_vec, v) * q_w * 2.0
     c = q_vec * np.dot(q_vec, v) * 2.0
     return a - b + c
+
+
+# ---------------------------------------------------------------------------
+# Cross-driver tracking trace
+# ---------------------------------------------------------------------------
+
+#: Column order of a tracking-trace row.  Every harness that emits a trace --
+#: ``test_tracker_isaacsim.py``, ``test_tracker_mujoco.py`` and
+#: ``trace_tracker_isaaclab.py`` -- writes exactly these keys, so traces from
+#: different backends diff directly.  Changing this list changes all three.
+TRACE_COLUMNS = (
+    "loop",
+    "frame",
+    "root_h",
+    "ref_h",
+    "tilt",
+    "ref_tilt",
+    "joint_err",
+    "dof_vel_rms",
+    "dof_vel_peak",
+)
+
+#: **Optional** extra columns, present only when the harness can read collider
+#: geometry back from a live physics stage -- the Isaac Sim driver and the
+#: IsaacLab harness can, the MuJoCo one does not.  Kept out of
+#: :data:`TRACE_COLUMNS` on purpose: that list is the contract every harness
+#: satisfies, and widening it would make MuJoCo traces retroactively invalid.
+#:
+#: ``foot_z`` is the lowest *collider* point, not a link origin.  The two are 3.5
+#: cm apart on the G1 foot, which is more than twice the pelvis-height anomaly
+#: this instrumentation exists to explain -- so the distinction is the whole
+#: point.  ``pelvis_minus_foot`` is the posture term: if it agrees between two
+#: stacks whose ``root_h`` does not, the difference is where the *floor* is, not
+#: how the robot is standing.
+TRACE_COLUMNS_GEOM = ("foot_z", "pelvis_minus_foot", "foot_contact")
+
+
+def tilt_deg_xyzw(quat_xyzw) -> float:
+    """Angle in degrees between the body's local +z axis and world +z.
+
+    Args:
+        quat_xyzw: Unit quaternion ``[x, y, z, w]``, shape ``[4,]``.
+
+    Returns:
+        Tilt angle in degrees, in ``[0, 180]``.
+    """
+    x, y, _z, _w = np.asarray(quat_xyzw, dtype=np.float64)
+    # R[2, 2] -- the z component of the body's z axis in world coordinates.
+    cos_tilt = 1.0 - 2.0 * (x * x + y * y)
+    return float(np.degrees(np.arccos(np.clip(cos_tilt, -1.0, 1.0))))
+
+
+def make_trace_row(
+    *,
+    loop: int,
+    frame: int,
+    root_h: float,
+    ref_h: float,
+    anchor_rot_xyzw,
+    ref_anchor_rot_xyzw,
+    dof_pos: np.ndarray,
+    ref_dof_pos: np.ndarray,
+    dof_vel: np.ndarray,
+    foot_z: float | None = None,
+    foot_contact: int | None = None,
+) -> dict:
+    """Build one tracking-trace row in the canonical :data:`TRACE_COLUMNS` schema.
+
+    Every deployment driver routes through this so the schema cannot drift
+    between backends -- the whole point of the trace is that an Isaac Sim run,
+    a MuJoCo run and an IsaacLab run are directly comparable, which silently
+    stops being true the moment one of them computes ``joint_err`` differently.
+
+    All arguments are single-environment, no batch dimension.
+
+    Args:
+        loop: Index of the current motion loop (0-based).
+        frame: Reference-motion frame index this control step tracks.
+        root_h: Measured root (pelvis) height, metres.
+        ref_h: Reference root height at ``frame``, metres.
+        anchor_rot_xyzw: Measured anchor-body orientation ``[4,]`` (xyzw).
+        ref_anchor_rot_xyzw: Reference anchor-body orientation ``[4,]`` (xyzw).
+        dof_pos: Measured DOF positions ``[num_dofs]``, policy joint order.
+        ref_dof_pos: Reference DOF positions ``[num_dofs]``, same order.
+        dof_vel: Measured DOF velocities ``[num_dofs]``, same order.
+        foot_z: Optional world z of the lowest foot *collider* point (not the
+            link origin). Adds the :data:`TRACE_COLUMNS_GEOM` height pair.
+        foot_contact: Optional number of feet currently in contact. Adds the
+            ``foot_contact`` column; used to split divergence by stance phase.
+
+    Returns:
+        Dict with exactly the :data:`TRACE_COLUMNS` keys, plus whichever
+        :data:`TRACE_COLUMNS_GEOM` keys the optional arguments supplied. All
+        values JSON-serialisable.
+    """
+    dof_pos = np.asarray(dof_pos, dtype=np.float64)
+    ref_dof_pos = np.asarray(ref_dof_pos, dtype=np.float64)
+    dof_vel = np.asarray(dof_vel, dtype=np.float64)
+    row = {
+        "loop": int(loop),
+        "frame": int(frame),
+        "root_h": float(root_h),
+        "ref_h": float(ref_h),
+        "tilt": tilt_deg_xyzw(anchor_rot_xyzw),
+        "ref_tilt": tilt_deg_xyzw(ref_anchor_rot_xyzw),
+        "joint_err": float(np.abs(dof_pos - ref_dof_pos).mean()),
+        "dof_vel_rms": float(np.sqrt(np.mean(dof_vel**2))),
+        "dof_vel_peak": float(np.abs(dof_vel).max()),
+    }
+    if foot_z is not None:
+        row["foot_z"] = float(foot_z)
+        row["pelvis_minus_foot"] = float(root_h) - float(foot_z)
+    if foot_contact is not None:
+        row["foot_contact"] = int(foot_contact)
+    return row
+
+
+def summarize_trace(trace: list) -> str:
+    """Format the standard five-line summary of a tracking trace.
+
+    Shared so the numbers quoted in
+    ``logs/isaacsim_g1_tracker_instability_findings.md`` mean the same thing
+    whichever driver produced them.
+
+    Args:
+        trace: List of rows from :func:`make_trace_row`.
+
+    Returns:
+        Multi-line summary string (no trailing newline).
+    """
+    col = {k: np.array([r[k] for r in trace]) for k in TRACE_COLUMNS}
+    lines = [
+        f"  mean joint err      : {col['joint_err'].mean():.4f} rad",
+        f"  mean |root_h - ref| : {np.abs(col['root_h'] - col['ref_h']).mean():.4f} m",
+        f"  mean |tilt - ref|   : {np.abs(col['tilt'] - col['ref_tilt']).mean():.2f} deg",
+        f"  mean rms dof_vel    : {col['dof_vel_rms'].mean():.3f}",
+        f"  peak dof_vel        : {col['dof_vel_peak'].max():.1f} rad/s",
+    ]
+
+    # The optional geometry columns, reported only when *every* row carries them
+    # -- a partially-populated column would average over two different
+    # definitions, which is worse than not reporting it.
+    if all("foot_z" in r for r in trace):
+        foot_z = np.array([r["foot_z"] for r in trace])
+        posture = np.array([r["pelvis_minus_foot"] for r in trace])
+        lines += [
+            f"  mean foot_z         : {np.nanmean(foot_z):+.4f} m "
+            f"(min {np.nanmin(foot_z):+.4f}, max {np.nanmax(foot_z):+.4f})",
+            f"  mean pelvis - foot  : {np.nanmean(posture):.4f} m "
+            f"(std {np.nanstd(posture):.4f})",
+        ]
+    if all("foot_contact" in r for r in trace):
+        contact = np.array([r["foot_contact"] for r in trace])
+        lines.append(
+            f"  stance fraction     : {float((contact > 0).mean()):.3f} "
+            f"(double {float((contact > 1).mean()):.3f}, "
+            f"flight {float((contact == 0).mean()):.3f})"
+        )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

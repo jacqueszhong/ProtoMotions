@@ -1,0 +1,11 @@
+python protomotions/train_agent.py \
+    --robot-name g1 \
+    --simulator isaaclab \
+    --experiment-path examples/experiments/mimic/g1_pick_box.py \
+    --experiment-name g1_box_1 \
+    --checkpoint data/pretrained_models/motion_tracker/g1-bones-deploy/last.ckpt \
+    --motion-file ../data/pick-box-0/g1_csv/kimodo_g1_motions.pt \
+    --scenes-file ../data/pick-box-0/box_0_traj.pt \
+    --num-envs 4096 \
+    --batch-size 16384 \
+    --ngpu 1
