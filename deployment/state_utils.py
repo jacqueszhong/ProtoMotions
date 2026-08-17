@@ -207,6 +207,20 @@ TRACE_COLUMNS = (
     "dof_vel_peak",
 )
 
+#: **Optional** extra columns, present only when the harness can read collider
+#: geometry back from a live physics stage -- the Isaac Sim driver and the
+#: IsaacLab harness can, the MuJoCo one does not.  Kept out of
+#: :data:`TRACE_COLUMNS` on purpose: that list is the contract every harness
+#: satisfies, and widening it would make MuJoCo traces retroactively invalid.
+#:
+#: ``foot_z`` is the lowest *collider* point, not a link origin.  The two are 3.5
+#: cm apart on the G1 foot, which is more than twice the pelvis-height anomaly
+#: this instrumentation exists to explain -- so the distinction is the whole
+#: point.  ``pelvis_minus_foot`` is the posture term: if it agrees between two
+#: stacks whose ``root_h`` does not, the difference is where the *floor* is, not
+#: how the robot is standing.
+TRACE_COLUMNS_GEOM = ("foot_z", "pelvis_minus_foot", "foot_contact")
+
 
 def tilt_deg_xyzw(quat_xyzw) -> float:
     """Angle in degrees between the body's local +z axis and world +z.
@@ -234,6 +248,8 @@ def make_trace_row(
     dof_pos: np.ndarray,
     ref_dof_pos: np.ndarray,
     dof_vel: np.ndarray,
+    foot_z: float | None = None,
+    foot_contact: int | None = None,
 ) -> dict:
     """Build one tracking-trace row in the canonical :data:`TRACE_COLUMNS` schema.
 
@@ -254,14 +270,20 @@ def make_trace_row(
         dof_pos: Measured DOF positions ``[num_dofs]``, policy joint order.
         ref_dof_pos: Reference DOF positions ``[num_dofs]``, same order.
         dof_vel: Measured DOF velocities ``[num_dofs]``, same order.
+        foot_z: Optional world z of the lowest foot *collider* point (not the
+            link origin). Adds the :data:`TRACE_COLUMNS_GEOM` height pair.
+        foot_contact: Optional number of feet currently in contact. Adds the
+            ``foot_contact`` column; used to split divergence by stance phase.
 
     Returns:
-        Dict with exactly the :data:`TRACE_COLUMNS` keys, all JSON-serialisable.
+        Dict with exactly the :data:`TRACE_COLUMNS` keys, plus whichever
+        :data:`TRACE_COLUMNS_GEOM` keys the optional arguments supplied. All
+        values JSON-serialisable.
     """
     dof_pos = np.asarray(dof_pos, dtype=np.float64)
     ref_dof_pos = np.asarray(ref_dof_pos, dtype=np.float64)
     dof_vel = np.asarray(dof_vel, dtype=np.float64)
-    return {
+    row = {
         "loop": int(loop),
         "frame": int(frame),
         "root_h": float(root_h),
@@ -272,6 +294,12 @@ def make_trace_row(
         "dof_vel_rms": float(np.sqrt(np.mean(dof_vel**2))),
         "dof_vel_peak": float(np.abs(dof_vel).max()),
     }
+    if foot_z is not None:
+        row["foot_z"] = float(foot_z)
+        row["pelvis_minus_foot"] = float(root_h) - float(foot_z)
+    if foot_contact is not None:
+        row["foot_contact"] = int(foot_contact)
+    return row
 
 
 def summarize_trace(trace: list) -> str:
@@ -288,13 +316,34 @@ def summarize_trace(trace: list) -> str:
         Multi-line summary string (no trailing newline).
     """
     col = {k: np.array([r[k] for r in trace]) for k in TRACE_COLUMNS}
-    return (
-        f"  mean joint err      : {col['joint_err'].mean():.4f} rad\n"
-        f"  mean |root_h - ref| : {np.abs(col['root_h'] - col['ref_h']).mean():.4f} m\n"
-        f"  mean |tilt - ref|   : {np.abs(col['tilt'] - col['ref_tilt']).mean():.2f} deg\n"
-        f"  mean rms dof_vel    : {col['dof_vel_rms'].mean():.3f}\n"
-        f"  peak dof_vel        : {col['dof_vel_peak'].max():.1f} rad/s"
-    )
+    lines = [
+        f"  mean joint err      : {col['joint_err'].mean():.4f} rad",
+        f"  mean |root_h - ref| : {np.abs(col['root_h'] - col['ref_h']).mean():.4f} m",
+        f"  mean |tilt - ref|   : {np.abs(col['tilt'] - col['ref_tilt']).mean():.2f} deg",
+        f"  mean rms dof_vel    : {col['dof_vel_rms'].mean():.3f}",
+        f"  peak dof_vel        : {col['dof_vel_peak'].max():.1f} rad/s",
+    ]
+
+    # The optional geometry columns, reported only when *every* row carries them
+    # -- a partially-populated column would average over two different
+    # definitions, which is worse than not reporting it.
+    if all("foot_z" in r for r in trace):
+        foot_z = np.array([r["foot_z"] for r in trace])
+        posture = np.array([r["pelvis_minus_foot"] for r in trace])
+        lines += [
+            f"  mean foot_z         : {np.nanmean(foot_z):+.4f} m "
+            f"(min {np.nanmin(foot_z):+.4f}, max {np.nanmax(foot_z):+.4f})",
+            f"  mean pelvis - foot  : {np.nanmean(posture):.4f} m "
+            f"(std {np.nanstd(posture):.4f})",
+        ]
+    if all("foot_contact" in r for r in trace):
+        contact = np.array([r["foot_contact"] for r in trace])
+        lines.append(
+            f"  stance fraction     : {float((contact > 0).mean()):.3f} "
+            f"(double {float((contact > 1).mean()):.3f}, "
+            f"flight {float((contact == 0).mean()):.3f})"
+        )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

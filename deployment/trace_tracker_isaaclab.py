@@ -33,6 +33,16 @@ What it emits
     to ``deployment/check_onnx_parity.py`` (Stage 2) and the action tape for
     ``test_tracker_isaacsim.py --action-tape`` (Stage 3).
 
+    Two state groups, and the distinction matters.  ``state__*`` comes from
+    ``env.context`` -- what the *policy* saw.  ``sim__*`` comes from
+    ``simulator.get_robot_state()`` and the physics view -- what *PhysX held*,
+    including per-link poses in sim link order and per-foot net contact force.
+    ``test_tracker_isaacsim.py --resync-state`` writes ``sim__*`` back into
+    another PhysX instance one control step at a time, so it must be the
+    simulator's own numbers; the two groups are compared at step 0 and the max
+    difference logged, because "they are the same" had been assumed and never
+    measured.
+
 ``init_state.json``
     The post-reset state read back **from the simulator**, not reconstructed.
     Reading it back captures the ``ref_respawn_offset`` z bump, the sampled XY
@@ -117,10 +127,13 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help=(
-            "After env.reset(), read the robot/ground physics materials and "
-            "collider offsets back from the live stage and physics view, then "
-            "exit. The IsaacLab half of test_tracker_isaacsim.py's "
-            "--dump-physx-properties; the two logs are meant to be diffed."
+            "After env.reset(), read the physics setup back from the live stage "
+            "and physics view, then exit: the height decomposition (pelvis, "
+            "lowest foot collider, ground), per-joint solver properties, "
+            "per-link rigid-body properties in sim link order, and the "
+            "robot/ground material stack. The IsaacLab half of "
+            "test_tracker_isaacsim.py's --dump-physx-properties; the two logs "
+            "are meant to be diffed line for line."
         ),
     )
     p.add_argument(
@@ -133,6 +146,43 @@ def _parse_args() -> argparse.Namespace:
             "measures how much of the divergence is the open-loop test itself "
             "rather than a physics difference."
         ),
+    )
+    p.add_argument(
+        "--drive-probe-out",
+        default=None,
+        help=(
+            "After env.reset(), run the paired drive-response probe (see "
+            "deployment/drive_probe.py) and write the result here, then exit. "
+            "The probe teleports the robot 5 m into the air -- out of contact "
+            "entirely -- writes a fixed state and a fixed PD target, and records "
+            "the joint response after every physics substep. Run the same spec "
+            "through test_tracker_isaacsim.py --drive-probe and diff the two "
+            "with `python -m deployment.drive_probe --compare`."
+        ),
+    )
+    p.add_argument(
+        "--drive-probe-spec-out",
+        default=None,
+        help=(
+            "Where to write the probe spec the driver must replay "
+            "(default: <out-dir>/drive_probe_spec.npz)."
+        ),
+    )
+    p.add_argument(
+        "--drive-probe-tape",
+        default=None,
+        help=(
+            "A context_isaaclab.npz to draw the probe's realistic `tape_*` cases "
+            "from (recorded joint configurations, joint speeds and PD targets, "
+            "lifted out of contact). Optional; without it the probe runs only "
+            "its synthetic cases."
+        ),
+    )
+    p.add_argument(
+        "--drive-probe-lift",
+        type=float,
+        default=5.0,
+        help="Metres to raise the probe's root by, to guarantee zero contact.",
     )
     return p.parse_args()
 
@@ -154,6 +204,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from lightning.fabric import Fabric  # noqa: E402
 
+from deployment import physx_probe  # noqa: E402
 from deployment.state_utils import make_trace_row, summarize_trace  # noqa: E402
 from protomotions.utils.fabric_config import FabricConfig  # noqa: E402
 from protomotions.utils.hydra_replacement import get_class  # noqa: E402
@@ -253,17 +304,69 @@ def assert_deterministic(env_config, robot_config, simulator_config) -> None:
 
 
 class TraceRecorder:
-    """Accumulates per-control-step trace rows and context/state arrays."""
+    """Accumulates per-control-step trace rows and context/state arrays.
 
-    def __init__(self, actor_in_keys: list, anchor_idx: int, dt: float) -> None:
+    Args:
+        actor_in_keys: Observation keys the actor consumes, in order.
+        anchor_idx: Index of the anchor body in the common body ordering.
+        dt: Control timestep.
+        foot_probe: Optional :class:`deployment.physx_probe.FootProbe` resolving
+            the lowest foot *collider* point each step. ``None`` disables the
+            geometry columns.
+        contact_sensors: Optional ``{body_name: ContactSensor}`` for the feet.
+            ``None`` disables the contact column.
+    """
+
+    def __init__(
+        self,
+        actor_in_keys: list,
+        anchor_idx: int,
+        dt: float,
+        foot_probe=None,
+        contact_sensors: dict | None = None,
+    ) -> None:
         self.actor_in_keys = list(actor_in_keys)
         self.anchor_idx = anchor_idx
         self.dt = dt
+        self.foot_probe = foot_probe
+        self.contact_sensors = dict(contact_sensors or {})
         self.trace: list = []
         self.arrays: dict = {}
+        # Logged once, at the first step: whether the context the policy sees and
+        # the state PhysX holds are the same numbers. Everything downstream --
+        # the action tape, the resync probe -- assumes they are, and that
+        # assumption has never been measured.
+        self._context_vs_sim_logged = False
 
     def _append(self, name: str, value: np.ndarray) -> None:
         self.arrays.setdefault(name, []).append(value)
+
+    def _link_transforms(self, env) -> np.ndarray:
+        """Link poses in sim link order, ``[num_links, 7]`` as ``x y z qx qy qz qw``.
+
+        Read through ``root_physx_view.get_link_transforms()`` -- the *same* call
+        the Isaac Sim driver makes -- rather than through ``robot.data.body_*_w``.
+        IsaacLab's data properties convert the quaternion to wxyz on the way past
+        (``articulation_data.py:594``); going through the raw view keeps the two
+        harnesses reading identical bytes in identical order, which is the only
+        reason a diff of their outputs means anything.
+        """
+        view = env.simulator._robot.root_physx_view
+        return np.asarray(
+            view.get_link_transforms()[0].detach().cpu().numpy(), dtype=np.float64
+        )
+
+    def _foot_contact_forces(self) -> dict:
+        """Net world contact force magnitude per instrumented foot."""
+        out = {}
+        for name, sensor in self.contact_sensors.items():
+            try:
+                force = sensor.data.net_forces_w[0, 0].detach().cpu().numpy()
+            except Exception as e:  # pragma: no cover - sensor availability
+                log.debug(f"contact sensor {name} read failed: {e}")
+                continue
+            out[name] = float(np.linalg.norm(force))
+        return out
 
     def record_pre_step(self, env, context, obs_td, mean_action) -> None:
         """Record everything derivable from the state that produced ``mean_action``.
@@ -286,6 +389,20 @@ class TraceRecorder:
         ref_rot = to_np(mimic.ref_state.rigid_body_rot[0])
         ref_dof_pos = to_np(mimic.ref_state.dof_pos[0])
 
+        # --- foot geometry and contact state (Step 1) -----------------------
+        link_tf = self._link_transforms(env)
+        foot_z = None
+        if self.foot_probe is not None:
+            foot_z = self.foot_probe.lowest(link_tf[:, :3], link_tf[:, 3:7])
+        contact_forces = self._foot_contact_forces()
+        foot_contact = None
+        if contact_forces:
+            foot_contact = sum(
+                1
+                for f in contact_forces.values()
+                if f > physx_probe.CONTACT_FORCE_THRESHOLD_N
+            )
+
         self.trace.append(
             make_trace_row(
                 loop=0,
@@ -297,6 +414,8 @@ class TraceRecorder:
                 dof_pos=dof_pos,
                 ref_dof_pos=ref_dof_pos,
                 dof_vel=dof_vel,
+                foot_z=foot_z,
+                foot_contact=foot_contact,
             )
         )
 
@@ -342,6 +461,54 @@ class TraceRecorder:
         self._append("ref__root_pos", ref_pos[0])
         self._append("ref__anchor_rot", ref_rot[self.anchor_idx])
 
+        # --- PhysX's own state, for the resync probe -------------------------
+        # `state__*` above comes from `env.context`, which is what the *policy*
+        # sees; these come from `simulator.get_robot_state()`, which is what
+        # PhysX *holds*. `test_tracker_isaacsim.py --resync-state` writes these
+        # straight back into another PhysX instance, so they have to be the
+        # simulator's numbers rather than the observation pipeline's -- and it is
+        # the same read `init_state.json` already uses, so step 0 of a resync run
+        # is identical to step 0 of an `--init-state` run by construction.
+        self._record_sim_state(env, link_tf, contact_forces)
+
+    def _record_sim_state(self, env, link_tf: np.ndarray, contact_forces: dict) -> None:
+        """Record the simulator's own state, the resync probe's input."""
+        state = env.simulator.get_robot_state()
+        sim_root_pos = to_np(state.rigid_body_pos[0, 0])
+        sim_root_rot = to_np(state.rigid_body_rot[0, 0])
+        sim_dof_pos = to_np(state.dof_pos[0])
+        sim_dof_vel = to_np(state.dof_vel[0])
+
+        self._append("sim__root_pos", sim_root_pos)
+        self._append("sim__root_rot", sim_root_rot)
+        self._append("sim__root_lin_vel", to_np(state.rigid_body_vel[0, 0]))
+        self._append("sim__root_ang_vel", to_np(state.rigid_body_ang_vel[0, 0]))
+        self._append("sim__dof_pos", sim_dof_pos)
+        self._append("sim__dof_vel", sim_dof_vel)
+        self._append("sim__link_pos", link_tf[:, :3].astype(np.float32))
+        self._append("sim__link_quat", link_tf[:, 3:7].astype(np.float32))
+        self._append(
+            "sim__foot_contact_force",
+            np.asarray(
+                [contact_forces.get(n, np.nan) for n in sorted(self.contact_sensors)],
+                dtype=np.float32,
+            ),
+        )
+
+        if self._context_vs_sim_logged:
+            return
+        self._context_vs_sim_logged = True
+        context_dof_pos = self.arrays["state__dof_pos"][-1]
+        context_root_pos = self.arrays["state__root_pos"][-1]
+        log.info(
+            "Context vs simulator state at step 0: "
+            f"max|d dof_pos|={np.abs(context_dof_pos - sim_dof_pos).max():.3e} "
+            f"max|d root_pos|={np.abs(context_root_pos - sim_root_pos).max():.3e} "
+            "(nonzero would mean the observation pipeline is not reporting raw "
+            "PhysX state, and the action tape would be scored against the wrong "
+            "trajectory)"
+        )
+
     def record_post_step(self, env) -> None:
         """Record the action the environment actually applied for this step."""
         self._append("processed_action", to_np(env._current_processed_action[0]))
@@ -365,6 +532,134 @@ class TraceRecorder:
         npz_path = out_dir / "context_isaaclab.npz"
         np.savez_compressed(npz_path, **stacked, **metadata)
         log.info(f"Context/state arrays ({len(self.trace)} steps) -> {npz_path}")
+
+
+def build_foot_probe(env, robot_config):
+    """Resolve the foot collider geometry and contact sensors for this robot.
+
+    Args:
+        env: The live :class:`BaseEnv`.
+        robot_config: The resolved robot config (for ``contact_bodies``).
+
+    Returns:
+        ``(foot_probe, contact_sensors)``. Either may be ``None``/empty when the
+        robot exposes no feet or no sensors -- callers degrade to the columns they
+        can fill rather than failing, since the height decomposition is useful
+        without contact forces and vice versa.
+    """
+    from isaacsim.core.utils.stage import get_current_stage
+
+    robot = env.simulator._robot
+    body_names = list(robot.data.body_names)
+
+    # `contact_bodies` is the authoritative list of feet -- it is what the
+    # terminations and the contact sensors already use, so deriving the probe
+    # from anything else would let "stance" mean two things in one run.
+    feet = list(getattr(robot_config, "contact_bodies", None) or [])
+    if not feet:
+        feet = [
+            n for n in body_names if "ankle_roll" in n.lower() or "foot" in n.lower()
+        ]
+        log.warning(
+            f"robot_config.contact_bodies is empty; falling back to name-matched "
+            f"feet {feet}"
+        )
+    feet = [n for n in feet if n in body_names]
+
+    stage = get_current_stage()
+    robot_root = str(robot.cfg.prim_path).replace(".*", "0")
+    link_paths = physx_probe.resolve_link_prim_paths(stage, robot_root, feet)
+    probe = physx_probe.FootProbe(
+        stage,
+        link_paths=link_paths,
+        link_indices={n: body_names.index(n) for n in feet},
+    )
+    if probe.missing:
+        log.warning(
+            f"No collider geometry resolved for {probe.missing}; their contact "
+            "height will read as nan."
+        )
+
+    contact_sensors = {
+        name: sensor
+        for name, sensor in getattr(env.simulator, "_contact_sensor_map", {}).items()
+        if name in feet
+    }
+    log.info(
+        f"Foot probe: {len(link_paths)} feet with geometry, "
+        f"{len(contact_sensors)} with contact sensors\n" + probe.describe()
+    )
+    return probe, contact_sensors
+
+
+def dump_ground_and_feet(env, foot_probe) -> None:
+    """Print the Step-1 height decomposition: pelvis, lowest foot collider, ground.
+
+    Reports the three numbers that separate the two explanations of the driver's
+    persistent +1.4 cm pelvis offset:
+
+    - ``pelvis - lowest foot collider`` is **posture**. If it agrees between the
+      two stacks, the joint configuration is the same and the difference is in
+      where the floor is.
+    - ``lowest foot collider - ground z`` is **contact**. If a foot rests at a
+      different height above the collision surface, the disagreement is in the
+      contact solve (offsets, penetration, patch friction), not in the policy or
+      the observation pipeline.
+
+    Printed rather than logged, for the reason :func:`dump_material_stack`
+    documents.
+    """
+    from pxr import UsdGeom
+    from isaacsim.core.utils.stage import get_current_stage
+
+    def emit(msg: str) -> None:
+        print(msg, flush=True)
+
+    stage = get_current_stage()
+    robot = env.simulator._robot
+    body_names = list(robot.data.body_names)
+    link_tf = np.asarray(
+        robot.root_physx_view.get_link_transforms()[0].detach().cpu().numpy(),
+        dtype=np.float64,
+    )
+
+    emit("\n=== Height decomposition (IsaacLab) ===")
+    root_z = float(link_tf[0, 2])
+    emit(f"  pelvis link origin world z   : {root_z:.6f}")
+
+    for name in sorted(foot_probe.geometry):
+        index = body_names.index(name)
+        tips = foot_probe.geometry[name]
+        emit(f"  {name}:")
+        emit(f"    link origin world z        : {float(link_tf[index, 2]):.6f}")
+        emit(
+            f"    lowest collider world z    : "
+            f"{physx_probe.lowest_tip_z(link_tf[index, :3], link_tf[index, 3:7], tips):.6f}"
+        )
+
+    lowest = foot_probe.lowest(link_tf[:, :3], link_tf[:, 3:7])
+    emit(f"  lowest foot collider world z : {lowest:.6f}")
+    emit(f"  pelvis - lowest collider     : {root_z - lowest:.6f}   <- posture")
+
+    xform_cache = UsdGeom.XformCache()
+    for path in ("/World/ground/terrain/mesh", "/World/ground", "/World/GroundPlane"):
+        prim = stage.GetPrimAtPath(path)
+        if not prim.IsValid():
+            continue
+        tf = xform_cache.GetLocalToWorldTransform(prim)
+        ground_z = float(tf.ExtractTranslation()[2])
+        emit(f"  ground prim {path} world z = {ground_z:.6f}")
+        emit(f"    lowest collider - ground   : {lowest - ground_z:.6f}   <- contact")
+        break
+
+    forces = {
+        name: float(
+            np.linalg.norm(sensor.data.net_forces_w[0, 0].detach().cpu().numpy())
+        )
+        for name, sensor in getattr(env.simulator, "_contact_sensor_map", {}).items()
+    }
+    if forces:
+        emit(f"  foot contact force magnitudes: {forces}")
 
 
 def dump_material_stack(env) -> None:
@@ -495,6 +790,38 @@ def dump_material_stack(env) -> None:
             f"values={np.round(vals, 4).tolist()}"
         )
 
+    # --- per-link rigid-body properties, PhysX + composed stage ------------
+    # The gap this closes: both stacks author `physxRigidBody:*`, but through
+    # different traversals -- IsaacLab's `modify_rigid_body_properties` is wrapped
+    # in `apply_nested`, which skips instanced prims (the mechanism that already
+    # silently dropped the collider offsets), while the driver walks a plain
+    # `Usd.PrimRange`. Two different skip rules over the same instanceable asset
+    # can reach two different sets of links, and until now nothing read them back.
+    robot_root = str(robot.cfg.prim_path).replace(".*", "0")
+    body_names = list(robot.data.body_names)
+
+    def _view_read(method: str):
+        fn = getattr(view, method, None)
+        if fn is None:
+            return None
+        try:
+            return np.asarray(fn()[0].detach().cpu().numpy())
+        except Exception as e:  # pragma: no cover - version dependent
+            emit(f"  <{method}() read-back failed: {e}>")
+            return None
+
+    physx_probe.dump_link_properties(
+        emit,
+        stage,
+        body_names=body_names,
+        link_prim_paths=physx_probe.resolve_link_prim_paths(
+            stage, robot_root, body_names
+        ),
+        masses=_view_read("get_masses"),
+        inertias=_view_read("get_inertias"),
+        coms=_view_read("get_coms"),
+    )
+
     emit("\n=== Material stack (foot-ground friction pair) ===")
 
     try:
@@ -518,7 +845,6 @@ def dump_material_stack(env) -> None:
     except Exception as e:  # pragma: no cover - version dependent
         emit(f"  robot physics-view material read-back failed: {e}")
 
-    robot_root = str(robot.cfg.prim_path).replace(".*", "0")
     robot_colliders = colliders_under(stage, robot_root)
     bound = [p for p in robot_colliders if bound_material(p) is not None]
     emit(
@@ -557,6 +883,137 @@ def dump_material_stack(env) -> None:
         "  (trailing '*' = value is the schema default, unauthored by any layer; "
         "'*(auto)' = PhysX derives it from shape size)"
     )
+
+
+def run_drive_probe(env, joint_names: list, out_dir: Path) -> None:
+    """Run the paired drive-response probe on this stack (see deployment/drive_probe.py).
+
+    Writes the spec (so the Isaac Sim driver replays *these* cases, not a
+    re-derived set) and this stack's response.
+
+    Deliberately bypasses ``env.step``.  The probe's whole point is that no
+    controller, observation, reward or termination sits between the written
+    state and the recorded response -- the only things acting are gravity and
+    the PD drive.  The substep loop below is ``IsaacLabSimulator._physics_step``
+    with ``_apply_control()`` replaced by a constant target, which for
+    ``BUILT_IN_PD`` is what ``_apply_control()`` does anyway (it re-applies the
+    same ``_common_actions`` every substep -- verified in round 3).
+
+    Reads go through ``root_physx_view``, not ``robot.data.*``: the driver reads
+    the same tensor API, so the two logs are PhysX-against-PhysX with no
+    IsaacLab-side buffer refresh, unit conversion or quaternion reordering in
+    between.
+    """
+    from deployment import drive_probe
+
+    sim = env.simulator
+    robot = sim._robot
+    view = robot.root_physx_view
+    device = robot.device
+    to_common = sim.data_conversion.dof_convert_to_common
+    to_sim = sim.data_conversion.dof_convert_to_sim
+
+    state = sim.get_robot_state()
+    tape = None
+    if args.drive_probe_tape is not None:
+        tape = dict(np.load(args.drive_probe_tape, allow_pickle=True))
+
+    spec = drive_probe.build_spec(
+        joint_names=joint_names,
+        base_root_pos=to_np(state.rigid_body_pos[0, 0]),
+        base_root_quat_xyzw=to_np(state.rigid_body_rot[0, 0]),
+        default_dof_pos=to_np(state.dof_pos[0]),
+        substeps=sim.decimation,
+        physics_dt=float(sim._sim.get_physics_dt()),
+        lift=float(args.drive_probe_lift),
+        tape=tape,
+    )
+    spec_path = Path(args.drive_probe_spec_out or (out_dir / "drive_probe_spec.npz"))
+    drive_probe.write_spec(spec_path, spec)
+    log.info(
+        f"Drive probe: {int(spec['spec__labels'].shape[0])} cases x "
+        f"{sim.decimation} substeps -> spec {spec_path}"
+    )
+
+    recorder = drive_probe.ProbeRecorder(spec, stack="isaaclab")
+
+    def _sample(case: int) -> None:
+        dof_pos = view.get_dof_positions()[0][to_common]
+        dof_vel = view.get_dof_velocities()[0][to_common]
+        root = view.get_root_transforms()[0]
+        recorder.sample(
+            case,
+            dof_pos=dof_pos.detach().cpu().numpy(),
+            dof_vel=dof_vel.detach().cpu().numpy(),
+            root_pos=root[:3].detach().cpu().numpy(),
+            root_quat_xyzw=root[3:7].detach().cpu().numpy(),
+        )
+
+    def _prop(method):
+        """Read one per-DOF property in policy order.
+
+        The gain/armature getters hand back **CPU** tensors even on the GPU
+        pipeline, while the state getters return GPU ones, so the reorder index
+        has to follow the tensor rather than the simulation device.
+        """
+        fn = getattr(view, method, None)
+        if fn is None:
+            return None
+        try:
+            values = fn()[0]
+            return values[to_common.to(values.device)].detach().cpu().numpy()
+        except Exception as e:  # pragma: no cover - version dependent
+            log.warning(f"drive probe: {method}() read-back failed: {e}")
+            return None
+
+    def _t(array, index=None):
+        out = torch.as_tensor(np.asarray(array), dtype=torch.float32, device=device)
+        return out if index is None else out[index]
+
+    target_readback, vel_target_readback = [], []
+    for case in range(recorder.num_cases):
+        # xyzw -> wxyz: write_root_state_to_sim takes IsaacLab's convention.
+        quat_xyzw = np.asarray(spec["spec__root_quat_xyzw"][case])
+        root_state = torch.cat(
+            [
+                _t(spec["spec__root_pos"][case]),
+                _t(quat_xyzw[[3, 0, 1, 2]]),
+                _t(spec["spec__root_lin_vel"][case]),
+                _t(spec["spec__root_ang_vel"][case]),
+            ]
+        ).unsqueeze(0)
+        robot.write_root_state_to_sim(root_state)
+        robot.write_joint_state_to_sim(
+            _t(spec["spec__dof_pos"][case], to_sim).unsqueeze(0),
+            _t(spec["spec__dof_vel"][case], to_sim).unsqueeze(0),
+        )
+        robot.set_joint_position_target(
+            _t(spec["spec__target"][case], to_sim).unsqueeze(0)
+        )
+        robot.write_data_to_sim()
+
+        _sample(case)
+        target_readback.append(_prop("get_dof_position_targets"))
+        vel_target_readback.append(_prop("get_dof_velocity_targets"))
+
+        for _ in range(recorder.substeps):
+            robot.write_data_to_sim()
+            sim._sim.step(render=False)
+            _sample(case)
+
+    out_path = Path(args.drive_probe_out)
+    recorder.write(
+        out_path,
+        target_readback=target_readback,
+        vel_target_readback=vel_target_readback,
+        stiffness=_prop("get_dof_stiffnesses"),
+        damping=_prop("get_dof_dampings"),
+        armature=_prop("get_dof_armatures"),
+        friction=_prop("get_dof_friction_coefficients"),
+        max_force=_prop("get_dof_max_forces"),
+        max_velocity=_prop("get_dof_max_velocities"),
+    )
+    log.info(f"Drive probe (isaaclab) -> {out_path}")
 
 
 def dump_init_state(env, out_dir: Path, joint_names: list) -> None:
@@ -665,11 +1122,24 @@ def main() -> None:
     #      sets `.disabled` on every logger created before it -- including the
     #      module-level one built at import time, above the AppLauncher line.
     # `force=True` alone fixes only the first and leaves the module silent.
+    #
+    # Measured on Isaac Sim 5.1: even both of those together are not enough --
+    # every log.info() below still went nowhere, and an entire reference-trace run
+    # produced its artifacts with none of its numbers on screen. Rather than keep
+    # guessing which of Kit's reconfigurations wins, own the handler outright:
+    # attach a stderr handler directly to this module's logger and stop
+    # propagating to the root logger Kit keeps rewriting. Do not replace this with
+    # basicConfig() again; it has now failed twice.
     logging.basicConfig(
         level=logging.INFO, format="%(levelname)s  %(message)s", force=True
     )
     log.disabled = False
     log.setLevel(logging.INFO)
+    log.propagate = False
+    if not log.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("%(levelname)s  %(message)s"))
+        log.addHandler(handler)
 
     from protomotions.simulator.base_simulator.utils import (
         convert_friction_for_simulator,
@@ -718,7 +1188,6 @@ def main() -> None:
     joint_names = list(robot_config.kinematic_info.dof_names)
     anchor_idx = robot_config.anchor_body_index
     actor_in_keys = list(agent_config.model.actor.in_keys)
-    recorder = TraceRecorder(actor_in_keys, anchor_idx, env.dt)
 
     tape = None
     if args.action_tape is not None:
@@ -735,8 +1204,24 @@ def main() -> None:
         obs, _ = env.reset(None)
         dump_init_state(env, out_dir, joint_names)
 
+        # After reset(): the physics view (and therefore the link transforms the
+        # probe queries) does not exist before the first step of the sim.
+        foot_probe, contact_sensors = build_foot_probe(env, robot_config)
+        recorder = TraceRecorder(
+            actor_in_keys,
+            anchor_idx,
+            env.dt,
+            foot_probe=foot_probe,
+            contact_sensors=contact_sensors,
+        )
+
         if args.dump_material_stack:
+            dump_ground_and_feet(env, foot_probe)
             dump_material_stack(env)
+            return
+
+        if args.drive_probe_out is not None:
+            run_drive_probe(env, joint_names, out_dir)
             return
 
         step = 0
@@ -782,6 +1267,12 @@ def main() -> None:
                 "meta__checkpoint": np.array(str(checkpoint)),
                 "meta__motion_file": np.array(str(motion_lib_config.motion_file)),
                 "meta__motion_index": np.asarray(args.motion_index, dtype=np.int64),
+                # Sim link order, so the driver can check its own `body_names`
+                # against this list rather than assuming the two agree.
+                "meta__body_names": np.array(
+                    list(env.simulator._robot.data.body_names)
+                ),
+                "meta__contact_body_names": np.array(sorted(contact_sensors)),
             },
         )
     finally:
