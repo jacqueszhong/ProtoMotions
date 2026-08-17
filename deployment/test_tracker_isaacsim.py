@@ -128,6 +128,36 @@ Isaac Sim specifics (read before pointing this at a new robot)
   what found it was ``--drive-probe``, which puts the robot out of contact and
   isolates the drive's stiffness and damping terms from each other.
 
+- **``--scenes-file`` spawns a SceneLib scene's objects.**  Without it this
+  driver authors robot + ground + lights and nothing else, so a policy trained
+  against a scene -- ``examples/experiments/mimic/g1_pick_box.py``, whose G1
+  picks up a box along a reference trajectory -- had nothing to reach for.  With
+  it, the scene's objects become real PhysX rigid bodies, are teleported onto
+  their SceneLib reference pose at every clip restart, and are scored in
+  ``--trace-out`` (``obj_pos_err``, ``obj_rot_err_deg``).  Points worth knowing:
+
+  - *The policy does not observe them.*  ``g1_pick_box.py`` fixes the box pose
+    per motion via ``Scene.humanoid_motion_id`` and the exporters carry no
+    ``scene_obs`` channel, so objects here are physics and scoring only -- the
+    ONNX input contract is untouched.
+  - *Two unrelated meanings of "static".*  ``ObjectOptions.fix_base_link`` is
+    the physical one and maps to ``physics:kinematicEnabled``, matching
+    IsaacLab's ``RigidBodyPropertiesCfg(kinematic_enabled=...)``.
+    ``SceneLib._is_static_object`` (``not obj.has_motion()``) is a data
+    property that only gates the z respawn lift in ``get_scene_pose``.  A
+    single-frame object is still an ordinary body that falls.
+  - *Collider offsets are authored on objects but not on the robot*, which is
+    not the contradiction it looks like -- see
+    :func:`_author_scene_object_physics`.  In short: the robot's colliders are
+    instance proxies IsaacLab's writer cannot reach, so training's request
+    never lands and matching training means not authoring; freshly authored
+    object prims are not instance proxies, so IsaacLab's request *does* land
+    there.
+  - *Incompatible with ``--resync-state``.*  The action tape has no object
+    channel, so resyncing the robot while the objects drift would quietly
+    invalidate that mode's one-step-experiment claim; the combination exits.
+    Plain ``--action-tape`` warns and runs.
+
 - **Root articulation prim**: found by searching for
   ``UsdPhysics.ArticulationRootAPI`` (:meth:`TrackerPolicy._find_articulation_root`),
   *not* by assuming a path shape.  For these assets the bodies live under
@@ -202,6 +232,13 @@ Usage
         --onnx data/pretrained_models/motion_tracker/g1-bones-deploy/compiled_models/unified_pipeline.onnx \
         --motion data/motion_for_trackers/g1_random_subset_tiny.pt
 
+With a scene (objects spawn, reset per loop, and are scored in the trace)::
+
+    python deployment/test_tracker_isaacsim.py \
+        --onnx <pick_box_export>/unified_pipeline.onnx \
+        --motion <pickup_motion>.pt \
+        --scenes-file /tmp/box.pt --loops 3 --trace-out /tmp/box_trace.json
+
 """
 
 from __future__ import annotations
@@ -270,6 +307,53 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="After loading a raw motion file, write a 50fps cache next to it",
+    )
+    p.add_argument(
+        "--scenes-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a ProtoMotions scenes .pt (data/scripts/create_box_scene.py). "
+            "Spawns the scene's objects as real PhysX rigid bodies, resets them "
+            "from the SceneLib reference at every clip restart, and scores their "
+            "pose error in --trace-out. Same flag name as inference_agent.py; "
+            "'none'/'null' disables. Without it no ProtoMotions module is "
+            "imported at all."
+        ),
+    )
+    p.add_argument(
+        "--scenes-asset-root",
+        type=str,
+        default=None,
+        help=(
+            "Root for resolving relative mesh paths inside the scenes file. "
+            "Defaults to SceneLib's own guess, the *grandparent* of the scenes "
+            "file -- which is asymmetric with the save side (paths are stored "
+            "relative to the file's parent), so pass this when a mesh scene "
+            "fails to load."
+        ),
+    )
+    p.add_argument(
+        "--scene-index",
+        type=int,
+        default=None,
+        help=(
+            "Which scene in the file to spawn. Default (unset) picks the scene "
+            "whose humanoid_motion_id equals --motion-index, falling back to 0 "
+            "with a warning when nothing is paired."
+        ),
+    )
+    p.add_argument(
+        "--scene-object-z-offset",
+        type=float,
+        default=0.0,
+        help=(
+            "Add this to the objects' spawn height, the object analogue of "
+            "--init-z-offset. Passed to SceneLib.get_scene_pose(respawn_offset=), "
+            "so like ProtoMotions' env.config.ref_object_respawn_offset it lifts "
+            "only objects that carry a motion trajectory. Defaults to 0.0, "
+            "matching this driver's flush-spawn stance for the robot."
+        ),
     )
     p.add_argument(
         "--loops",
@@ -581,6 +665,7 @@ from deployment.state_utils import (  # noqa: E402
     compute_root_local_ang_vel_np,
     compute_yaw_offset_np,
     make_trace_row,
+    quat_angle_deg_xyzw,
     summarize_trace,
 )
 
@@ -950,9 +1035,14 @@ class TrackerPolicy:
         init_z_offset: float = 0.0,
         author_collider_offsets: bool = False,
         resync_state: bool = False,
+        scene_objects=None,
     ) -> None:
         self.author_collider_offsets = bool(author_collider_offsets)
         self.resync_state = bool(resync_state)
+        # Spawned SceneLib objects (--scenes-file), or None. Physics and scoring
+        # only: the ONNX graph carries no scene channel, so the policy does not
+        # observe them -- see the module docstring.
+        self.scene_objects = scene_objects
         robot_meta = meta["robot"]
         timing = meta["timing"]
         motion_meta = meta["motion"]
@@ -1716,6 +1806,8 @@ class TrackerPolicy:
         self._apply_solver_iterations(view)
         self._apply_joint_properties(view)
         self._build_foot_probe(view)
+        if self.scene_objects is not None:
+            self.scene_objects.initialize()
 
     def _build_foot_probe(self, view) -> None:
         """Resolve the feet's collider geometry so contact height can be measured.
@@ -2045,6 +2137,18 @@ class TrackerPolicy:
             root_lin_vel=root_lin_vel,
             root_ang_vel=root_ang_vel,
         )
+
+        # Objects land in the same "outside the physics step" window the robot
+        # write above requires, and at the same clip time (frame 0). --init-state
+        # moves the robot to IsaacLab's absolute spawn, so the objects take the
+        # same translation -- ProtoMotions applies one offset to both.
+        if self.scene_objects is not None:
+            root_offset = (
+                self._init_state.get("respawn_root_offset")
+                if self._init_state is not None
+                else None
+            )
+            self.scene_objects.reset(motion_time=0.0, root_offset=root_offset)
 
         self._frame_idx = 0
         self._decimation_counter = 0
@@ -2475,11 +2579,14 @@ class TrackerPolicy:
         MuJoCo harness has no equivalent), which turns the trace's ``root_h``
         column from a bare height into a decomposition: ``pelvis - foot`` is
         posture, ``foot - ground`` is contact.
+
+        ``obj_pos_err``/``obj_rot_err_deg`` are added with ``--scenes-file``.
         """
         if self.trace is None:
             return
         ref = self.motion_player.get_state_at_frame(self._frame_idx)
         root_pos, _ = self.robot.get_world_pose()
+        obj_pos_err, obj_rot_err_deg = self._object_pose_errors()
         self.trace.append(
             make_trace_row(
                 loop=self._loop_idx,
@@ -2492,8 +2599,37 @@ class TrackerPolicy:
                 ref_dof_pos=ref["dof_pos"],
                 dof_vel=dof_vel,
                 foot_z=self._lowest_foot_z(),
+                obj_pos_err=obj_pos_err,
+                obj_rot_err_deg=obj_rot_err_deg,
             )
         )
+
+    def _object_pose_errors(self):
+        """Scene-object pose error against the SceneLib reference at this frame.
+
+        The object-side analogue of ``joint_err``: how far the objects are from
+        where the scene's reference trajectory says they should be *now*. Nothing
+        drives them there -- they are written once at reset and then left to
+        physics, exactly as in IsaacLab -- so this measures the manipulation, not
+        a tracking controller.
+
+        Returns:
+            ``(mean position error [m], mean orientation error [deg])``, or
+            ``(None, None)`` without ``--scenes-file``, which drops the columns.
+        """
+        if self.scene_objects is None:
+            return None, None
+        ref_pos, ref_quat = self.scene_objects.reference_pose(
+            self._frame_idx * self.control_dt
+        )
+        pos, quat = self.scene_objects.measured_pose()
+        pos_err = float(np.linalg.norm(pos - ref_pos, axis=-1).mean())
+        rot_err = float(
+            np.mean(
+                [quat_angle_deg_xyzw(quat[i], ref_quat[i]) for i in range(len(quat))]
+            )
+        )
+        return pos_err, rot_err
 
     def forward(self, dt: float) -> None:
         """Physics-callback entry point -- called once per physics substep.
@@ -3327,7 +3463,12 @@ def _configure_physics_scene(world, robot_props: dict) -> None:
 
 
 def _add_physics_material(
-    stage, path: str, static_friction: float, dynamic_friction: float, combine: str
+    stage,
+    path: str,
+    static_friction: float,
+    dynamic_friction: float,
+    combine: str,
+    restitution: float = 0.0,
 ):
     """Author a physics material and return its prim, mirroring IsaacLab's terrain one.
 
@@ -3339,13 +3480,23 @@ def _add_physics_material(
     taking the higher-priority mode (``average < min < multiply < max``), so an
     unauthored mode flips the result silently the moment either side changes.
     Author both explicitly here.
+
+    Args:
+        stage: USD stage to author on.
+        path: Prim path for the material.
+        static_friction: Static friction coefficient.
+        dynamic_friction: Dynamic friction coefficient.
+        combine: Friction/restitution combine mode token, e.g. ``"average"``.
+        restitution: Restitution coefficient. Defaults to 0.0, which is what
+            every ground caller wants; scene objects pass their
+            ``ObjectOptions.restitution`` through here.
     """
     mat_prim = UsdShade.Material.Define(stage, path).GetPrim()
     UsdPhysics.MaterialAPI.Apply(mat_prim)
     PhysxSchema.PhysxMaterialAPI.Apply(mat_prim)
     _set_prim_attr(mat_prim, "physics:staticFriction", float(static_friction))
     _set_prim_attr(mat_prim, "physics:dynamicFriction", float(dynamic_friction))
-    _set_prim_attr(mat_prim, "physics:restitution", 0.0)
+    _set_prim_attr(mat_prim, "physics:restitution", float(restitution))
     _set_prim_attr(mat_prim, "physxMaterial:frictionCombineMode", combine)
     _set_prim_attr(mat_prim, "physxMaterial:restitutionCombineMode", combine)
     return mat_prim
@@ -3448,6 +3599,398 @@ def add_protomotions_trimesh_ground(
     )
 
 
+# ---------------------------------------------------------------------------
+# Scene objects (--scenes-file)
+# ---------------------------------------------------------------------------
+
+#: Per-kind fallback colours, copied from
+#: ``IsaacLabSimulator._preprocess_object_playground`` so an object whose
+#: ``ObjectOptions.color`` is unset looks the same in both stacks.
+_OBJECT_COLOR_DEFAULTS = {
+    "box": (0.8, 0.3, 0.3),
+    "sphere": (0.3, 0.3, 0.8),
+    "cylinder": (0.3, 0.8, 0.3),
+    "mesh": (0.2, 0.7, 0.3),
+}
+
+#: Collider offsets IsaacLab spawns every scene object with
+#: (``CollisionPropertiesCfg(contact_offset=0.002, rest_offset=0.0)``).
+_OBJECT_CONTACT_OFFSET = 0.002
+_OBJECT_REST_OFFSET = 0.0
+
+#: PhysX's own default friction, used when ``ObjectOptions`` requests none --
+#: see :func:`_author_scene_object_physics` on why not the wrappers' default.
+_PHYSX_DEFAULT_FRICTION = 0.5
+
+
+def _author_scene_object_physics(
+    stage, prim_path: str, spec, mesh_collision_approximation=None
+) -> None:
+    """Write one scene object's PhysX properties onto an already-created prim.
+
+    Split out of :func:`add_scene_objects` so primitives and meshes go through
+    the *same* property path -- the part that has to mirror IsaacLab is the
+    physics, not the geometry.
+
+    Three decisions worth stating:
+
+    - **Collider offsets are authored unconditionally**, unlike the robot's
+      (``--author-collider-offsets`` defaults to off). That is not a
+      contradiction: the robot default exists because its colliders are
+      *instance proxies* that IsaacLab's writer cannot reach, so training's
+      0.02/0.0 request never lands and matching training means not authoring
+      either. These object prims are freshly authored and not instance proxies,
+      so IsaacLab's request *does* land on them there -- authoring is what
+      matches.
+
+    - **Mass, not the wrapper's guess.** ``DynamicCuboid``/``DynamicSphere``/
+      ``DynamicCylinder`` default to ``mass=0.02`` kg when none is passed, which
+      would silently outrank the scene's density. Author both fields explicitly:
+      ``physics:mass`` when the scene names a mass, otherwise ``0.0`` (the
+      schema's "derive from density") plus ``physics:density`` -- the same split
+      as ``IsaacLabSimulator._mass_props_from_options``.
+
+    - **The material is explicit.** IsaacLab passes no physics material for
+      scene objects, so they land on PhysX's built-in default; the Isaac Sim
+      convenience wrappers, in contrast, invent a 0.2/1.0 material. Neither is a
+      value anyone chose. Author one: the scene's own friction/restitution when
+      ``ObjectOptions`` supplies them (a deliberate divergence -- IsaacLab drops
+      those fields, and for a pickup task grip friction is exactly the number
+      that matters), otherwise PhysX's 0.5/0.5/0.0.
+
+    Args:
+        stage: The USD stage.
+        prim_path: Path of the object's root prim.
+        spec: The :class:`deployment.scene_utils.SceneObjectSpec` to apply.
+        mesh_collision_approximation: ``SceneLibConfig.mesh_collision_approximation``,
+            applied to mesh colliders when set.
+    """
+    prim = stage.GetPrimAtPath(prim_path)
+
+    # fix_base_link is the *physical* static flag; SceneLib's `_is_static_object`
+    # (= no motion data) is a different property and must not be used here.
+    # IsaacLab: RigidBodyPropertiesCfg(kinematic_enabled=object_options.fix_base_link).
+    _set_prim_attr(prim, "physics:kinematicEnabled", bool(spec.fix_base_link))
+
+    UsdPhysics.MassAPI.Apply(prim)
+    if spec.mass is not None:
+        _set_prim_attr(prim, "physics:mass", float(spec.mass))
+        _set_prim_attr(prim, "physics:density", 0.0)
+    else:
+        _set_prim_attr(prim, "physics:mass", 0.0)
+        _set_prim_attr(prim, "physics:density", float(spec.density or 0.0))
+
+    colliders = _find_prims_with_api(stage, prim_path, UsdPhysics.CollisionAPI)
+    for collider in colliders:
+        PhysxSchema.PhysxCollisionAPI.Apply(collider)
+        _set_prim_attr(collider, "physxCollision:contactOffset", _OBJECT_CONTACT_OFFSET)
+        _set_prim_attr(collider, "physxCollision:restOffset", _OBJECT_REST_OFFSET)
+        if spec.kind == "mesh" and mesh_collision_approximation is not None:
+            mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(collider)
+            mesh_collision.CreateApproximationAttr().Set(
+                str(mesh_collision_approximation)
+            )
+
+    static_friction = (
+        spec.static_friction
+        if spec.static_friction is not None
+        else _PHYSX_DEFAULT_FRICTION
+    )
+    dynamic_friction = (
+        spec.dynamic_friction
+        if spec.dynamic_friction is not None
+        else _PHYSX_DEFAULT_FRICTION
+    )
+    material = _add_physics_material(
+        stage,
+        f"{prim_path}/physicsMaterial",
+        static_friction=static_friction,
+        dynamic_friction=dynamic_friction,
+        combine="average",
+        restitution=spec.restitution if spec.restitution is not None else 0.0,
+    )
+    # Bound on the "physics" purpose and on the object root, so it resolves for
+    # every collider beneath it -- the same shape as the trimesh ground's bind.
+    binding_api = UsdShade.MaterialBindingAPI.Apply(prim)
+    binding_api.Bind(
+        UsdShade.Material(material),
+        bindingStrength=UsdShade.Tokens.weakerThanDescendants,
+        materialPurpose="physics",
+    )
+
+    log.info(
+        f"  {prim_path}: {spec.kind} "
+        + (f"mass={spec.mass}" if spec.mass is not None else f"density={spec.density}")
+        + f" kinematic={bool(spec.fix_base_link)} "
+        f"friction={static_friction}/{dynamic_friction} "
+        f"restitution={spec.restitution if spec.restitution is not None else 0.0} "
+        f"({len(colliders)} collider(s))"
+    )
+
+
+def _add_mesh_scene_object(stage, prim_path: str, spec, color) -> None:
+    """Reference a mesh asset in and give it rigid-body + collider APIs.
+
+    The primitive kinds get all of this from ``isaacsim.core.api.objects``;
+    meshes have no such wrapper, so the same three things are done by hand:
+    reference the asset, apply ``RigidBodyAPI`` to its root, and apply
+    ``CollisionAPI`` to every geometry prim underneath (a referenced asset's
+    meshes are descendants, not the root itself).
+
+    Args:
+        stage: The USD stage.
+        prim_path: Where to reference the asset in.
+        spec: The mesh :class:`~deployment.scene_utils.SceneObjectSpec`.
+        color: RGB display colour applied to any gprim lacking its own.
+    """
+    from pxr import Gf, UsdGeom
+
+    asset_path = spec.usd_path
+    if not os.path.exists(asset_path):
+        raise FileNotFoundError(
+            f"Scene mesh asset not found: {asset_path}. Relative paths inside a "
+            f"scenes file resolve against --scenes-asset-root (default: the "
+            f"grandparent of the scenes file)."
+        )
+    add_reference_to_stage(usd_path=asset_path, prim_path=prim_path)
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        raise ValueError(f"Referencing {asset_path} at {prim_path} produced no prim")
+
+    # XformCommonAPI rather than AddScaleOp: the referenced asset may already
+    # carry xform ops, and this keeps the op order valid instead of appending a
+    # second, possibly out-of-order, scale.
+    UsdGeom.XformCommonAPI(prim).SetScale(Gf.Vec3f(*[float(s) for s in spec.scale]))
+
+    UsdPhysics.RigidBodyAPI.Apply(prim)
+    geom_count = 0
+    for child in Usd.PrimRange(
+        prim, Usd.TraverseInstanceProxies(Usd.PrimAllPrimsPredicate)
+    ):
+        if not child.IsA(UsdGeom.Gprim):
+            continue
+        geom_count += 1
+        UsdPhysics.CollisionAPI.Apply(child)
+        gprim = UsdGeom.Gprim(child)
+        if not gprim.GetDisplayColorAttr().IsAuthored():
+            gprim.CreateDisplayColorAttr([Gf.Vec3f(*[float(c) for c in color])])
+    if geom_count == 0:
+        raise ValueError(
+            f"{asset_path} contains no geometry prims under {prim_path}; nothing "
+            f"to collide with."
+        )
+
+
+def add_scene_objects(
+    specs, root_path: str = "/World/Scene", mesh_collision_approximation=None
+) -> list:
+    """Spawn a SceneLib scene's objects onto the stage as PhysX rigid bodies.
+
+    The scene half of ``--scenes-file``: turns the descriptions from
+    :func:`deployment.scene_utils.scene_object_specs` into prims. Follows the
+    precedent set by :func:`add_protomotions_trimesh_ground` -- hand-authored USD
+    rather than any ProtoMotions spawner, and no ProtoMotions import in this
+    function at all, so a run without ``--scenes-file`` never touches the
+    package.
+
+    Objects are spawned at the origin; their real poses are written at every
+    reset by :class:`SceneObjects`, exactly as IsaacLab spawns at the origin and
+    positions in ``reset_envs``.
+
+    **Must be called before ``world.reset()``** -- these are stage edits, and
+    PhysX only reads the stage when the sim starts playing.
+
+    Args:
+        specs: List of :class:`~deployment.scene_utils.SceneObjectSpec`.
+        root_path: Scope to author the objects under.
+        mesh_collision_approximation: ``SceneLibConfig.mesh_collision_approximation``,
+            forwarded to mesh colliders.
+
+    Returns:
+        The created prim paths, in spec order -- which is SceneLib's object
+        order, so the caller can index pose tensors with it positionally.
+
+    Raises:
+        ValueError: On an unknown object kind.
+    """
+    from isaacsim.core.api.objects import DynamicCuboid, DynamicCylinder, DynamicSphere
+
+    stage = get_current_stage()
+    log.info(f"Scene: spawning {len(specs)} object(s) under {root_path}")
+
+    prim_paths = []
+    for index, spec in enumerate(specs):
+        prim_path = f"{root_path}/Object_{index}"
+        name = f"scene_object_{index}"
+        color = np.asarray(
+            spec.color
+            if spec.color is not None
+            else _OBJECT_COLOR_DEFAULTS.get(spec.kind, (0.5, 0.5, 0.5)),
+            dtype=np.float32,
+        )
+
+        if spec.kind == "box":
+            # size=1.0 + scale=(w, d, h) is how IsaacLab's CuboidCfg expresses a
+            # box too: a unit cube carrying its dimensions in the xform scale.
+            DynamicCuboid(
+                prim_path=prim_path,
+                name=name,
+                size=1.0,
+                scale=np.asarray(spec.size, dtype=np.float32),
+                color=color,
+            )
+        elif spec.kind == "sphere":
+            DynamicSphere(
+                prim_path=prim_path, name=name, radius=float(spec.radius), color=color
+            )
+        elif spec.kind == "cylinder":
+            DynamicCylinder(
+                prim_path=prim_path,
+                name=name,
+                radius=float(spec.radius),
+                height=float(spec.height),
+                color=color,
+            )
+        elif spec.kind == "mesh":
+            _add_mesh_scene_object(stage, prim_path, spec, color)
+        else:
+            raise ValueError(f"Unsupported scene object kind: {spec.kind}")
+
+        _author_scene_object_physics(
+            stage,
+            prim_path,
+            spec,
+            mesh_collision_approximation=mesh_collision_approximation,
+        )
+        prim_paths.append(prim_path)
+
+    return prim_paths
+
+
+class SceneObjects:
+    """Runtime handle on the spawned scene objects: reset them, read them back.
+
+    Deliberately thin. Like IsaacLab, objects are written once per episode and
+    then left entirely to physics -- there is no per-substep work here, because
+    a driver that nudged the box every step would be measuring its own writes
+    instead of the policy's manipulation.
+
+    All reads go through the initialized :class:`isaacsim.core.prims.RigidPrim`
+    view rather than a USD stage read. The module docstring's instance-proxy
+    trap does not literally apply to these freshly authored prims, but the rule
+    it justifies -- physics view, never USD -- does, and the failure mode is
+    identical: a stage read returns the spawn pose forever, so a box being
+    carried across the room would trace as a perfectly stationary object.
+    """
+
+    def __init__(self, scene_lib, prim_paths: list, z_offset: float = 0.0) -> None:
+        """Wrap the spawned object prims.
+
+        Args:
+            scene_lib: Single-scene ``SceneLib`` from
+                :func:`deployment.scene_utils.build_scene_lib`.
+            prim_paths: Prim paths from :func:`add_scene_objects`, in SceneLib
+                object order.
+            z_offset: ``respawn_offset`` for ``get_scene_pose``
+                (``--scene-object-z-offset``).
+        """
+        from isaacsim.core.prims import RigidPrim
+
+        self.scene_lib = scene_lib
+        self.prim_paths = list(prim_paths)
+        self.z_offset = float(z_offset)
+        self.num_objects = len(self.prim_paths)
+        # Latched by reset(); applied by reference_pose() so the trace scores
+        # against the same frame the objects were written in.
+        self.root_offset = None
+        # An explicit path list, not a regex: a regex view is ordered by string
+        # match, which stops agreeing with SceneLib's object order at ten
+        # objects ("Object_10" sorts before "Object_2").
+        self.view = RigidPrim(prim_paths_expr=self.prim_paths, name="scene_objects")
+
+    def initialize(self) -> None:
+        """Create the physics view. Call after ``world.reset()``, like the robot's."""
+        self.view.initialize()
+        log.info(
+            f"Scene objects initialized: {self.num_objects} rigid bodies "
+            f"({', '.join(self.prim_paths)})"
+        )
+
+    def reference_pose(self, motion_time: float):
+        """Reference object poses at ``motion_time``, in world coordinates.
+
+        Includes :attr:`root_offset`, so this is directly comparable to
+        :meth:`measured_pose` -- which is what the trace needs.
+
+        Args:
+            motion_time: Time into the clip, seconds. The object trajectory and
+                the motion share a clock -- that is the whole meaning of
+                ``Scene.humanoid_motion_id``.
+
+        Returns:
+            ``(pos [N, 3], quat_xyzw [N, 4])`` NumPy arrays.
+        """
+        import torch
+
+        state = self.scene_lib.get_scene_pose(
+            torch.tensor([0], dtype=torch.long),
+            torch.tensor([float(motion_time)], dtype=torch.float),
+            respawn_offset=self.z_offset,
+        )
+        pos = state.root_pos[0].cpu().numpy().astype(np.float32)
+        quat_xyzw = state.root_rot[0].cpu().numpy().astype(np.float32)
+        if self.root_offset is not None:
+            pos = pos + self.root_offset
+        return pos, quat_xyzw
+
+    def reset(self, motion_time: float = 0.0, root_offset=None) -> None:
+        """Teleport the objects onto their reference pose and zero their velocity.
+
+        **Call only from outside the physics step**, for the same reason
+        :meth:`TrackerPolicy.reset_episode` gives for the robot.
+
+        Args:
+            motion_time: Time into the clip to take the reference from.
+            root_offset: Optional ``[3]`` world translation added to every
+                object, carrying ``--init-state``'s ``respawn_root_offset``.
+                ProtoMotions applies that same offset to robot *and* objects
+                (``BaseEnv.move_reset_robot_obj_states_to_respawn_position``);
+                without it the robot would spawn at IsaacLab's absolute position
+                and the objects tens of metres away at the motion's own origin.
+        """
+        if root_offset is not None:
+            self.root_offset = np.asarray(root_offset, dtype=np.float32).reshape(1, 3)
+        pos, quat_xyzw = self.reference_pose(motion_time)
+
+        # get/set_world_poses speak wxyz, unlike the articulation's
+        # get_link_transforms() (already xyzw). Convert at the boundary.
+        quat_wxyz = np.asarray(quat_xyzw)[:, [3, 0, 1, 2]].astype(np.float32)
+        self.view.set_world_poses(
+            positions=TrackerPolicy._for_view(self.view, pos.astype(np.float32)),
+            orientations=TrackerPolicy._for_view(self.view, quat_wxyz),
+        )
+        self.view.set_velocities(
+            TrackerPolicy._for_view(
+                self.view, np.zeros((self.num_objects, 6), dtype=np.float32)
+            )
+        )
+        log.info(
+            f"    scene objects reset to t={motion_time:.3f}s, "
+            f"pos={np.round(pos, 3).tolist()}"
+        )
+
+    def measured_pose(self):
+        """Current object poses off the physics view.
+
+        Returns:
+            ``(pos [N, 3], quat_xyzw [N, 4])`` NumPy arrays.
+        """
+        pos, quat_wxyz = self.view.get_world_poses()
+        pos = _to_numpy(pos).reshape(-1, 3)
+        quat_wxyz = _to_numpy(quat_wxyz).reshape(-1, 4)
+        return pos, wxyz_to_xyzw(quat_wxyz)
+
+
 def setup_lighting_and_camera(target_pos) -> None:
     """Add a key light and frame the camera on the robot's start pose."""
     create_prim(
@@ -3475,9 +4018,37 @@ def setup_lighting_and_camera(target_pos) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_scenes_file(raw: str | None) -> str | None:
+    """Normalise ``--scenes-file``, matching ``inference_agent.py``'s handling."""
+    if raw is None:
+        return None
+    return None if raw.lower() in ("none", "null") else raw
+
+
 def main() -> None:
     if args.drive_probe and not args.drive_probe_out:
         raise SystemExit("--drive-probe requires --drive-probe-out")
+    scenes_file = _resolve_scenes_file(args.scenes_file)
+    if scenes_file is not None:
+        if args.resync_state:
+            # The tape has no object channel. Resync would restore the robot to
+            # IsaacLab's recorded state every step and leave the object wherever
+            # it drifted, so step k would no longer start from IsaacLab's state
+            # -- silently voiding the "N independent one-step experiments" claim
+            # the whole mode rests on.
+            raise SystemExit(
+                "--resync-state cannot be combined with --scenes-file: the "
+                "action tape records no object state, so the objects would "
+                "diverge from the recording while the robot is resynced to it, "
+                "and the one-step divergence would no longer be interpretable."
+            )
+        if args.action_tape is not None:
+            log.warning(
+                "--action-tape with --scenes-file: the replay drives the robot "
+                "open-loop but nothing controls the objects, so they only match "
+                "the recording for as long as the robot's trajectory does. Valid "
+                "as a diagnostic; not a parity measurement."
+            )
     if args.resync_state:
         if args.action_tape is None:
             raise SystemExit("--resync-state requires --action-tape")
@@ -3564,6 +4135,36 @@ def main() -> None:
             restitution=0.0,
         )
 
+    # Scene objects, before the robot: a bad scenes file should fail here rather
+    # than after Kit has spent time referencing and authoring the robot asset.
+    # Also before world.reset(), because PhysX only reads the stage on play.
+    scene_objects = None
+    if scenes_file is not None:
+        from deployment import scene_utils
+
+        scene_index = scene_utils.resolve_scene_index(
+            scenes_file, args.motion_index, explicit=args.scene_index
+        )
+        scene_lib = scene_utils.build_scene_lib(
+            scenes_file, scene_index, asset_root=args.scenes_asset_root
+        )
+        specs = scene_utils.scene_object_specs(scene_lib)
+        if not specs:
+            # A scene with no objects is a valid SceneLib state and nothing to
+            # spawn; an empty RigidPrim view would fail on initialize() instead.
+            log.warning(
+                f"Scene {scene_index} of {scenes_file} holds no objects; running "
+                "without scene objects."
+            )
+        else:
+            prim_paths = add_scene_objects(
+                specs,
+                mesh_collision_approximation=scene_lib.config.mesh_collision_approximation,
+            )
+            scene_objects = SceneObjects(
+                scene_lib, prim_paths, z_offset=args.scene_object_z_offset
+            )
+
     policy = TrackerPolicy(
         meta=meta,
         prim_path=args.prim_path,
@@ -3582,6 +4183,7 @@ def main() -> None:
         init_z_offset=args.init_z_offset,
         author_collider_offsets=args.author_collider_offsets,
         resync_state=args.resync_state,
+        scene_objects=scene_objects,
     )
     policy.num_loops = (
         args.loops if args.loops is not None else (1 if args.headless else 10_000_000)
