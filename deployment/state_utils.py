@@ -75,6 +75,7 @@ __all__ = [
     # Cross-driver tracking trace
     "TRACE_COLUMNS",
     "tilt_deg_xyzw",
+    "quat_angle_deg_xyzw",
     "make_trace_row",
     "summarize_trace",
     # PyTorch versions -- used during ONNX export / first-run deploy
@@ -221,6 +222,20 @@ TRACE_COLUMNS = (
 #: how the robot is standing.
 TRACE_COLUMNS_GEOM = ("foot_z", "pelvis_minus_foot", "foot_contact")
 
+#: **Optional** scene-object columns, present only when the harness spawns a
+#: SceneLib scene -- the Isaac Sim driver's ``--scenes-file`` and IsaacLab
+#: inference.  Kept out of :data:`TRACE_COLUMNS` for the same reason as
+#: :data:`TRACE_COLUMNS_GEOM`: a MuJoCo trace has no objects at all, and
+#: widening the shared contract would retroactively invalidate it.
+#:
+#: Both are errors of the *measured* object pose against the SceneLib reference
+#: at the same motion time, so they answer "did the object end up where the
+#: reference says it should be" -- the object-side analogue of ``joint_err``.
+#: Objects are written at reset and then left to physics, exactly as in
+#: IsaacLab, so a growing ``obj_pos_err`` is the robot moving the object (or
+#: gravity), not a tracking failure.
+TRACE_COLUMNS_OBJECT = ("obj_pos_err", "obj_rot_err_deg")
+
 
 def tilt_deg_xyzw(quat_xyzw) -> float:
     """Angle in degrees between the body's local +z axis and world +z.
@@ -237,6 +252,28 @@ def tilt_deg_xyzw(quat_xyzw) -> float:
     return float(np.degrees(np.arccos(np.clip(cos_tilt, -1.0, 1.0))))
 
 
+def quat_angle_deg_xyzw(a_xyzw, b_xyzw) -> float:
+    """Angle in degrees between two orientations (xyzw), in ``[0, 180]``.
+
+    The geodesic distance on SO(3): ``2 * arccos(|w|)`` of the relative
+    quaternion ``a^-1 * b``.  The absolute value handles the double cover -- ``q``
+    and ``-q`` are the same rotation, and without it a perfectly matched pair
+    can read as 360 degrees apart.
+
+    Args:
+        a_xyzw: First orientation ``[4,]`` (xyzw).
+        b_xyzw: Second orientation ``[4,]`` (xyzw).
+
+    Returns:
+        Absolute angle between them, degrees.
+    """
+    a = np.asarray(a_xyzw, dtype=np.float32)
+    b = np.asarray(b_xyzw, dtype=np.float32)
+    relative = _quat_mul_np(_quat_conjugate_np(a), b)
+    w = float(np.clip(abs(relative[..., 3]), 0.0, 1.0))
+    return float(np.degrees(2.0 * np.arccos(w)))
+
+
 def make_trace_row(
     *,
     loop: int,
@@ -250,6 +287,8 @@ def make_trace_row(
     dof_vel: np.ndarray,
     foot_z: float | None = None,
     foot_contact: int | None = None,
+    obj_pos_err: float | None = None,
+    obj_rot_err_deg: float | None = None,
 ) -> dict:
     """Build one tracking-trace row in the canonical :data:`TRACE_COLUMNS` schema.
 
@@ -274,11 +313,18 @@ def make_trace_row(
             link origin). Adds the :data:`TRACE_COLUMNS_GEOM` height pair.
         foot_contact: Optional number of feet currently in contact. Adds the
             ``foot_contact`` column; used to split divergence by stance phase.
+        obj_pos_err: Optional scene-object position error against the SceneLib
+            reference, metres, **averaged over the scene's objects** (so it is
+            exact for the single-box case this instrumentation was built for,
+            and a summary otherwise). Adds the :data:`TRACE_COLUMNS_OBJECT`
+            columns together with ``obj_rot_err_deg``.
+        obj_rot_err_deg: Optional scene-object orientation error, degrees, mean
+            over the scene's objects.
 
     Returns:
         Dict with exactly the :data:`TRACE_COLUMNS` keys, plus whichever
-        :data:`TRACE_COLUMNS_GEOM` keys the optional arguments supplied. All
-        values JSON-serialisable.
+        :data:`TRACE_COLUMNS_GEOM` / :data:`TRACE_COLUMNS_OBJECT` keys the
+        optional arguments supplied. All values JSON-serialisable.
     """
     dof_pos = np.asarray(dof_pos, dtype=np.float64)
     ref_dof_pos = np.asarray(ref_dof_pos, dtype=np.float64)
@@ -299,6 +345,10 @@ def make_trace_row(
         row["pelvis_minus_foot"] = float(root_h) - float(foot_z)
     if foot_contact is not None:
         row["foot_contact"] = int(foot_contact)
+    if obj_pos_err is not None:
+        row["obj_pos_err"] = float(obj_pos_err)
+    if obj_rot_err_deg is not None:
+        row["obj_rot_err_deg"] = float(obj_rot_err_deg)
     return row
 
 
@@ -343,6 +393,15 @@ def summarize_trace(trace: list) -> str:
             f"(double {float((contact > 1).mean()):.3f}, "
             f"flight {float((contact == 0).mean()):.3f})"
         )
+    if all("obj_pos_err" in r for r in trace):
+        pos_err = np.array([r["obj_pos_err"] for r in trace])
+        rot_err = np.array([r["obj_rot_err_deg"] for r in trace])
+        lines += [
+            f"  mean obj pos err    : {np.nanmean(pos_err):.4f} m "
+            f"(max {np.nanmax(pos_err):.4f})",
+            f"  mean obj rot err    : {np.nanmean(rot_err):.2f} deg "
+            f"(max {np.nanmax(rot_err):.2f})",
+        ]
     return "\n".join(lines)
 
 
