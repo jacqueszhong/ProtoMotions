@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""ONNX export for BeyondMimic tracker policies, targeting Isaac Sim.
+"""ONNX export for ProtoMotions tracker policies, targeting Isaac Sim.
 
-Exports a ProtoMotions BeyondMimic tracker policy to a unified ONNX model
-**without** running a simulator. The script auto-detects actor observation
-keys from the checkpoint's agent config.
+Exports a tracker policy to a unified ONNX model **without** running a
+simulator. The script auto-detects actor observation keys from the checkpoint's
+agent config, so it is not tied to one observation family -- see below.
 
 This is the Isaac Sim counterpart of ``export_bm_tracker_onnx.py``.  The
 exported network is identical -- the observation pipeline and policy are
@@ -15,15 +15,31 @@ matters because ``deployment/test_tracker_isaacsim.py`` re-derives its substep
 count as ``control_dt / physics_dt``; handing it MuJoCo timing makes it take
 20 PhysX substeps per control tick instead of 4.
 
-Typical actor obs for BM configs::
+Observation families
+--------------------
+Whatever the actor's ``in_keys`` name is what gets traced. Two families ship:
+
+*BeyondMimic / reduced coordinates* (the G1 deploy tracker)::
 
     noisy_reduced_coords_obs
     noisy_mimic_reduced_coords_target_poses
     historical_previous_processed_actions
 
-The obs function ``build_reduced_coords_target_poses`` uses anchor-body
-references (``future_anchor_rot/pos/vel/ang_vel``) rather than full-body
-``future_rot``, and an action-history input is included.
+``build_reduced_coords_target_poses`` uses anchor-body references
+(``future_anchor_rot/pos/vel/ang_vel``) rather than full-body ``future_rot``.
+
+*Max coordinates* (the SOMA trackers, ``soma-bones`` and its task fine-tunes)::
+
+    max_coords_obs
+    mimic_target_poses
+    previous_actions
+
+``compute_humanoid_max_coords_observations`` reads every body's world pose and
+velocity plus ``ground_heights``; ``build_max_coords_target_poses`` matches them
+against full-body references. Its action history is ``historical.actions`` --
+the *raw* pre-tanh policy output, not the processed PD target the BM configs
+feed back. The emitted YAML records which, per input, under
+``policy_inputs[].semantics`` / ``source_output``.
 
 Usage
 -----
@@ -39,7 +55,11 @@ Outputs
     The exported ONNX model.
 
 ``<output>/unified_pipeline.yaml``
-    Rich metadata / deployment contract.
+    Rich metadata / deployment contract. Besides the network's I/O it carries
+    the robot's identity (``robot.robot_name``), its USD asset
+    (``robot.usd_path``) and its body/joint ordering, which is what lets
+    ``deployment/test_tracker_isaacsim.py`` run a policy with no robot-specific
+    flags.
 """
 
 from __future__ import annotations
@@ -118,7 +138,12 @@ class _MockHistorical:
     def __init__(self, num_envs: int, history_steps: int, num_dofs: int):
         import torch
 
+        # ``processed`` selects between the two in previous_actions_factory:
+        # processed_actions are post-tanh/clamp (BM configs), actions are the
+        # raw policy output (the max-coords SOMA tracker).  Both must exist or
+        # the corresponding config cannot be traced at all.
         self.processed_actions = torch.randn(num_envs, history_steps, num_dofs)
+        self.actions = torch.randn(num_envs, history_steps, num_dofs)
 
 
 class MockContext:
@@ -142,6 +167,23 @@ class MockContext:
         self.body_contacts  = torch.zeros(num_envs, num_bodies, dtype=torch.bool)
         # ground_heights: used by max_coords_obs root_height_obs
         self.ground_heights = torch.zeros(num_envs)
+
+
+# Class name -> the key `protomotions.robot_configs.factory.robot_config` accepts.
+# The resolved config is a pickled instance, so its class is the only robot
+# identity it carries; the run's own `config.yaml` (which does record
+# `robot_name`) is not shipped next to the pretrained checkpoints. Mirrors
+# `protomotions/robot_configs/factory.py` -- an unknown class simply omits the
+# field, and the deployment driver then asks for `--robot` explicitly.
+_ROBOT_CLASS_TO_FACTORY_NAME = {
+    "SmplRobotConfig": "smpl",
+    "SMPLXRobotConfig": "smplx",
+    "AMPRobotConfig": "amp",
+    "G1RobotConfig": "g1",
+    "H1_2RobotConfig": "h1_2",
+    "Rigv1RobotConfig": "rigv1",
+    "Soma23RobotConfig": "soma23",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +265,12 @@ def export_tracker(
     joint_names = list(robot_config.kinematic_info.dof_names)
     anchor_body_name = robot_config.anchor_body_name
     anchor_body_index = robot_config.anchor_body_index
-    root_body_index = 0  # pelvis is always first body
+    root_body_index = 0  # the root body is always first in kinematic order
+    # `anchor_body_name` is None whenever the robot anchors on its own root
+    # (soma23), in which case RobotConfig resolves anchor_body_index to 0.
+    # Downstream consumers want a name they can look up in body_names.
+    if anchor_body_name is None:
+        anchor_body_name = body_names[anchor_body_index]
 
     mimic_ctrl_cfg = env_config.control_components.get("mimic")
     if mimic_ctrl_cfg is None:
@@ -540,6 +587,20 @@ def export_tracker(
         log.warning(f"Could not resolve per-joint effort limits: {e}")
 
     mjcf_path = robot_config.asset.asset_file_name
+    # The Isaac Sim driver spawns from USD, not MJCF.  Carrying the asset here
+    # is what lets it default `--usd` per-robot instead of falling back to a
+    # hardcoded G1 path.  Both are relative to `robot_config.asset.asset_root`.
+    usd_path = getattr(robot_config.asset, "usd_asset_file_name", None)
+    usd_bodies_root_prim_path = getattr(
+        robot_config.asset, "usd_bodies_root_prim_path", None
+    )
+    robot_name = _ROBOT_CLASS_TO_FACTORY_NAME.get(type(robot_config).__name__)
+    if robot_name is None:
+        log.warning(
+            f"Could not map robot config class {type(robot_config).__name__!r} to a "
+            "protomotions.robot_configs.factory key; the deployment YAML will "
+            "carry no robot_name and the driver will need --robot."
+        )
 
     # Control type detection
     control_type = "BUILT_IN_PD"
@@ -566,6 +627,9 @@ def export_tracker(
         num_bodies=num_bodies,
         num_dofs=num_dofs,
         mjcf_path=mjcf_path,
+        usd_path=usd_path,
+        usd_bodies_root_prim_path=usd_bodies_root_prim_path,
+        robot_name=robot_name,
         control_dt=control_dt,
         physics_dt=physics_dt,
         decimation=decimation,
@@ -610,6 +674,9 @@ def _build_yaml(
     num_bodies,
     num_dofs,
     mjcf_path,
+    usd_path,
+    usd_bodies_root_prim_path,
+    robot_name,
     control_dt,
     physics_dt,
     decimation,
@@ -647,6 +714,54 @@ def _build_yaml(
             entry["kind"] = "last_actions"
             # The ONNX output key this feeds back from
             entry["output_key"] = "robot_action"
+            # Which ONNX *output* actually feeds this input on the next tick.
+            # `historical.processed_actions` is the commanded PD target (post
+            # accel-clamp / EMA); `historical.actions` is the raw pre-tanh
+            # policy output.  Feeding back the wrong one is silent and wrong.
+            if key.endswith("processed_actions"):
+                entry["source_output"] = "joint_pos_targets"
+                entry["semantics"] = "processed"
+            else:
+                entry["source_output"] = "actions"
+                entry["semantics"] = "raw"
+            shape_list = shape if isinstance(shape, list) else []
+            if len(shape_list) == 3:
+                # [batch, history_steps, num_dofs], newest-first.
+                entry["history_steps"] = shape_list[1]
+            entry["element_names"] = [joint_names]
+        elif "rigid_body_pos" in key:
+            entry["kind"] = "body_pos"
+            entry["element_names"] = [body_names, ["x", "y", "z"]]
+        elif "rigid_body_rot" in key:
+            entry["kind"] = "body_rot"
+            entry["element_names"] = [body_names, ["x", "y", "z", "w"]]
+        elif "rigid_body_vel" in key:
+            entry["kind"] = "body_vel"
+            entry["element_names"] = [body_names, ["x", "y", "z"]]
+        elif "rigid_body_ang_vel" in key:
+            entry["kind"] = "body_ang_vel"
+            entry["element_names"] = [body_names, ["x", "y", "z"]]
+        elif key == "ground_heights":
+            entry["kind"] = "ground_height"
+        elif key == "body_contacts":
+            entry["kind"] = "body_contacts"
+            entry["element_names"] = [body_names]
+        elif "mimic" in key and "future_pos" in key:
+            entry["kind"] = "reference_motion_body_pos"
+            entry["future_steps"] = len(future_step_indices)
+            entry["element_names"] = [body_names, ["x", "y", "z"]]
+        elif "mimic" in key and "future_rot" in key:
+            entry["kind"] = "reference_motion_body_rot"
+            entry["future_steps"] = len(future_step_indices)
+            entry["element_names"] = [body_names, ["x", "y", "z", "w"]]
+        elif "mimic" in key and "future_vel" in key:
+            entry["kind"] = "reference_motion_body_vel"
+            entry["future_steps"] = len(future_step_indices)
+            entry["element_names"] = [body_names, ["x", "y", "z"]]
+        elif "mimic" in key and "future_ang_vel" in key:
+            entry["kind"] = "reference_motion_body_ang_vel"
+            entry["future_steps"] = len(future_step_indices)
+            entry["element_names"] = [body_names, ["x", "y", "z"]]
         elif "mimic" in key and "anchor_rot" in key:
             entry["kind"] = "reference_motion_body_rot"
             entry["future_steps"] = len(future_step_indices)
@@ -708,7 +823,10 @@ def _build_yaml(
         },
         # Full deployment contract fields (for robojudo integration)
         "robot": {
+            "robot_name": robot_name,
             "mjcf_path": mjcf_path,
+            "usd_path": usd_path,
+            "usd_bodies_root_prim_path": usd_bodies_root_prim_path,
             "num_bodies": num_bodies,
             "num_dofs": num_dofs,
             "anchor_body_name": anchor_body_name,
