@@ -1,0 +1,673 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Create a scenes file containing a static chair, for use with ``--scenes-file``.
+
+The chair is two pinned boxes in one scene -- a seat slab and a reclined
+backrest -- so it needs no mesh asset: IsaacLab spawns ``CuboidCfg``s and
+IsaacGym generates URDFs. Both carry ``fix_base_link=True``, which is the whole
+point: a chair that can be shoved is not a chair.
+
+This is the mirror image of ``create_box_scene.py``. There, a single-frame object
+is a bug (object-tracking rewards pay it for not moving). Here it is the
+requirement, and the consequence is that the sitting experiment must carry *no*
+object rewards at all -- see ``examples/experiments/mimic/soma_sit_chair.py``.
+
+By default every dimension is fitted to the motion the chair is paired with:
+
+    # Fit a chair under motion 0 of a seated clip.
+    python data/scripts/create_chair_scene.py --output soma_sit_chair.pt \
+        --motion-file soma_sit_motion.pt --motion-id 0
+
+    # One scene per motion in the file.
+    python data/scripts/create_chair_scene.py --output chairs.pt \
+        --motion-file soma_sit_motions.pt --all-motions
+
+Then check what you built before spending a training run on it:
+
+    python data/scripts/create_chair_scene.py --inspect soma_sit_chair.pt \
+        --motion-file soma_sit_motion.pt
+
+The fit that matters is the seat height. It is taken from the *collision*
+geometry, not the body origins: on SOMA the thighs are capsules of radius 0.06
+and the pelvis a sphere of radius 0.08, and the thigh undersides sit 4-6 cm
+below the pelvis underside -- so the thighs, not the buttocks, carry the weight.
+``seat_top`` is the lowest of those surfaces over the whole clip, which puts the
+reference pose exactly at rest on the seat.
+
+Facing is derived from the hips->knees vector, not from the root quaternion:
+SOMA's rest orientation makes the root yaw read +28.8 deg on one seated clip and
+-178.6 deg on another that faces the same way.
+
+Chair poses live in the same world frame as the motion -- the packaged ``gts``
+body positions -- and both are shifted together by the respawn offsets at reset.
+"""
+
+import argparse
+import math
+from pathlib import Path
+from typing import List, Optional, Sequence, Tuple
+
+import torch
+
+from protomotions.components.scene_lib import (
+    BoxSceneObject,
+    ObjectOptions,
+    Scene,
+    SceneLib,
+)
+
+# SOMA seated support chain. The thigh is the capsule between <side>Leg (hip
+# joint) and <side>Shin (knee); the pelvis is the sphere at Hips.
+DEFAULT_PELVIS_BODY = "Hips"
+DEFAULT_THIGH_BODIES = [("LeftLeg", "LeftShin"), ("RightLeg", "RightShin")]
+
+# Collision radii from protomotions/data/assets/mjcf/soma23_humanoid.xml.
+DEFAULT_THIGH_RADIUS = 0.06
+DEFAULT_PELVIS_RADIUS = 0.08
+
+# Samples along each thigh capsule axis when looking for its lowest point.
+CAPSULE_SAMPLES = 21
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Create a scenes file with a static two-box chair fitted to a motion"
+    )
+    parser.add_argument(
+        "--inspect",
+        type=str,
+        default=None,
+        metavar="SCENES_PT",
+        help="Report on an existing scenes file instead of creating one.",
+    )
+    parser.add_argument("--output", type=str, help="Output .pt path")
+    parser.add_argument(
+        "--motion-file",
+        type=str,
+        default=None,
+        help="Packaged MotionLib .pt to fit the chair to, and to cross-check "
+        "against under --inspect.",
+    )
+    parser.add_argument(
+        "--motion-id",
+        type=int,
+        action="append",
+        default=None,
+        help="Motion index this scene is paired with; repeat for one scene per "
+        "motion. Pairing is what binds the chair to the right clip. Default: 0.",
+    )
+    parser.add_argument(
+        "--all-motions",
+        action="store_true",
+        help="Emit one fitted scene per motion in --motion-file.",
+    )
+    parser.add_argument(
+        "--robot-name",
+        type=str,
+        default="soma23",
+        help="Robot whose body names the support bodies refer to.",
+    )
+
+    geometry = parser.add_argument_group(
+        "chair geometry (all default to the motion fit)"
+    )
+    geometry.add_argument(
+        "--seat-top",
+        type=float,
+        default=None,
+        help="Height (m) of the seat's top surface. Default: fitted to the lowest "
+        "thigh/pelvis collision surface in the clip.",
+    )
+    geometry.add_argument(
+        "--seat-clearance",
+        type=float,
+        default=0.0,
+        help="Lower the fitted seat by this much (m). Positive drops the seat, "
+        "leaving the reference pose hovering; negative pushes it up into the "
+        "thighs. Ignored when --seat-top is given.",
+    )
+    geometry.add_argument(
+        "--seat-width", type=float, default=0.60, help="Seat size across the body (m)"
+    )
+    geometry.add_argument(
+        "--seat-depth", type=float, default=0.55, help="Seat size front-to-back (m)"
+    )
+    geometry.add_argument(
+        "--seat-thickness", type=float, default=0.06, help="Seat slab thickness (m)"
+    )
+    geometry.add_argument(
+        "--seat-back-offset",
+        type=float,
+        default=0.18,
+        help="How far behind the hips the backrest's front face sits (m). Also "
+        "sets how much seat is behind the hips.",
+    )
+    geometry.add_argument(
+        "--back-width",
+        type=float,
+        default=0.60,
+        help="Backrest size across the body (m)",
+    )
+    geometry.add_argument(
+        "--back-height",
+        type=float,
+        default=0.45,
+        help="Backrest size up from the seat (m)",
+    )
+    geometry.add_argument(
+        "--back-thickness", type=float, default=0.06, help="Backrest thickness (m)"
+    )
+    geometry.add_argument(
+        "--back-angle",
+        type=float,
+        default=12.0,
+        help="Backrest recline from vertical (degrees); positive tips the top backwards.",
+    )
+    geometry.add_argument(
+        "--yaw",
+        type=float,
+        default=None,
+        help="Chair heading (degrees). Default: fitted from the hips->knees vector.",
+    )
+    geometry.add_argument(
+        "--friction",
+        type=float,
+        default=1.0,
+        help="Chair static/dynamic friction. Robot friction randomization does not "
+        "touch scene objects, so how much the robot slides on the seat rides on this.",
+    )
+
+    fit = parser.add_argument_group("support-body fit")
+    fit.add_argument(
+        "--thigh-radius",
+        type=float,
+        default=DEFAULT_THIGH_RADIUS,
+        help="Thigh capsule collision radius (m).",
+    )
+    fit.add_argument(
+        "--pelvis-radius",
+        type=float,
+        default=DEFAULT_PELVIS_RADIUS,
+        help="Pelvis sphere collision radius (m).",
+    )
+
+    relabel = parser.add_argument_group("reference contact relabelling")
+    relabel.add_argument(
+        "--relabel-contacts",
+        type=str,
+        default=None,
+        metavar="OUT_PT",
+        help="Write a copy of --motion-file with the thigh bodies marked as in "
+        "contact wherever they rest on the fitted seat. Needed before adding the "
+        "thighs to contact_bodies: the packaged labels come from ground-plane "
+        "contact detection and mark the thighs as free, so contact_match_rew "
+        "would otherwise penalise sitting. Never overwrites the input.",
+    )
+    relabel.add_argument(
+        "--contact-tol",
+        type=float,
+        default=0.02,
+        help="Thigh surface must be within this distance (m) of the seat top to "
+        "count as resting on it.",
+    )
+
+    args = parser.parse_args()
+    if args.inspect is None and not args.output:
+        parser.error("--output is required unless --inspect is given")
+    if args.inspect is None and not args.motion_file and args.seat_top is None:
+        parser.error("--motion-file is required unless --seat-top is given")
+    if args.all_motions and args.motion_id:
+        parser.error("--all-motions and --motion-id are mutually exclusive")
+    if args.relabel_contacts and not args.motion_file:
+        parser.error("--relabel-contacts requires --motion-file")
+    return args
+
+
+def load_packaged_motion(motion_file: str, motion_id: int):
+    """Slice one motion out of a packaged MotionLib .pt.
+
+    Forward kinematics is already baked in (``gts``/``grs`` hold per-body world
+    poses), so this is a pure lookup -- same access pattern as
+    ``create_box_scene.py``.
+
+    Args:
+        motion_file: Path to the packaged MotionLib .pt.
+        motion_id: Index of the motion to slice.
+
+    Returns:
+        Tuple of (body_pos [frames, bodies, 3], dt, num_motions).
+    """
+    data = torch.load(motion_file, map_location="cpu", weights_only=False)
+
+    num_motions = data["motion_num_frames"].shape[0]
+    if not 0 <= motion_id < num_motions:
+        raise ValueError(
+            f"--motion-id {motion_id} out of range; file has {num_motions} motion(s)"
+        )
+
+    start = int(data["length_starts"][motion_id])
+    num_frames = int(data["motion_num_frames"][motion_id])
+    dt = float(data["motion_dt"][motion_id])
+    frames = slice(start, start + num_frames)
+
+    return data["gts"][frames], dt, num_motions
+
+
+def resolve_support_indices(robot_name: str):
+    """Map the seated support bodies to indices on the robot.
+
+    Args:
+        robot_name: Robot config name.
+
+    Returns:
+        Tuple of (pelvis index, list of (hip index, knee index) thigh pairs).
+    """
+    from protomotions.robot_configs.factory import robot_config
+
+    body_names = robot_config(robot_name).kinematic_info.body_names
+
+    needed = [DEFAULT_PELVIS_BODY] + [b for pair in DEFAULT_THIGH_BODIES for b in pair]
+    missing = [b for b in needed if b not in body_names]
+    if missing:
+        raise ValueError(
+            f"Seated support bodies not found on robot '{robot_name}': {missing}.\n"
+            f"This script is shaped for SOMA. Available: {body_names}"
+        )
+
+    pelvis_index = body_names.index(DEFAULT_PELVIS_BODY)
+    thigh_indices = [
+        (body_names.index(hip), body_names.index(knee))
+        for hip, knee in DEFAULT_THIGH_BODIES
+    ]
+    return pelvis_index, thigh_indices
+
+
+def thigh_surface_heights(
+    body_pos: torch.Tensor,
+    thigh_indices: Sequence[Tuple[int, int]],
+    thigh_radius: float,
+) -> torch.Tensor:
+    """Lowest point of each thigh capsule, per frame.
+
+    The capsule axis runs from the hip body origin to the knee body origin, so
+    sampling that segment and subtracting the radius gives the underside without
+    needing the body rotations.
+
+    Args:
+        body_pos: Per-body world positions [frames, bodies, 3].
+        thigh_indices: (hip index, knee index) pairs.
+        thigh_radius: Capsule collision radius (m).
+
+    Returns:
+        Underside heights [frames, num_thighs].
+    """
+    weights = torch.linspace(0.0, 1.0, CAPSULE_SAMPLES).view(-1, 1)
+    per_thigh = []
+    for hip_idx, knee_idx in thigh_indices:
+        hip_z = body_pos[:, hip_idx, 2].unsqueeze(0)
+        knee_z = body_pos[:, knee_idx, 2].unsqueeze(0)
+        axis_z = hip_z * (1.0 - weights) + knee_z * weights
+        per_thigh.append(axis_z.min(dim=0).values - thigh_radius)
+    return torch.stack(per_thigh, dim=1)
+
+
+def fit_chair_to_motion(
+    body_pos: torch.Tensor,
+    pelvis_index: int,
+    thigh_indices: Sequence[Tuple[int, int]],
+    thigh_radius: float,
+    pelvis_radius: float,
+):
+    """Derive seat height, heading and hip location from a seated clip.
+
+    Args:
+        body_pos: Per-body world positions [frames, bodies, 3].
+        pelvis_index: Index of the pelvis body.
+        thigh_indices: (hip index, knee index) pairs.
+        thigh_radius: Thigh capsule collision radius (m).
+        pelvis_radius: Pelvis sphere collision radius (m).
+
+    Returns:
+        Tuple of (seat_top, yaw_radians, hips_xy [2], thigh_surface [frames, thighs]).
+    """
+    thigh_surface = thigh_surface_heights(body_pos, thigh_indices, thigh_radius)
+    pelvis_surface = body_pos[:, pelvis_index, 2] - pelvis_radius
+    seat_top = float(min(thigh_surface.min(), pelvis_surface.min()))
+
+    hips_xy = body_pos[:, pelvis_index, :2].mean(dim=0)
+    knee_xy = (
+        torch.stack([body_pos[:, knee_idx, :2] for _, knee_idx in thigh_indices])
+        .mean(dim=0)
+        .mean(dim=0)
+    )
+
+    forward = knee_xy - hips_xy
+    if float(forward.norm()) < 1e-6:
+        raise ValueError(
+            "Hips and knees are vertically aligned -- cannot infer a facing "
+            "direction. Pass --yaw explicitly."
+        )
+    forward = forward / forward.norm()
+
+    # Canonical chair faces +y, so the yaw taking (0, 1) to `forward` is
+    # atan2(-fx, fy).
+    yaw = math.atan2(-float(forward[0]), float(forward[1]))
+    return seat_top, yaw, hips_xy, thigh_surface
+
+
+def yaw_rotate(vec: Sequence[float], yaw: float) -> Tuple[float, float, float]:
+    """Rotate a vector about the world z axis.
+
+    Args:
+        vec: (x, y, z) in the canonical chair frame.
+        yaw: Rotation angle (radians).
+
+    Returns:
+        Rotated (x, y, z).
+    """
+    cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+    return (
+        vec[0] * cos_y - vec[1] * sin_y,
+        vec[0] * sin_y + vec[1] * cos_y,
+        vec[2],
+    )
+
+
+def quat_multiply(lhs: Sequence[float], rhs: Sequence[float]) -> Tuple[float, ...]:
+    """Hamilton product of two XYZW quaternions.
+
+    Args:
+        lhs: Left quaternion (applied second).
+        rhs: Right quaternion (applied first).
+
+    Returns:
+        Product quaternion, XYZW.
+    """
+    lx, ly, lz, lw = lhs
+    rx, ry, rz, rw = rhs
+    return (
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+        lw * rw - lx * rx - ly * ry - lz * rz,
+    )
+
+
+def build_chair_objects(
+    args, seat_top: float, yaw: float, hips_xy
+) -> List[BoxSceneObject]:
+    """Build the seat and backrest boxes for one scene.
+
+    The canonical chair frame faces +y, so ``width`` is lateral and ``depth`` is
+    front-to-back on both boxes, and the recline is a rotation about the lateral
+    (x) axis before the heading yaw is applied.
+
+    Args:
+        args: Parsed CLI arguments.
+        seat_top: Height of the seat's top surface (m).
+        yaw: Chair heading (radians).
+        hips_xy: Mean hip position in world xy.
+
+    Returns:
+        [seat, backrest] -- the object order the experiment's object_index refers to.
+    """
+    options = ObjectOptions(
+        fix_base_link=True,
+        density=1000.0,
+        static_friction=args.friction,
+        dynamic_friction=args.friction,
+        max_angular_velocity=100.0,
+    )
+
+    hips_x, hips_y = float(hips_xy[0]), float(hips_xy[1])
+
+    # Seat spans from --seat-back-offset behind the hips to --seat-depth ahead
+    # of that, so its centre sits forward of the hips.
+    seat_shift = args.seat_depth / 2.0 - args.seat_back_offset
+    seat_offset = yaw_rotate((0.0, seat_shift, 0.0), yaw)
+    seat = BoxSceneObject(
+        width=args.seat_width,
+        depth=args.seat_depth,
+        height=args.seat_thickness,
+        translation=(
+            hips_x + seat_offset[0],
+            hips_y + seat_offset[1],
+            seat_top - args.seat_thickness / 2.0,
+        ),
+        rotation=(0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)),
+        options=options,
+    )
+
+    # Backrest: place its bottom edge on the seat, behind the hips, then tilt.
+    # Rotating about +x by +angle sends local +z towards -y, i.e. backwards.
+    angle = math.radians(args.back_angle)
+    bottom_shift = -(args.seat_back_offset + args.back_thickness / 2.0)
+    bottom_offset = yaw_rotate((0.0, bottom_shift, 0.0), yaw)
+
+    half_h = args.back_height / 2.0
+    centre_from_bottom = yaw_rotate(
+        (0.0, -half_h * math.sin(angle), half_h * math.cos(angle)), yaw
+    )
+
+    tilt_quat = (math.sin(angle / 2.0), 0.0, 0.0, math.cos(angle / 2.0))
+    yaw_quat = (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
+
+    backrest = BoxSceneObject(
+        width=args.back_width,
+        depth=args.back_thickness,
+        height=args.back_height,
+        translation=(
+            hips_x + bottom_offset[0] + centre_from_bottom[0],
+            hips_y + bottom_offset[1] + centre_from_bottom[1],
+            seat_top + centre_from_bottom[2],
+        ),
+        rotation=quat_multiply(yaw_quat, tilt_quat),
+        options=options,
+    )
+
+    return [seat, backrest]
+
+
+def relabel_seat_contacts(
+    motion_file: str,
+    output_file: str,
+    seat_tops: dict,
+    thigh_indices: Sequence[Tuple[int, int]],
+    thigh_radius: float,
+    contact_tol: float,
+) -> None:
+    """Write a copy of a motion with thigh-on-seat contacts marked.
+
+    The packaged labels come from ground-plane contact detection, so a seated
+    clip marks only the feet. Adding the thighs to ``contact_bodies`` without
+    this makes ``contact_match_rew`` penalise the very behaviour we want.
+
+    Args:
+        motion_file: Packaged MotionLib .pt to copy.
+        output_file: Where to write the relabelled copy.
+        seat_tops: Motion index -> fitted seat top (m).
+        thigh_indices: (hip index, knee index) pairs.
+        thigh_radius: Thigh capsule collision radius (m).
+        contact_tol: Max gap (m) that still counts as resting on the seat.
+    """
+    if Path(output_file).resolve() == Path(motion_file).resolve():
+        raise ValueError("--relabel-contacts must not overwrite --motion-file")
+
+    data = torch.load(motion_file, map_location="cpu", weights_only=False)
+    if "contacts" not in data:
+        raise ValueError(f"{motion_file} has no 'contacts' field to relabel")
+
+    contacts = data["contacts"].clone()
+    marked = 0
+    for motion_id, seat_top in sorted(seat_tops.items()):
+        start = int(data["length_starts"][motion_id])
+        num_frames = int(data["motion_num_frames"][motion_id])
+        frames = slice(start, start + num_frames)
+
+        surface = thigh_surface_heights(
+            data["gts"][frames], thigh_indices, thigh_radius
+        )
+        resting = (surface - seat_top).abs() <= contact_tol
+        for thigh_slot, (hip_idx, _) in enumerate(thigh_indices):
+            contacts[frames, hip_idx] = torch.maximum(
+                contacts[frames, hip_idx],
+                resting[:, thigh_slot].to(contacts.dtype),
+            )
+            marked += int(resting[:, thigh_slot].sum())
+
+    data["contacts"] = contacts
+    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+    torch.save(data, output_file)
+    print(
+        f"Wrote {output_file} with {marked} thigh-frame contacts marked "
+        f"(tolerance {contact_tol:.3f}m)"
+    )
+
+
+def inspect_scenes(scenes_file: str, motion_file: Optional[str]) -> None:
+    """Print what a chair scenes file actually contains, and flag silent traps.
+
+    Args:
+        scenes_file: Path to the scenes .pt.
+        motion_file: Optional packaged MotionLib .pt to cross-check the fit.
+    """
+    scenes = SceneLib._load_scenes_from_file(scenes_file, device="cpu")
+    print(f"{scenes_file}: {len(scenes)} scene(s)")
+
+    motion_data = None
+    thigh_indices = None
+    if motion_file is not None:
+        motion_data = torch.load(motion_file, map_location="cpu", weights_only=False)
+        print(f"{motion_file}: {motion_data['motion_num_frames'].shape[0]} motion(s)")
+        try:
+            _, thigh_indices = resolve_support_indices("soma23")
+        except ValueError:
+            thigh_indices = None
+
+    for scene_idx, scene in enumerate(scenes):
+        print(f"\nscene {scene_idx}: humanoid_motion_id={scene.humanoid_motion_id}")
+        if scene.humanoid_motion_id == -1:
+            print(
+                "  WARNING: unpaired scene. Motions are sampled independently, so "
+                "the chair need not be under the clip being tracked."
+            )
+        if len(scene.objects) != 2:
+            print(
+                f"  WARNING: {len(scene.objects)} object(s); a chair from this "
+                "script is [seat, backrest]."
+            )
+
+        for obj_idx, obj in enumerate(scene.objects):
+            role = ["seat", "backrest"][obj_idx] if obj_idx < 2 else f"object {obj_idx}"
+            frames = obj.translation.shape[0]
+            translation = obj.translation[0].tolist()
+            print(
+                f"  object {obj_idx} ({role}, {type(obj).__name__}): "
+                f"size=({obj.width:.3f}, {obj.depth:.3f}, {obj.height:.3f}) "
+                f"translation=({translation[0]:+.3f}, {translation[1]:+.3f}, "
+                f"{translation[2]:.3f}) frames={frames} "
+                f"fix_base_link={obj.options.fix_base_link}"
+            )
+            if not obj.options.fix_base_link:
+                print(
+                    "    WARNING: fix_base_link=False -- this part of the chair is "
+                    "dynamic and will be pushed away when the robot leans on it."
+                )
+            if frames > 1:
+                print(
+                    "    WARNING: multi-frame object. A chair should be static; a "
+                    "moving one drags its reference around under the robot."
+                )
+
+        seat = scene.objects[0]
+        seat_top = float(seat.translation[0][2]) + seat.height / 2.0
+        print(f"  seat top = {seat_top:.4f}m")
+
+        if motion_data is not None and thigh_indices and scene.humanoid_motion_id >= 0:
+            motion_id = scene.humanoid_motion_id
+            start = int(motion_data["length_starts"][motion_id])
+            num_frames = int(motion_data["motion_num_frames"][motion_id])
+            surface = thigh_surface_heights(
+                motion_data["gts"][start : start + num_frames],
+                thigh_indices,
+                DEFAULT_THIGH_RADIUS,
+            )
+            gap = float(surface.min()) - seat_top
+            print(f"  lowest reference thigh surface = {float(surface.min()):.4f}m")
+            print(f"  clearance (thigh - seat) = {gap:+.4f}m")
+            if gap > 0.01:
+                print(
+                    "    WARNING: the reference thighs float above the seat. The "
+                    "policy can hold the pose without ever loading the chair."
+                )
+            if gap < -0.02:
+                print(
+                    "    WARNING: the seat is inside the reference thighs. The "
+                    "robot will be pushed off its reference at reset."
+                )
+
+
+def main():
+    args = parse_args()
+
+    if args.inspect:
+        inspect_scenes(args.inspect, args.motion_file)
+        return
+
+    pelvis_index, thigh_indices = resolve_support_indices(args.robot_name)
+
+    if args.all_motions:
+        _, _, num_motions = load_packaged_motion(args.motion_file, 0)
+        motion_ids = list(range(num_motions))
+    else:
+        motion_ids = args.motion_id or [0]
+
+    scenes = []
+    seat_tops = {}
+    for motion_id in motion_ids:
+        if args.motion_file:
+            body_pos, _, _ = load_packaged_motion(args.motion_file, motion_id)
+            fitted_top, fitted_yaw, hips_xy, _ = fit_chair_to_motion(
+                body_pos,
+                pelvis_index,
+                thigh_indices,
+                args.thigh_radius,
+                args.pelvis_radius,
+            )
+        else:
+            fitted_top, fitted_yaw, hips_xy = 0.45, 0.0, torch.zeros(2)
+
+        seat_top = (
+            args.seat_top
+            if args.seat_top is not None
+            else fitted_top - args.seat_clearance
+        )
+        yaw = math.radians(args.yaw) if args.yaw is not None else fitted_yaw
+        seat_tops[motion_id] = seat_top
+
+        objects = build_chair_objects(args, seat_top, yaw, hips_xy)
+        scenes.append(Scene(objects=objects, humanoid_motion_id=motion_id))
+        print(
+            f"motion {motion_id}: seat_top={seat_top:.4f}m "
+            f"yaw={math.degrees(yaw):+.1f}deg "
+            f"hips=({float(hips_xy[0]):+.3f}, {float(hips_xy[1]):+.3f})"
+        )
+
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    SceneLib.save_scenes_to_file(scenes, args.output)
+    print(f"Saved {len(scenes)} chair scene(s) to {args.output}")
+
+    if args.relabel_contacts:
+        relabel_seat_contacts(
+            motion_file=args.motion_file,
+            output_file=args.relabel_contacts,
+            seat_tops=seat_tops,
+            thigh_indices=thigh_indices,
+            thigh_radius=args.thigh_radius,
+            contact_tol=args.contact_tol,
+        )
+
+
+if __name__ == "__main__":
+    main()
