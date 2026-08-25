@@ -29,7 +29,58 @@ anchor-relative:
   rigid_body_pos in world coordinates, so drift is priced in.
 - No "drifted"/"fall"/"bad_motion_body_pos" terminations. tracking_error is max
   per-body world-frame error over 0.5m, which fires on a fall and on a drift.
-- No reset-noise or push-randomization trimming: soma-bones has neither.
+- No push randomization, for the same reason the G1 file drops it: a shove every
+  1-3s rips the box out of the hands mid-grasp.
+- No reset noise. Unlike the G1 file, which inherited it and trimmed it, there is
+  nothing here to trim, and adding it would be a net negative: ``apply_reset_noise``
+  (envs/obs/observation_noise.py) perturbs only the robot's ``ResetState``, never
+  ``new_object_states``, while the box is respawned exactly on its reference. Every
+  radian of it is pure robot/box desync on an RSI reset. init_start_prob=0.5 below
+  already covers the "practise the approach" case that reset noise would serve.
+
+DOMAIN RANDOMIZATION (configure_robot_and_simulator, below). soma-bones was
+trained with none — its MODEL_CARD says so outright, and warns that cross-sim
+transfer should not be assumed. Two things are being bought here:
+
+- Box generalization: ``object_assets`` randomizes the box's mass, friction,
+  restitution and centre of mass. Without it the policy can memorise one exact
+  3 kg box. Note this is the ONLY DR that reaches the box; robot-body friction
+  does not touch scene objects.
+- Cross-sim transfer: friction, centre-of-mass and action noise, the portable
+  part of the G1 recipe. ``convert_friction_for_simulator`` rewrites both the
+  terrain config and these friction ranges per backend (IsaacGym forces AVERAGE,
+  Newton forces MAX, IsaacLab is configurable), so the effective distribution is
+  preserved when the same config is run elsewhere.
+
+All of it is width-neutral, so the warm start still loads strictly. Three caveats
+worth knowing before reading the eval curves:
+
+1. Only IsaacLab and IsaacGym can run this experiment at all. MuJoCo asserts
+   ``scene_lib.num_scenes() == 0``, Genesis stubs out object spawning, and Newton
+   does not spawn scene-lib objects — and Newton additionally ignores
+   ``object_assets`` outright. So "cross-sim" here realistically means
+   IsaacLab -> IsaacGym, and IsaacGym applies friction to all shapes at once and
+   ignores ``dynamic_friction_range`` (it has a single friction property).
+2. Object and robot properties are sampled into buckets ONCE at setup and
+   assigned round-robin (``arange(num_envs) % num_buckets``), not resampled per
+   episode. Each env keeps its box for the whole run; variety is across envs.
+   With 4096 envs and 64 buckets that is 64 distinct boxes, ~64 envs each.
+3. The evaluator's ``_disable_perturbations`` nulls only ``reset_noise`` and the
+   push flag — friction, CoM, action noise and object DR all stay live during
+   eval. So eval/box_pos_error and eval/success_rate are measured on randomized
+   boxes and will read worse than a no-DR baseline. That is honest rather than
+   broken, but it feeds motion_weights_update_failure_discount=0 below, so a
+   motion that only fails on the extreme buckets still gets its weight zeroed.
+
+Observation noise is off. Copying the G1 ``observation_noise`` block verbatim
+would be a silent no-op: its ``dof_pos``/``dof_vel``/``anchor_*`` fields never
+enter a max-coordinate observation. The fields that would actually bite here are
+``body_pos_noise``/``body_rot_noise``/``body_vel_noise``/``body_ang_vel_noise``,
+and using them also means flipping ``use_noisy=True`` on the two obs factories
+below. That is width-neutral too, but it feeds noise to the critic as well as the
+actor, since both read the same keys — an asymmetric split would need separate
+clean keys for the critic, which is safe (the normalizer is one RunningMeanStd
+over the concatenated in_keys, so names do not matter, only widths and order).
 
 THE SCENES FILE MUST CARRY A BOX TRAJECTORY. The reference the box is scored
 against is ``scene_lib.get_scene_pose(env_ids, motion_times)``, which comes from
@@ -74,7 +125,8 @@ the pretrained config. The networks use LazyLinear and lazy observation
 normalizers that materialize from the checkpoint's tensor shapes before a strict
 load_state_dict, so any change to an observation width makes the checkpoint
 unloadable rather than merely degraded. Rewards, terminations, scenes and the
-motion manager are not part of that contract.
+motion manager are not part of that contract, and neither is domain
+randomization: it changes physics and action values, never a tensor width.
 
 The policy does not observe the box: its pose is fixed per motion through
 Scene.humanoid_motion_id, and the pickup comes from tracking the reference
@@ -97,7 +149,14 @@ Reward weighting (weights are normalized by the agent, so only ratios matter):
 """
 
 from protomotions.robot_configs.base import RobotConfig
-from protomotions.simulator.base_simulator.config import SimulatorConfig
+from protomotions.simulator.base_simulator.config import (
+    SimulatorConfig,
+    ActionNoiseDomainRandomizationConfig,
+    CenterOfMassDomainRandomizationConfig,
+    DomainRandomizationConfig,
+    FrictionDomainRandomizationConfig,
+    ObjectAssetDomainRandomizationConfig,
+)
 from protomotions.components.terrains.config import TerrainConfig
 from protomotions.envs.base_env.config import EnvConfig
 from protomotions.agents.ppo.config import PPOAgentConfig
@@ -328,9 +387,77 @@ def agent_config(
 def configure_robot_and_simulator(
     robot_cfg: RobotConfig, simulator_cfg: SimulatorConfig, args: argparse.Namespace
 ):
-    """Configure robot to add contact sensors for foot contact tracking."""
+    """Configure contact sensors and domain randomization.
+
+    soma-bones ships with none of this — see the module docstring for why the
+    recipe below is not a copy of the G1 one, and what deliberately stays off.
+    All of it is width-neutral, so `--checkpoint .../soma-bones/last.ckpt` still
+    loads strictly: DR touches physics and action values, never an observation
+    tensor's shape.
+    """
     robot_cfg.update_fields(
         contact_bodies=["all_left_foot_bodies", "all_right_foot_bodies"]
+    )
+
+    simulator_cfg.domain_randomization = DomainRandomizationConfig(
+        # Same magnitude as the G1 deploy recipe. Applied in the PD action space
+        # by the shared base-simulator path, so it is backend-independent.
+        action_noise=ActionNoiseDomainRandomizationConfig(
+            action_noise_range=(-0.025, 0.025), dof_names=[".*"], dof_indices=None
+        ),
+        # Robot-body friction. terrain_config() above is a bare TerrainConfig(),
+        # i.e. combine_mode=AVERAGE against ground friction 1.0, so the effective
+        # range is (robot + 1.0) / 2 = (0.65, 1.3) rather than the (0.3, 1.6)
+        # written here. That compression is wanted: soma-bones has never seen a
+        # friction distribution at all, and this is a fine-tune, not a fresh run.
+        # To get the full G1 spread instead, give terrain_config() a
+        # TerrainSimConfig(..., combine_mode=CombineMode.MULTIPLY) — at the
+        # nominal 1.0 ground both modes agree, so that swap changes only the
+        # width of the distribution, not its centre.
+        friction=FrictionDomainRandomizationConfig(
+            num_buckets=64,
+            static_friction_range=(0.3, 1.6),
+            dynamic_friction_range=(0.3, 1.2),
+            restitution_range=(0.0, 0.5),
+            body_names=[".*"],
+            body_indices=None,
+        ),
+        center_of_mass=CenterOfMassDomainRandomizationConfig(
+            com_range={"x": (-0.025, 0.025), "y": (-0.05, 0.05), "z": (-0.05, 0.05)},
+            body_names=robot_cfg.common_naming_to_robot_body_names["torso_body_name"],
+            body_indices=None,
+        ),
+        # The box itself. This is the half of the recipe that serves the task
+        # rather than the transfer: without it the policy is free to memorise one
+        # 3 kg, friction-1.0 box, which is exactly the failure mode
+        # `create_box_scene.py --friction` warns about ("grasp reliability rides
+        # on this value"). Ranges are ABSOLUTE and override the scene's
+        # ObjectOptions, so they are written around that script's defaults
+        # (mass 3.0, friction 1.0) rather than as multipliers.
+        #
+        # Deliberately narrower than the robot-side ranges: mass and grip
+        # friction sit directly in the reward path, and box_pos_fine at
+        # sigma=0.1 has no gradient left past ~20cm of error, so a box that
+        # cannot be held at all just produces a dead reward signal.
+        object_assets=ObjectAssetDomainRandomizationConfig(
+            num_buckets=64,
+            mass_range=(2.0, 4.5),
+            static_friction_range=(0.7, 1.3),
+            dynamic_friction_range=(0.7, 1.3),
+            restitution_range=(0.0, 0.15),
+            center_of_mass_range={
+                "x": (-0.02, 0.02),
+                "y": (-0.02, 0.02),
+                "z": (-0.02, 0.02),
+            },
+        ),
+        # Off on purpose — see the module docstring. Copying the G1 block here
+        # would be a silent no-op: its dof_*/anchor_* fields never reach a
+        # max-coords observation.
+        observation_noise=None,
+        # Off for the same reason as the G1 file: a shove every 1-3s rips the box
+        # out of the hands mid-grasp.
+        push=None,
     )
 
 
@@ -351,3 +478,9 @@ def apply_inference_overrides(
     env_cfg.max_episode_length = 1000000
     env_cfg.motion_manager.resample_on_reset = True
     env_cfg.motion_manager.init_start_prob = 1.0
+
+    # Watch the nominal 3 kg / friction-1.0 box on nominal physics, not a
+    # randomized draw. Also what deployment/trace_tracker_isaaclab.py requires
+    # before it will trace a checkpoint: it refuses while domain_randomization
+    # is not None.
+    simulator_cfg.domain_randomization = None
