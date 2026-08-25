@@ -222,15 +222,47 @@ Requirements
   MuJoCo's 1 kHz / decimation-20 timing, which has to be overridden here with
   ``--physics-dt``.
 - A pre-built robot USD asset (see ``protomotions/data/assets/usd/<robot>/``,
-  produced offline by ``usd_convert/``). Pass its path via ``--usd``.
+  produced offline by ``usd_convert/``). Taken from the YAML's
+  ``robot.usd_path``; override with ``--usd``.
+
+Robots and observation families
+-------------------------------
+Nothing here is robot-specific: the driver reads the robot's identity, USD,
+body/joint names and gains out of the exported YAML, and its physics
+parameters out of ``protomotions.robot_configs`` under the YAML's
+``robot.robot_name``. Two observation families are supported, chosen per run
+from the semantic keys in ``_runtime.onnx_name_to_in_key``:
+
+- **reduced coordinates** (BeyondMimic; the G1 deploy tracker) -- joint state
+  plus the anchor body's rotation, and an action history of *processed* PD
+  targets. Only the root and anchor poses are ever read from the sim.
+- **max coordinates** (the SOMA trackers) -- every body's world pose and
+  velocity plus ``ground_heights``, matched against full-body reference poses,
+  with an action history of *raw* pre-tanh policy outputs. Needs the
+  articulation's link buffers and a body-order remap; see
+  :meth:`TrackerPolicy._read_body_state` and :func:`build_onnx_inputs`.
+
+Two joint encodings are likewise handled: single-axis revolute joints (G1, one
+prim per DOF) and 3-DOF D6 joints (soma23, one prim per body carrying
+``rotX``/``rotY``/``rotZ`` drives). See :meth:`TrackerPolicy._author_drive_gains`.
 
 Usage
 -----
 ::
 
-    python deployment/test_tracker_isaacsim.py \
+    python deployment/test_tracker_isaacsim.py --robot g1 \
         --onnx data/pretrained_models/motion_tracker/g1-bones-deploy/compiled_models/unified_pipeline.onnx \
-        --motion data/motion_for_trackers/g1_random_subset_tiny.pt
+        --motion data/motion_for_trackers/g1_bones_seed_mini.pt
+
+``--robot`` is only needed for YAMLs predating the ``robot.robot_name`` field
+(the committed G1 export is one); a freshly exported YAML carries it::
+
+    python deployment/export_bm_tracker_onnx_isaacsim.py \
+        --checkpoint data/pretrained_models/motion_tracker/soma-bones/last.ckpt
+    python deployment/test_tracker_isaacsim.py \
+        --onnx data/pretrained_models/motion_tracker/soma-bones/compiled_models/unified_pipeline.onnx \
+        --motion data/motion_for_trackers/soma23_bones_seed_mini.pt \
+        --headless --loops 5 --trace-out /tmp/soma_trace.json
 
 With a scene (objects spawn, reset per loop, and are scored in the trace)::
 
@@ -254,8 +286,6 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
-_DEFAULT_USD = "protomotions/data/assets/usd/g1_holo_compat/g1_holo_compat.usda"
-
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -270,17 +300,23 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--usd",
-        default=_DEFAULT_USD,
-        help="Path to the robot USD asset (absolute, or relative to the repo root)",
+        default=None,
+        help=(
+            "Path to the robot USD asset (absolute, or relative to the repo root, "
+            "or to protomotions/data/assets). Default (unset) takes the YAML "
+            "metadata's robot.usd_path, falling back to --robot's robot config."
+        ),
     )
     p.add_argument(
         "--robot",
-        default="g1",
+        default=None,
         help=(
-            "Robot name for protomotions.robot_configs. Supplies the per-joint "
-            "armature, effort limits and solver iteration counts that the "
-            "deployment YAML does not carry. Pass '' to skip, at the cost of "
-            "joint dynamics that no longer match training."
+            "Robot name for protomotions.robot_configs (e.g. 'g1', 'soma23'). "
+            "Supplies the per-joint armature, effort limits, solver iteration "
+            "counts and physics rate that the deployment YAML does not carry. "
+            "Default (unset) takes the YAML metadata's robot.robot_name; pass "
+            "'' to skip it entirely, at the cost of joint dynamics that no "
+            "longer match training."
         ),
     )
     p.add_argument(
@@ -660,12 +696,15 @@ from pxr import PhysxSchema, Usd, UsdPhysics, UsdShade  # noqa: E402
 from deployment import physx_probe  # noqa: E402
 from deployment.physx_probe import CONTACT_FORCE_THRESHOLD_N  # noqa: E402
 from deployment.motion_utils import MotionPlayer  # noqa: E402
+from deployment.obs_assembly import build_onnx_inputs  # noqa: E402
 from deployment.state_utils import (  # noqa: E402
     apply_heading_offset_np,
+    apply_heading_offset_to_positions_np,
     compute_root_local_ang_vel_np,
     compute_yaw_offset_np,
     make_trace_row,
     quat_angle_deg_xyzw,
+    quat_rotate_np,
     summarize_trace,
 )
 
@@ -950,54 +989,21 @@ def load_robot_joint_properties(robot_name: str, joint_names: list) -> dict:
         "bounce_threshold_velocity": getattr(physx, "bounce_threshold_velocity", None),
         # Feet, for the contact-height probe. Same list training instruments with
         # ContactSensorCfg (`isaaclab/utils/scene.py`), so "foot" means the same
-        # bodies in both harnesses.
+        # bodies in both harnesses. Note this is set by the *experiment* file,
+        # so a bare RobotConfig can leave it empty -- hence the naming-map
+        # fallback below, which _build_foot_probe prefers over substring guesses.
         "contact_bodies": list(getattr(config, "contact_bodies", None) or []),
+        "all_left_foot_bodies": list(
+            (getattr(config, "common_naming_to_robot_body_names", None) or {}).get(
+                "all_left_foot_bodies", []
+            )
+        ),
+        "all_right_foot_bodies": list(
+            (getattr(config, "common_naming_to_robot_body_names", None) or {}).get(
+                "all_right_foot_bodies", []
+            )
+        ),
     }
-
-
-def build_onnx_inputs(
-    dof_pos: np.ndarray,
-    dof_vel: np.ndarray,
-    anchor_rot: np.ndarray,
-    root_local_ang_vel: np.ndarray,
-    future_refs: dict,
-    anchor_body_index: int,
-    onnx_name_to_key: dict,
-    num_dofs: int,
-    prev_actions: np.ndarray | None = None,
-) -> dict:
-    """Assemble ONNX input dict from live robot state + motion futures.
-
-    Unlike ``test_tracker_mujoco.build_onnx_inputs``, ``anchor_rot`` and
-    ``root_local_ang_vel`` are passed in pre-computed rather than derived
-    from a full per-body rotation array -- Isaac Sim's articulation API has
-    no cheap "all body world poses" query, so callers fetch only the two
-    bodies actually needed (root + anchor).
-    """
-    if prev_actions is None:
-        prev_actions = np.zeros(num_dofs, dtype=np.float32)
-
-    future_anchor_rot = future_refs["body_rot"][:, anchor_body_index, :]  # [nsteps, 4]
-
-    key_to_array = {
-        "current.dof_pos": dof_pos[None],
-        "current.dof_vel": dof_vel[None],
-        "current.anchor_rot": anchor_rot[None],
-        "current.root_local_ang_vel": root_local_ang_vel[None],
-        "historical.processed_actions": prev_actions[None, None],
-        "mimic.future_anchor_rot": future_anchor_rot[None],
-        "mimic.future_rot": future_refs["body_rot"][None],
-        "mimic.future_dof_pos": future_refs["dof_pos"][None],
-        "mimic.future_dof_vel": future_refs["dof_vel"][None],
-    }
-
-    onnx_inputs: dict[str, np.ndarray] = {}
-    for onnx_name, sem_key in onnx_name_to_key.items():
-        if sem_key in key_to_array:
-            onnx_inputs[onnx_name] = key_to_array[sem_key].astype(np.float32)
-        else:
-            log.warning(f"No value for ONNX input '{onnx_name}' (key='{sem_key}')")
-    return onnx_inputs
 
 
 # ---------------------------------------------------------------------------
@@ -1050,10 +1056,21 @@ class TrackerPolicy:
         runtime = meta["_runtime"]
 
         self.anchor_body_index = robot_meta["anchor_body_index"]
-        self.anchor_body_name = robot_meta.get("anchor_body_name", "torso_link")
-        self.root_body_name = robot_meta.get("root_body_name", "pelvis")
+        self.root_body_name = robot_meta.get("root_body_name") or "pelvis"
+        # `anchor_body_name` is present-but-null for robots that anchor on their
+        # own root (soma23: RobotConfig leaves it None and resolves the index to
+        # 0). `.get(key, default)` does not fire on an explicit null, so read it
+        # with `or` -- otherwise `body_names.index(None)` raises in
+        # `_resolve_anchor_link_index`.
+        self.anchor_body_name = (
+            robot_meta.get("anchor_body_name") or self.root_body_name
+        )
         self.joint_names = list(robot_meta["joint_names"])
+        # Body order the policy's max-coordinate observations are expressed in.
+        # Absent only in YAMLs predating the body_names field.
+        self.body_names = list(robot_meta.get("body_names") or [])
         self.num_dofs = robot_meta["num_dofs"]
+        self.num_bodies = robot_meta.get("num_bodies", len(self.body_names))
         self.control_dt = timing["control_dt"]
         self.future_step_indices = list(motion_meta["future_step_indices"])
         self.stiffness = control["stiffness"]
@@ -1118,6 +1135,39 @@ class TrackerPolicy:
         self.onnx_out_names = [o.name for o in self.session.get_outputs()]
         log.info(f"ONNX inputs:  {[i.name for i in self.session.get_inputs()]}")
         log.info(f"ONNX outputs: {self.onnx_out_names}")
+
+        # Which observation family is this? Decided by the semantic keys the
+        # contract asks for, not by robot name -- the same robot can be trained
+        # either way. See build_onnx_inputs.
+        required_keys = set(self.onnx_name_to_key.values())
+        self._needs_body_state = any(
+            k.startswith("current.rigid_body_") for k in required_keys
+        )
+        # `historical.actions` is the raw pre-tanh policy output, fed back from
+        # the ONNX `actions` head; `historical.processed_actions` is the
+        # commanded PD target, fed back after the accel clamp and EMA. Getting
+        # these two crossed produces a plausible-looking but wrong observation.
+        self._needs_raw_actions = "historical.actions" in required_keys
+        self._raw_action_steps = 1
+        if self._needs_raw_actions:
+            raw_name = next(
+                n for n, k in self.onnx_name_to_key.items() if k == "historical.actions"
+            )
+            raw_shape = next(
+                i.shape for i in self.session.get_inputs() if i.name == raw_name
+            )
+            # [batch, history_steps, num_dofs]; batch is dynamic, the rest concrete.
+            if len(raw_shape) == 3 and isinstance(raw_shape[1], int):
+                self._raw_action_steps = int(raw_shape[1])
+        log.info(
+            f"Observation family: {'max-coords' if self._needs_body_state else 'reduced-coords'}"
+            f"; action history: "
+            + (
+                f"raw x{self._raw_action_steps}"
+                if self._needs_raw_actions
+                else "processed x1"
+            )
+        )
 
         self.motion_player = MotionPlayer(
             motion_file, motion_index=motion_index, control_dt=self.control_dt
@@ -1188,12 +1238,20 @@ class TrackerPolicy:
 
         # Episode-local filter/history state -- reset every episode in reset_episode().
         self._isaac_to_policy: np.ndarray | None = None
+        self._isaac_to_policy_body: np.ndarray | None = None
         self._anchor_link_index: int | None = None
         self._prev_actions: np.ndarray | None = None
+        # Newest-first ring of raw (pre-tanh) policy outputs, for policies whose
+        # action-history input is `historical.actions` rather than
+        # `historical.processed_actions`. Depth comes from the ONNX input shape.
+        self._raw_action_history: np.ndarray | None = None
         self._prev_pd: np.ndarray | None = None
         self._prev_prev_pd: np.ndarray | None = None
         self._ema_prev_targets: np.ndarray | None = None
         self._heading_offset: np.ndarray | None = None
+        # Root positions the max-coords reference realignment pivots around.
+        self._motion_pivot: np.ndarray | None = None
+        self._robot_pivot: np.ndarray | None = None
         self._pd_targets_isaac: np.ndarray | None = None
         self._max_ref_err = 0.0
 
@@ -1594,6 +1652,14 @@ class TrackerPolicy:
         ``set_gains(save_to_usd=True)`` writes ``kp * pi/180``
         (``isaacsim/core/prims/impl/articulation.py``), so do the same -- writing
         the raw Nm/rad value makes PhysX solve at 57.2958x the intended stiffness.
+
+        **Two joint encodings.** A single-axis revolute joint (the G1) is one prim
+        per DOF, named after the DOF, carrying one ``"angular"`` drive. A D6 joint
+        (soma23) is one prim per *body*, named after the body (``Spine1``), carrying
+        three rotational drives ``rotX``/``rotY``/``rotZ`` whose DOF names live in
+        the custom tokens ``mjcf:rotX:name`` etc. (``Spine1_x``). Matching only the
+        prim name against ``joint_names`` finds nothing on such an asset, so the
+        whole pass silently no-ops -- hence the hard failure at the end.
         """
         stage = get_current_stage()
         deg = math.pi / 180.0  # Nm/rad -> Nm/deg, matching set_gains(save_to_usd=True)
@@ -1602,20 +1668,59 @@ class TrackerPolicy:
             for name, kp, kd in zip(self.joint_names, self.stiffness, self.damping)
         }
         applied = 0
+        unmatched: list = []
         for prim in Usd.PrimRange(stage.GetPrimAtPath(prim_path)):
-            gains = by_name.get(prim.GetName())
-            if gains is None or not prim.HasAPI(UsdPhysics.DriveAPI):
+            if not prim.HasAPI(UsdPhysics.DriveAPI):
                 continue
-            drive = UsdPhysics.DriveAPI.Get(prim, "angular")
-            if not drive:
-                continue
-            drive.CreateStiffnessAttr().Set(gains[0])
-            drive.CreateDampingAttr().Set(gains[1])
-            applied += 1
+            # Which drive tokens does this prim actually carry?
+            tokens = [
+                schema.split(":", 1)[1]
+                for schema in prim.GetAppliedSchemas()
+                if schema.startswith("PhysicsDriveAPI:")
+            ]
+            matched_here = False
+            for token in tokens:
+                # Single-axis: the prim itself is the DOF. D6: read the DOF name
+                # from the converter's mjcf:<token>:name token, falling back to
+                # the <body>_<axis> convention the MJCF uses.
+                if token == "angular":
+                    dof_name = prim.GetName()
+                else:
+                    attr = prim.GetAttribute(f"mjcf:{token}:name")
+                    dof_name = attr.Get() if attr and attr.HasValue() else None
+                    if dof_name is None and token.startswith("rot"):
+                        dof_name = f"{prim.GetName()}_{token[3:].lower()}"
+                gains = by_name.get(dof_name)
+                if gains is None:
+                    continue
+                drive = UsdPhysics.DriveAPI.Get(prim, token)
+                if not drive:
+                    continue
+                drive.CreateStiffnessAttr().Set(gains[0])
+                drive.CreateDampingAttr().Set(gains[1])
+                applied += 1
+                matched_here = True
+            if not matched_here:
+                unmatched.append(prim.GetName())
+
         log.info(
             f"Authored PD gains on {applied}/{len(by_name)} USD joint drives "
             "(converted Nm/rad -> Nm/deg)."
         )
+        if applied == 0:
+            raise RuntimeError(
+                "Authored PD gains on 0 USD joint drives. The policy's joint "
+                "names match no drive on this asset, so every physics step "
+                "before the physics view exists would run at the stage's own "
+                f"gains. Policy joints: {self.joint_names[:5]}... ; prims with a "
+                f"drive API: {unmatched[:5]}..."
+            )
+        if applied < len(by_name):
+            log.warning(
+                f"{len(by_name) - applied} policy joints had no matching USD "
+                "drive; those run on the stage's authored gains until "
+                "post_reset() applies set_gains()."
+            )
 
     def _author_body_properties(self, prim_path: str) -> None:
         """Apply training's RigidBodyPropertiesCfg / CollisionPropertiesCfg to the stage.
@@ -1802,6 +1907,31 @@ class TrackerPolicy:
             [isaac_dof_names.index(n) for n in self.joint_names], dtype=np.int64
         )
 
+        # Same gather for *links*. The articulation's link order is PhysX's own
+        # (breadth-first from the root), while max-coordinate observations are
+        # in the MJCF's kinematic order -- for soma23 the two differ from index 2
+        # onward (sim: Hips, Spine1, RightLeg, ... ; MJCF: Hips, Spine1, Spine2, ...).
+        # Only needed by policies that observe per-body state; reduced-coords
+        # policies never touch it.
+        self._isaac_to_policy_body = None
+        if self.body_names:
+            isaac_body_names = list(view.body_names or [])
+            missing_bodies = set(self.body_names) - set(isaac_body_names)
+            if missing_bodies:
+                raise ValueError(
+                    "USD articulation is missing bodies required by the policy: "
+                    f"{sorted(missing_bodies)}. USD body_names={isaac_body_names}"
+                )
+            if len(isaac_body_names) != len(self.body_names):
+                raise ValueError(
+                    f"USD articulation has {len(isaac_body_names)} links but the "
+                    f"policy expects {len(self.body_names)}. Extra links: "
+                    f"{sorted(set(isaac_body_names) - set(self.body_names))}"
+                )
+            self._isaac_to_policy_body = np.array(
+                [isaac_body_names.index(n) for n in self.body_names], dtype=np.int64
+            )
+
         self._resolve_anchor_link_index(view)
         self._apply_solver_iterations(view)
         self._apply_joint_properties(view)
@@ -1828,10 +1958,25 @@ class TrackerPolicy:
         body_names = list(view.body_names or [])
         feet = [n for n in (props.get("contact_bodies") or []) if n in body_names]
         if not feet:
+            # `contact_bodies` is set by the *experiment* file, not the robot
+            # config, so a bare RobotConfig leaves it None (soma23 does). The
+            # common-naming map is the same source the experiment resolves
+            # through, so prefer it over guessing from substrings.
+            for key in (
+                props.get("all_left_foot_bodies") or [],
+                props.get("all_right_foot_bodies") or [],
+            ):
+                feet.extend(n for n in key if n in body_names and n not in feet)
+            if feet:
+                log.info(f"Feet from the robot config's foot-body naming map: {feet}.")
+        if not feet:
+            # Last resort. "toe" matters for rigs that split the foot into an
+            # ankle plus a toe link (soma23: LeftFoot + LeftToeBase); missing it
+            # measures contact height against the wrong body.
             feet = [
                 n
                 for n in body_names
-                if "ankle_roll" in n.lower() or "foot" in n.lower()
+                if any(t in n.lower() for t in ("ankle_roll", "foot", "toe"))
             ]
             if feet:
                 log.warning(
@@ -1881,6 +2026,91 @@ class TrackerPolicy:
         except Exception as e:  # pragma: no cover - version dependent
             log.debug(f"link transform read-back failed: {e}")
             return None
+
+    def _read_link_velocities(self) -> np.ndarray | None:
+        """Link velocities in sim link order, ``[num_links, 6]`` as ``vx vy vz wx wy wz``.
+
+        World frame, **linear first**. That split is not documented anywhere in
+        the Isaac Sim API surface and it is the opposite of MuJoCo's ``cvel``
+        (angular first), so it was measured rather than assumed: writing a known
+        root linear/angular velocity and reading the buffer back gives
+        ``first3 == linear`` exactly (see the round-5 probe notes in
+        ``docs/`` / ``agent_logs/``). Getting it backwards is silent -- the
+        policy just sees a nonsense body-velocity observation.
+        """
+        view = self.robot._articulation_view
+        physics_view = getattr(view, "_physics_view", None)
+        if physics_view is None:
+            return None
+        try:
+            return _to_numpy(physics_view.get_link_velocities()).reshape(-1, 6)
+        except Exception as e:  # pragma: no cover - version dependent
+            log.debug(f"link velocity read-back failed: {e}")
+            return None
+
+    def _read_body_state(self):
+        """Full per-body state in **policy** body order, for max-coords observations.
+
+        Returns ``(pos [B,3], rot [B,4] xyzw, vel [B,3], ang_vel [B,3])``, all in
+        the world frame -- which is what ``compute_humanoid_max_coords_observations``
+        and ``build_max_coords_target_poses`` expect; they do their own
+        root-relative, heading-inverted normalization internally.
+
+        Raises rather than returning ``None``: a policy that needs these cannot
+        run a single step without them, so a soft failure would only hide the
+        cause behind a wrong-looking trajectory.
+        """
+        if self._isaac_to_policy_body is None:
+            raise RuntimeError(
+                "This policy observes per-body state but the YAML carried no "
+                "robot.body_names, so no link reorder map could be built. "
+                "Re-export with deployment/export_bm_tracker_onnx_isaacsim.py."
+            )
+        link_tf = self._read_link_transforms()
+        link_vel = self._read_link_velocities()
+        if link_tf is None or link_vel is None:
+            raise RuntimeError(
+                "Could not read the articulation's link buffers "
+                "(get_link_transforms / get_link_velocities). They only exist "
+                "after world.reset(); check the initialization order."
+            )
+        idx = self._isaac_to_policy_body
+        body_pos = link_tf[idx, 0:3].astype(np.float32)
+        body_rot = link_tf[idx, 3:7].astype(np.float32)  # already xyzw
+        body_vel = link_vel[idx, 0:3].astype(np.float32)
+        body_ang_vel = link_vel[idx, 3:6].astype(np.float32)
+        return body_pos, body_rot, body_vel, body_ang_vel
+
+    def _alignment_is_identity(self) -> bool:
+        """True when realigning the reference into the robot's frame is a no-op.
+
+        The robot is normally spawned at motion frame 0, so the yaw offset is
+        identity and the two pivots coincide; skipping the transform then keeps
+        the reference bit-exact rather than paying float32 round-trip error on
+        every body, every step. Becomes False under ``--init-state`` or any
+        start pose that is not the motion's own.
+        """
+        if self._heading_offset is None:
+            return True
+        # Yaw-only quaternion, so w == 1 (up to sign) means no rotation.
+        if abs(abs(float(self._heading_offset[3])) - 1.0) > 1e-6:
+            return False
+        if self._motion_pivot is None or self._robot_pivot is None:
+            return True
+        # Horizontal only -- the z components are equal by construction, since
+        # the realignment deliberately leaves height alone.
+        return bool(np.abs(self._robot_pivot[:2] - self._motion_pivot[:2]).max() <= 1e-6)
+
+    def _ground_height_under_root(self) -> float:
+        """Terrain height beneath the root, for ``root_height_obs``.
+
+        Zero on the analytic ground plane (``--ground plane``, the default),
+        which is also what training sees on flat terrain -- ProtoMotions sets
+        ``env.skip_correct_terrain_height_on_flat = True``. Under
+        ``--ground trimesh`` the mesh is built around z=0 as well, so zero
+        remains correct until a non-flat terrain is actually requested.
+        """
+        return 0.0
 
     def _lowest_foot_z(self) -> float | None:
         """World z of the lowest foot collider point, or ``None`` if unavailable."""
@@ -2157,6 +2387,15 @@ class TrackerPolicy:
         self._prev_prev_pd = None
         self._ema_prev_targets = None
         self._heading_offset = None
+        self._motion_pivot = None
+        self._robot_pivot = None
+        # ProtoMotions zero-fills the action history on reset
+        # (env.py `_reset_state_history`: "Zero actions for historical reset").
+        self._raw_action_history = (
+            np.zeros((self._raw_action_steps, self.num_dofs), dtype=np.float32)
+            if self._needs_raw_actions
+            else None
+        )
         self._pd_targets_isaac = dof_pos_isaac.copy()
         self._max_ref_err = 0.0
 
@@ -2358,10 +2597,28 @@ class TrackerPolicy:
         # Heading offset: aligns the reference motion's yaw to the robot's yaw at
         # episode start. See test_tracker_mujoco.py's docstring for background.
         if self._heading_offset is None:
-            motion_anchor_rot = self.motion_player.get_state_at_frame(0)["body_rot"][
-                self.anchor_body_index
-            ]
+            frame0 = self.motion_player.get_state_at_frame(0)
+            motion_anchor_rot = frame0["body_rot"][self.anchor_body_index]
             self._heading_offset = compute_yaw_offset_np(anchor_rot, motion_anchor_rot)
+            # Pivots for the position half of the realignment (max-coords only).
+            self._motion_pivot = np.asarray(
+                frame0["body_pos"][0], dtype=np.float32
+            ).copy()
+            robot_pivot = np.asarray(
+                _to_numpy(self.robot.get_world_pose()[0]), dtype=np.float32
+            ).copy()
+            # **Horizontal only.** The realignment exists to absorb an arbitrary
+            # startup heading and ground position; the *vertical* offset between
+            # robot and reference is physically meaningful and must survive.
+            # ProtoMotions resets the robot `env.config.ref_respawn_offset`
+            # (0.05 m) above the reference, so the policy is trained seeing a
+            # target 5 cm below itself at t=0. Cancelling that -- which taking
+            # the robot's own z as the pivot does -- silently changes the very
+            # first observation. Measured against IsaacLab's recorded context
+            # under --init-state: it showed up as exactly 0.05 m on
+            # `mimic.future_pos` and nothing else.
+            robot_pivot[2] = self._motion_pivot[2]
+            self._robot_pivot = robot_pivot
 
         future_refs = self.motion_player.get_future_references(
             self._frame_idx, self.future_step_indices
@@ -2369,6 +2626,29 @@ class TrackerPolicy:
         future_refs["body_rot"] = apply_heading_offset_np(
             self._heading_offset, future_refs["body_rot"]
         )
+
+        body_state = None
+        if self._needs_body_state:
+            body_state = self._read_body_state()
+            # Max-coordinate target poses difference the reference *positions*
+            # against the live root in world coordinates, so a rotation-only
+            # realignment is not enough -- the reference has to move as a rigid
+            # body. Skipped entirely when the transform is the identity (the
+            # robot spawned at motion frame 0), which keeps the normal path
+            # bit-exact instead of paying float32 rounding for a no-op.
+            if not self._alignment_is_identity():
+                for key in ("body_pos",):
+                    future_refs[key] = apply_heading_offset_to_positions_np(
+                        self._heading_offset,
+                        future_refs[key],
+                        self._motion_pivot,
+                        self._robot_pivot,
+                    )
+                # Velocities are free vectors: rotate, do not translate.
+                for key in ("body_vel", "body_ang_vel"):
+                    future_refs[key] = quat_rotate_np(
+                        self._heading_offset, future_refs[key]
+                    )
 
         onnx_inputs = build_onnx_inputs(
             dof_pos=dof_pos,
@@ -2380,6 +2660,10 @@ class TrackerPolicy:
             onnx_name_to_key=self.onnx_name_to_key,
             num_dofs=self.num_dofs,
             prev_actions=self._prev_actions,
+            body_state=body_state,
+            raw_action_history=self._raw_action_history,
+            ground_height=self._ground_height_under_root(),
+            num_bodies=self.num_bodies,
         )
         # Record the assembled inputs so they can be diffed against IsaacLab's
         # recorded ctx__* arrays. check_onnx_parity.py proves the *graph* is
@@ -2433,6 +2717,23 @@ class TrackerPolicy:
         # `historical.processed_actions` is the actually-commanded position, i.e.
         # after the accel clamp and EMA filter -- not the raw policy output.
         self._prev_actions = pd_targets.copy()
+
+        # `historical.actions` is the other thing: the raw pre-tanh network
+        # output, straight off the `actions` head, unfiltered. ProtoMotions
+        # stores it as `actions[:, 1:]`, i.e. newest first with index 0 being
+        # the previous control step, so push to the front and drop the oldest.
+        if self._needs_raw_actions:
+            raw = (
+                ort_out[self.onnx_out_names.index("actions")]
+                .squeeze()
+                .astype(np.float32)
+            )
+            if self._raw_action_history is None:
+                self._raw_action_history = np.zeros(
+                    (self._raw_action_steps, self.num_dofs), dtype=np.float32
+                )
+            self._raw_action_history = np.roll(self._raw_action_history, 1, axis=0)
+            self._raw_action_history[0] = raw
 
         self._pd_targets_isaac = self._to_isaac_order(pd_targets)
 
@@ -4061,23 +4362,62 @@ def main() -> None:
 
     onnx_path = str(args.onnx)
     yaml_path = onnx_path.replace(".onnx", ".yaml")
-    usd_path = resolve_usd_path(args.usd)
-
-    log.info(f"ONNX: {onnx_path}")
-    log.info(f"USD:  {usd_path}")
 
     with open(yaml_path) as f:
         meta = yaml.safe_load(f)
 
+    # The USD is resolved *after* the YAML is read so the contract can supply it.
+    # Precedence: --usd > the YAML's robot.usd_path (written by
+    # export_bm_tracker_onnx_isaacsim.py) > the robot config's own asset. Only
+    # the last needs --robot, so a YAML from the current exporter is
+    # self-describing and the driver has no per-robot default to get wrong.
+    # Robot name: needed for armature, solver iterations and the physics rate,
+    # none of which the YAML carries. Default it from the contract rather than
+    # from a hardcoded "g1", which would silently apply G1 joint dynamics to a
+    # SOMA run. YAMLs predating robot_name still work via --robot.
+    robot_name = args.robot or meta.get("robot", {}).get("robot_name")
+    if robot_name:
+        source = "--robot" if args.robot else "YAML robot.robot_name"
+        log.info(f"Robot config: {robot_name} (from {source})")
+    else:
+        log.warning(
+            "No robot name: the YAML carries no robot.robot_name and --robot was "
+            "not passed. Armature, velocity limits, solver iteration counts and "
+            "the physics rate cannot be matched to training. Pass --robot, or "
+            "re-export with deployment/export_bm_tracker_onnx_isaacsim.py."
+        )
+
+    usd_source = "--usd"
+    usd_arg = args.usd
+    if usd_arg is None:
+        usd_arg = meta.get("robot", {}).get("usd_path")
+        usd_source = "YAML robot.usd_path"
+    if usd_arg is None and robot_name:
+        usd_arg = getattr(
+            build_robot_config(robot_name).asset, "usd_asset_file_name", None
+        )
+        usd_source = f"robot config '{robot_name}'"
+    if usd_arg is None:
+        raise SystemExit(
+            "Cannot determine the robot USD. The YAML carries no robot.usd_path "
+            "(re-export with deployment/export_bm_tracker_onnx_isaacsim.py), and "
+            "neither --usd nor --robot was given."
+        )
+    usd_path = resolve_usd_path(usd_arg)
+
+    log.info(f"ONNX: {onnx_path}")
+    log.info(f"USD:  {usd_path}  (from {usd_source})")
+
     control_dt = meta["timing"]["control_dt"]
 
-    # Timing. The exported YAML carries the *MuJoCo* rate (1 kHz / decimation 20)
-    # because that is the driver it was written for; IsaacLab trains this policy at
-    # 200 Hz / decimation 4 (`g1.py: isaaclab=IsaacLabSimParams(fps=200, decimation=4)`).
-    # Prefer the robot config's Isaac rate, and let --physics-dt override both.
+    # Timing. A YAML from export_bm_tracker_onnx.py carries the *MuJoCo* rate,
+    # 1 kHz / decimation 20; one from export_bm_tracker_onnx_isaacsim.py already
+    # carries the Isaac rate the policy trained at (g1 200 Hz / 4, soma23
+    # 120 Hz / 4). The robot config is authoritative for both, so prefer it;
+    # --physics-dt overrides everything.
     robot_props = (
-        load_robot_joint_properties(args.robot, meta["robot"]["joint_names"])
-        if args.robot
+        load_robot_joint_properties(robot_name, meta["robot"]["joint_names"])
+        if robot_name
         else {}
     )
     sim_fps = robot_props.get("sim_fps")
@@ -4086,15 +4426,20 @@ def main() -> None:
         log.info(f"physics_dt={physics_dt}s (from --physics-dt)")
     elif sim_fps:
         physics_dt = 1.0 / float(sim_fps)
+        yaml_dt = meta["timing"]["physics_dt"]
+        agrees = abs(yaml_dt - physics_dt) < 1e-9
         log.info(
             f"physics_dt={physics_dt}s (from the robot config's IsaacLab rate, "
-            f"{sim_fps} Hz); the YAML's {meta['timing']['physics_dt']}s is MuJoCo's."
+            f"{sim_fps} Hz); the YAML says {yaml_dt}s"
+            + (" -- they agree." if agrees else " (an older MuJoCo-rate YAML).")
         )
     else:
         physics_dt = meta["timing"]["physics_dt"]
         log.warning(
-            f"physics_dt={physics_dt}s taken from the YAML -- this is the MuJoCo "
-            "rate. Pass --robot to resolve training's Isaac rate instead."
+            f"physics_dt={physics_dt}s taken from the YAML. Without a robot "
+            "config this cannot be checked against training's Isaac rate, and a "
+            "YAML from the MuJoCo exporter would put it 20x too fine. "
+            "Pass --robot."
         )
 
     # Device: World defaults to the CPU/numpy backend, a different PhysX solver
@@ -4175,7 +4520,7 @@ def main() -> None:
         cache_motion=args.cache_motion,
         action_ema_alpha=args.action_ema_alpha,
         motion_index=args.motion_index,
-        robot_name=args.robot or None,
+        robot_name=robot_name or None,
         physics_dt=physics_dt,
         joint_friction_mode=args.joint_friction,
         action_tape=args.action_tape,

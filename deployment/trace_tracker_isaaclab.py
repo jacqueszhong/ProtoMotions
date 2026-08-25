@@ -217,12 +217,13 @@ log = logging.getLogger(__name__)
 # Context resolution
 # ---------------------------------------------------------------------------
 
-#: Context paths the exported ONNX contract consumes, from the deployment
-#: YAML's ``_runtime.obs_context_keys``.  Eight of these become ONNX inputs;
-#: the rest are folded into constants during tracing, but are recorded anyway
-#: because a mismatch in a "passthrough" value is exactly the kind of thing
-#: that makes the baked constants wrong.
-CONTEXT_KEYS = (
+#: Fallback context paths, matching a BeyondMimic / reduced-coordinate tracker.
+#: Used only when the key set cannot be derived from the checkpoint's own
+#: observation components -- see :func:`resolve_context_keys`, which is what
+#: normally decides. A max-coordinate policy (the SOMA trackers) consumes a
+#: completely different set, and recording this one for it produces an .npz
+#: that ``check_onnx_parity.py`` cannot read.
+FALLBACK_CONTEXT_KEYS = (
     "current.anchor_pos",
     "current.anchor_rot",
     "current.dof_pos",
@@ -237,6 +238,44 @@ CONTEXT_KEYS = (
     "mimic.future_dof_vel",
     "mimic.ref_anchor_pos",
 )
+
+
+def resolve_context_keys(env_config, actor_in_keys: list) -> tuple:
+    """Context paths the exported ONNX contract consumes, for *this* policy.
+
+    Derived the same way ``export_bm_tracker_onnx_isaacsim.py`` derives its ONNX
+    inputs: every ``dynamic_vars`` binding of every observation component the
+    actor consumes. Some of these are folded into constants during tracing
+    rather than becoming ONNX inputs, but they are recorded anyway -- a mismatch
+    in a "passthrough" value is exactly the kind of thing that makes the baked
+    constants wrong.
+
+    Falls back to :data:`FALLBACK_CONTEXT_KEYS` if the components cannot be
+    introspected, so an unexpected config shape degrades to the old behaviour
+    rather than recording nothing.
+    """
+    keys: set = set()
+    try:
+        components = env_config.observation_components
+        for name in actor_in_keys:
+            component = components.get(name)
+            if component is None:
+                continue
+            bindings = component.get_bindings_dict()
+            keys.update(str(path) for path in bindings.values())
+    except Exception as e:  # pragma: no cover - config-shape dependent
+        log.warning(
+            f"Could not derive context keys from the observation components ({e}); "
+            "falling back to the BeyondMimic key set."
+        )
+        return FALLBACK_CONTEXT_KEYS
+    if not keys:
+        log.warning(
+            "No context keys derived from the observation components; falling "
+            "back to the BeyondMimic key set."
+        )
+        return FALLBACK_CONTEXT_KEYS
+    return tuple(sorted(keys))
 
 
 def resolve_context_path(path: str, context):
@@ -324,8 +363,13 @@ class TraceRecorder:
         dt: float,
         foot_probe=None,
         contact_sensors: dict | None = None,
+        context_keys: tuple | None = None,
     ) -> None:
         self.actor_in_keys = list(actor_in_keys)
+        self.context_keys = tuple(
+            FALLBACK_CONTEXT_KEYS if context_keys is None else context_keys
+        )
+        self._context_keys_warned: set = set()
         self.anchor_idx = anchor_idx
         self.dt = dt
         self.foot_probe = foot_probe
@@ -423,11 +467,20 @@ class TraceRecorder:
         self._append("motion_time", np.asarray(motion_time, dtype=np.float32))
 
         # ONNX-contract context tensors, env 0.
-        for key in CONTEXT_KEYS:
-            self._append(
-                f"ctx__{key.replace('.', '_')}",
-                to_np(resolve_context_path(key, context)[0]),
-            )
+        for key in self.context_keys:
+            try:
+                value = resolve_context_path(key, context)
+            except AttributeError:
+                value = None
+            if value is None:
+                if key not in self._context_keys_warned:
+                    self._context_keys_warned.add(key)
+                    log.warning(
+                        f"Context key {key!r} does not resolve on this env; it "
+                        "will be missing from the .npz."
+                    )
+                continue
+            self._append(f"ctx__{key.replace('.', '_')}", to_np(value[0]))
 
         # Actor observations, the assembled vector, and the normalizer output.
         obs_parts = []
@@ -1207,12 +1260,15 @@ def main() -> None:
         # After reset(): the physics view (and therefore the link transforms the
         # probe queries) does not exist before the first step of the sim.
         foot_probe, contact_sensors = build_foot_probe(env, robot_config)
+        context_keys = resolve_context_keys(env_config, actor_in_keys)
+        log.info(f"Recording {len(context_keys)} context keys: {list(context_keys)}")
         recorder = TraceRecorder(
             actor_in_keys,
             anchor_idx,
             env.dt,
             foot_probe=foot_probe,
             contact_sensors=contact_sensors,
+            context_keys=context_keys,
         )
 
         if args.dump_material_stack:

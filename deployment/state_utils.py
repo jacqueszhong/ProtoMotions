@@ -509,6 +509,63 @@ def apply_heading_offset_np(
     return aligned.reshape(original_shape)
 
 
+def quat_rotate_np(q_xyzw: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Rotate vectors by a quaternion (xyzw), the forward of
+    :func:`_quat_rotate_inverse_np`.
+
+    Args:
+        q_xyzw: Unit quaternion ``[4,]`` (xyzw).
+        v: Vectors, shape ``[..., 3]``.
+
+    Returns:
+        Rotated vectors, same shape as ``v``.
+    """
+    shape = v.shape
+    flat = v.reshape(-1, 3)
+    q_w = float(q_xyzw[3])
+    q_vec = np.asarray(q_xyzw[:3], dtype=flat.dtype)
+    a = flat * (2.0 * q_w**2 - 1.0)
+    b = np.cross(np.broadcast_to(q_vec, flat.shape), flat) * q_w * 2.0
+    c = q_vec[None, :] * (flat @ q_vec)[:, None] * 2.0
+    return (a + b + c).reshape(shape)
+
+
+def apply_heading_offset_to_positions_np(
+    offset_quat_xyzw: np.ndarray,
+    positions: np.ndarray,
+    motion_pivot: np.ndarray,
+    robot_pivot: np.ndarray,
+) -> np.ndarray:
+    """Map reference *positions* into the robot's frame, alongside
+    :func:`apply_heading_offset_np` for rotations.
+
+    Rotation-only realignment is enough for reduced-coordinate observations,
+    which only ever read the anchor body's orientation. Max-coordinate target
+    poses (``build_max_coords_target_poses``) difference the reference
+    **positions** against the live root position in world coordinates, so the
+    reference has to be moved as a rigid body::
+
+        aligned = R_offset * (p - motion_pivot) + robot_pivot
+
+    When the robot is spawned at motion frame 0 -- the normal case in sim --
+    ``R_offset`` is identity and the two pivots coincide, so this is a no-op by
+    construction rather than by omission. It stops being a no-op with
+    ``--init-state``, or on hardware with an arbitrary startup pose.
+
+    Args:
+        offset_quat_xyzw: Yaw-only offset ``[4,]`` from :func:`compute_yaw_offset_np`.
+        positions: Reference positions, shape ``[..., 3]`` (world frame).
+        motion_pivot: Reference root position at episode start, ``[3,]``.
+        robot_pivot: Robot root position at episode start, ``[3,]``.
+
+    Returns:
+        Aligned positions, same shape as ``positions``.
+    """
+    centered = positions - np.asarray(motion_pivot, dtype=positions.dtype)
+    rotated = quat_rotate_np(offset_quat_xyzw, centered)
+    return rotated + np.asarray(robot_pivot, dtype=positions.dtype)
+
+
 # ---------------------------------------------------------------------------
 # PyTorch helpers (used during ONNX export and first-run deploy)
 # ---------------------------------------------------------------------------
