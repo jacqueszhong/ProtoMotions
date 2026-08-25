@@ -2193,7 +2193,18 @@ class TrackerPolicy:
         damping_isaac = self._to_isaac_order(self.damping)
 
         controller = self.robot.get_articulation_controller()
-        controller.set_effort_modes("force")
+        # Isaac Sim's set_effort_modes() hardcodes the USD drive instance name
+        # ("angular" for every rotational DOF), and its `HasAPI(DriveAPI)` guard
+        # passes on any instance -- so on D6 joints that author drive:rotX/rotY/rotZ
+        # (soma23) it writes to an undefined attribute and raises "Empty typeName".
+        # Those assets already declare `type = "force"` per axis, so skipping is a
+        # no-op; the G1's revolute `angular` drives still take the real call.
+        try:
+            controller.set_effort_modes("force")
+        except Exception:
+            log.info(
+                "set_effort_modes skipped: per-axis joint drives are already force-mode."
+            )
         controller.switch_control_mode("position")
         # switch_control_mode() restores the USD default gains, so set ours after.
         view.set_gains(
