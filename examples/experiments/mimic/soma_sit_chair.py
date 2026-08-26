@@ -10,7 +10,8 @@ The task changes are:
 
 1. scene_lib_config takes --scenes-file and enables pointcloud sampling.
 2. All object-tracking terms are REMOVED (see below).
-3. Two anti-squat terms: a torque-squared power penalty and thigh contact bodies.
+3. Two anti-squat terms: a torque-squared power penalty, and thigh *and back*
+   contact bodies.
 
 THE CHAIR IS STATIC, WHICH INVERTS THE BOX FILE'S ADVICE. soma_pick_box.py warns
 that a single-frame object makes ``object_pos_rew`` pay the box for not moving.
@@ -28,10 +29,27 @@ pose as an isometric wall-sit — thighs hovering a centimetre above the seat,
 legs carrying everything — and collect full reward without ever loading the
 chair. Three things stop that, in the order they cost anything:
 
-1. Seat fit. data/scripts/create_chair_scene.py puts the seat top at the lowest
-   thigh/pelvis *collision* surface over the clip, so the reference pose is
-   already resting on it and there is no gap to hover in. Verify with
-   ``--inspect``: "clearance (thigh - seat)" must be ~0.
+1. Seat and backrest fit. data/scripts/create_chair_scene.py puts the seat top at
+   the lowest thigh/pelvis *collision* surface over the clip, so the reference
+   pose is already resting on it and there is no gap to hover in. It fits the
+   backrest the same way, and that is not cosmetic: at the recline and offset the
+   script used to hardcode, the SOMA sit clip leaves Spine2 10.1cm and Chest
+   8.0cm clear of the backrest, so nothing in the clip ever touches it. Verify
+   with ``--inspect``:
+
+     - "clearance (thigh - seat)" must be ~0;
+     - the Spine2 and Chest gaps must be ~0;
+     - the Hips and Spine1 clearances must be POSITIVE. Reclining the backrest to
+       reach the back swings its lower half towards the pelvis, and a backrest
+       inside the pelvis sphere shoves the character off its reference at reset.
+
+   One consequence to expect: the fitted plane is tangent to the *rearmost* frame
+   of the clip, so the typical frame sits ~1.5cm in front of it. A policy that
+   tracks the reference perfectly therefore registers no back contact on most
+   frames while the label says 1, and the term nudges the torso ~1.5cm further
+   back than the reference. That is the intended trade -- it is what makes the
+   back actually load the chair -- and it is far below what gt_coef=-25.0
+   notices, but it shows up as a small steady gt_error that is not a bug.
 
 2. pow_rew with use_torque_squared=True. This is the load-bearing change.
    ``power_consumption_sum`` (protomotions/envs/rewards/base.py) computes
@@ -42,28 +60,36 @@ chair. Three things stop that, in the order they cost anything:
    sitting strictly cheaper than squatting. The weight below is the one knob to
    sweep; too high and it eats into tracking.
 
-3. Thigh contact bodies + contact_match_rew. Contact sensors only exist for
-   bodies listed in robot_cfg.contact_bodies (the IsaacLab simulator zero-fills
-   rigid_body_contact_forces for everything else), so thigh contact is invisible
-   until LeftLeg/RightLeg are added. Safe for the warm start: the observations
-   below use observe_contacts=False, so contact_bodies does not enter any
-   observation width.
+3. Thigh and back contact bodies + contact_match_rew. Contact sensors only exist
+   for bodies listed in robot_cfg.contact_bodies (the IsaacLab simulator
+   zero-fills rigid_body_contact_forces for everything else), so thigh contact is
+   invisible until LeftLeg/RightLeg are added, and back contact until
+   Spine2/Chest are. Safe for the warm start: the observations below use
+   observe_contacts=False, so contact_bodies does not enter any observation
+   width.
 
-   THE MOTION FILE MUST CARRY RELABELLED THIGH CONTACTS. The packaged labels
-   come from ground-plane contact detection, so a seated clip marks only the
-   feet and leaves the thighs free — and then contact_match_rew *penalises*
-   sitting. Generate the relabelled copy alongside the chair:
+   THE MOTION FILE MUST CARRY RELABELLED THIGH AND BACK CONTACTS. The packaged
+   labels come from ground-plane contact detection, so a seated clip marks only
+   the feet and leaves the thighs and back free — and then contact_match_rew
+   *penalises* sitting. Generate the relabelled copy alongside the chair:
 
        python data/scripts/create_chair_scene.py --output <chair.pt> \
            --motion-file <sit_motion.pt> --motion-id 0 \
            --relabel-contacts <sit_motion_seatcontacts.pt>
 
-   and train against the relabelled file. Without it, drop LeftLeg/RightLeg from
-   contact_bodies below.
+   and train against the relabelled file. Without it, drop LeftLeg, RightLeg,
+   Spine2 and Chest from contact_bodies below.
+
+   The chair and the relabelled motion are ONE artifact in two files. The back
+   labels are only true of the backrest that was fitted at the same time, so
+   regenerate both together and pass both to the run. Feeding a scenes file that
+   predates the backrest fit to this config gives Spine2/Chest a label they can
+   never satisfy — a flat penalty with no gradient towards anything.
 
 The decisive check is an ablation, not a curve: evaluate the trained policy
 twice, once with --scenes-file and once with `--scenes-file none`. A policy that
-really sits falls over without the chair. A squatter scores the same both ways.
+really sits and leans falls over without the chair — backwards, once the
+backrest it was resting on is gone. A squatter scores the same both ways.
 
 On the reference data: the SOMA sit clips are seated *throughout* — the pelvis
 height is constant for the whole 5s — so this trains seated balance, not a
@@ -92,6 +118,11 @@ Run it as a warm start from the tracker checkpoint:
         --checkpoint data/pretrained_models/motion_tracker/soma-bones/last.ckpt \
         --motion-file <sit_motion_seatcontacts.pt> --scenes-file <chair.pt> \
         --num-envs 4096 --batch-size 16384 --experiment-name soma_sit_chair_v1
+
+USE A NEW --experiment-name WHEN THE CHAIR CHANGES. Resuming reads the saved
+experiment state and ignores this file entirely, so a resumed run keeps training
+against the old chair and the old contact labels while appearing to pick up the
+new ones. A refitted backrest is a different task; give it a different name.
 """
 
 from protomotions.robot_configs.base import RobotConfig
@@ -192,10 +223,23 @@ def env_config(robot_cfg: RobotConfig, args: argparse.Namespace) -> EnvConfig:
         "pow_rew": pow_rew_factory(
             weight=-1e-4, min_value=-0.5, use_torque_squared=True
         ),
-        # With LeftLeg/RightLeg in contact_bodies and relabelled reference
-        # contacts, this is the direct "thighs must be on the seat" term. Read
-        # its logged value to tell sitting from squatting: ~0 means the thighs
-        # are down, ~-0.1 means they are not.
+        # With LeftLeg/RightLeg/Spine2/Chest in contact_bodies and relabelled
+        # reference contacts, this is the direct "thighs on the seat, back on the
+        # backrest" term.
+        #
+        # Reading the logged value: contact_match_rew SUMS |sim - ref| over every
+        # contact body and multiplies by the weight, so the scale is set by how
+        # many bodies are listed, not by how wrong any one of them is. The list
+        # below is 8 bodies, not 4: all_left_foot_bodies and its right-hand twin
+        # each expand to two (see protomotions/robot_configs/soma23.py). So 0 is
+        # a perfect match and -0.8 is every body wrong, in steps of -0.1 per
+        # mismatched body — one thigh off the seat and one shoulder off the
+        # backrest reads -0.2, not -0.1.
+        #
+        # weight stays at -0.1 through that widening on purpose: the invariant
+        # worth keeping is "each body's mismatch costs 0.1", not "the term's
+        # floor is -0.6". Rescaling to hold the old floor would quietly halve
+        # what a thigh off the seat is worth.
         "contact_match_rew": contact_match_rew_factory(
             weight=-0.1, zero_during_grace_period=True
         ),
@@ -315,15 +359,35 @@ def agent_config(
 def configure_robot_and_simulator(
     robot_cfg: RobotConfig, simulator_cfg: SimulatorConfig, args: argparse.Namespace
 ):
-    """Configure robot contact sensors for foot and thigh contact tracking.
+    """Configure robot contact sensors for foot, thigh and back contact tracking.
 
     The thighs are the anti-squat term: on SOMA they, not the buttocks, carry the
     weight when seated (the thigh capsule undersides sit 4-6cm below the pelvis
-    sphere's). Contact sensors are only created for bodies named here, so without
-    them contact_match_rew cannot see the seat at all.
+    sphere's). Spine2 and Chest are the anti-perch term: they are the band a
+    backrest actually touches, and they are what makes the difference between
+    sitting and balancing on the front edge of the seat. Contact sensors are only
+    created for bodies named here, so without them contact_match_rew cannot see
+    the chair at all.
+
+    Spine1 is deliberately absent. At r=0.06 it sits too far forward for a
+    backrest to reach without the same backrest reaching the pelvis, so labelling
+    it would be labelling a contact the simulator never registers.
+
+    THE THIGHS AND THE BACK ARE NOT THE SAME KIND OF CONTACT. The seat is fitted
+    to the lowest thigh surface in the clip, so the thighs are pinned to it on
+    every frame (150/150 on the SOMA sit clip) whatever the backrest does. The
+    back only touches because create_chair_scene.py *fitted the chair to lean
+    into it* — at the recline the script used to hardcode, Spine2 and Chest miss
+    the backrest by 10.1cm and 8.0cm. Adding these two bodies to a run whose
+    scenes file predates that fit gives contact_match_rew a target the policy
+    cannot reach on any frame: a constant -0.2, with no gradient towards
+    anything. Regenerate the chair and the relabelled motion together.
 
     Raw body names are fine alongside the common-naming keys — see
-    abstract_names_to_body_names in protomotions/robot_configs/base.py.
+    abstract_names_to_body_names in protomotions/robot_configs/base.py. Adding
+    bodies here is also safe for the warm start (observe_contacts=False) and
+    cannot terminate an episode (non_termination_contact_bodies defaults to
+    "all").
     """
     robot_cfg.update_fields(
         contact_bodies=[
@@ -331,6 +395,8 @@ def configure_robot_and_simulator(
             "all_right_foot_bodies",
             "LeftLeg",
             "RightLeg",
+            "Spine2",
+            "Chest",
         ]
     )
 
