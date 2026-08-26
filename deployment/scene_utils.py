@@ -52,7 +52,86 @@ __all__ = [
     "resolve_scene_index",
     "build_scene_lib",
     "scene_object_specs",
+    "load_resolved_configs",
+    "resolve_init_z_offset",
 ]
+
+
+class _UnavailableConfig:
+    """Stand-in for a pickled class whose module is not installed here.
+
+    Instances carry the pickled ``__dict__`` and nothing else.  Attribute reads
+    that the real class would have answered raise ``AttributeError``, which is
+    the honest outcome: the value was never reconstructed.
+    """
+
+    def __setstate__(self, state):
+        if isinstance(state, dict):
+            self.__dict__.update(state)
+
+    def __repr__(self):
+        return f"<unavailable {type(self).__module__}.{type(self).__name__}>"
+
+
+def load_resolved_configs(path: str):
+    """``torch.load`` a run's ``resolved_configs*.pt`` without the training stack.
+
+    A resolved-configs file pickles *every* config a run resolved, the agent's
+    included, so a plain ``torch.load`` imports `protomotions.agents.*` and
+    through it ``lightning``.  The deployment interpreter
+    (``isaacsim/python.sh``) deliberately carries only runtime dependencies, so
+    that import fails and takes the whole load with it -- which is why
+    ``--ground trimesh`` could never run from the driver even though it only
+    ever reads the ``terrain`` entry.
+
+    Unpickling is therefore made lenient: any class whose module will not import
+    is replaced by an :class:`_UnavailableConfig` subclass carrying the pickled
+    state.  Entries the caller actually reads (``terrain``, ``robot``,
+    ``simulator``) live in modules the deployment env *does* have, so they come
+    back as their real types; only the unreachable subtrees degrade, and they
+    degrade to an object rather than to an exception.
+
+    Args:
+        path: Path to a ``resolved_configs_inference.pt`` / ``resolved_configs.pt``.
+
+    Returns:
+        The unpickled dict of resolved configs.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+    """
+    import pickle
+    import types
+
+    import torch
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Resolved configs not found: {path}")
+
+    missing: Dict[str, str] = {}
+
+    class _LenientUnpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            try:
+                return super().find_class(module, name)
+            except Exception as exc:  # ImportError, AttributeError, ...
+                missing.setdefault(f"{module}.{name}", str(exc))
+                return type(name, (_UnavailableConfig,), {"__module__": module})
+
+    shim = types.ModuleType("deployment._lenient_pickle")
+    shim.__dict__.update(pickle.__dict__)
+    shim.Unpickler = _LenientUnpickler
+
+    resolved = torch.load(
+        path, map_location="cpu", weights_only=False, pickle_module=shim
+    )
+    if missing:
+        log.info(
+            f"{path}: {len(missing)} config class(es) not importable here and "
+            f"left unreconstructed (e.g. {sorted(missing)[0]}). Harmless unless "
+            f"you read those entries."
+        )
+    return resolved
 
 
 @dataclass
@@ -313,3 +392,67 @@ def scene_object_specs(scene_lib) -> List[SceneObjectSpec]:
             raise ValueError(f"Unsupported object type: {type(obj)}")
         specs.append(spec)
     return specs
+
+
+def resolve_init_z_offset(raw, resolved_configs: Optional[str]) -> float:
+    """Turn the driver's ``--init-z-offset`` (``METRES|auto``) into a number.
+
+    ``auto`` means "whatever training reset with", which lives in
+    ``env.ref_respawn_offset`` of the run's resolved configs -- *not* in the ONNX
+    export's YAML, so it is only knowable when ``--resolved-configs`` is given.
+    Falling back to ``0.0`` keeps every existing invocation byte-identical, but
+    the fallback is warned about rather than silent: on a clip whose contact
+    geometry is fitted to a seat, spawning flush when training spawned 5 cm high
+    is the difference between tracking the motion and sliding off the chair.
+
+    Reading through :func:`load_resolved_configs` is what makes this work at all
+    from ``isaacsim/python.sh``: the ``env`` config's module chain is not
+    importable there, so a plain ``torch.load`` raises. The lenient unpickler
+    hands back a stub carrying the pickled ``__dict__``, and the offset is a
+    plain float in it.
+
+    Args:
+        raw: The flag's value: a number of metres, or ``"auto"``.
+        resolved_configs: Path to a ``resolved_configs*.pt``, or None.
+
+    Returns:
+        The spawn lift in metres, applied to the robot *and* the scene objects.
+
+    Raises:
+        ValueError: If ``raw`` is neither a number nor ``auto``.
+    """
+    if raw is None:
+        return 0.0
+    if str(raw).strip().lower() != "auto":
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"--init-z-offset expects metres or 'auto', got {raw!r}"
+            ) from None
+
+    if resolved_configs is None:
+        log.warning(
+            "--init-z-offset auto without --resolved-configs: spawning flush "
+            "(0.0 m). Training resets at env.config.ref_respawn_offset above the "
+            "reference and lifts the scene with it, so this run starts from a "
+            "different contact configuration than the policy was trained on. "
+            "Pass --resolved-configs <run>/resolved_configs_inference.pt, or an "
+            "explicit --init-z-offset."
+        )
+        return 0.0
+
+    resolved = load_resolved_configs(resolved_configs)
+    offset = getattr(resolved.get("env"), "ref_respawn_offset", None)
+    if offset is None:
+        log.warning(
+            f"--init-z-offset auto: {resolved_configs} carries no "
+            "env.ref_respawn_offset; spawning flush (0.0 m)."
+        )
+        return 0.0
+    log.info(
+        f"--init-z-offset auto -> {float(offset)} m (env.ref_respawn_offset from "
+        f"{resolved_configs}); applied to the robot and to the scene objects, as "
+        "ProtoMotions does."
+    )
+    return float(offset)

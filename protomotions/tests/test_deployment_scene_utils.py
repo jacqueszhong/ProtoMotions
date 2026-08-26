@@ -13,6 +13,8 @@ object columns in ``deployment.state_utils``, which every driver shares.
 
 from __future__ import annotations
 
+import importlib
+import sys
 from dataclasses import dataclass
 
 import numpy as np
@@ -21,6 +23,8 @@ import torch
 
 from deployment.scene_utils import (
     build_scene_lib,
+    load_resolved_configs,
+    resolve_init_z_offset,
     resolve_scene_index,
     scene_object_specs,
 )
@@ -284,3 +288,147 @@ def test_quat_angle_deg_xyzw_is_double_cover_safe():
     q = np.array([0.1, 0.2, 0.3, 0.927])
     q = q / np.linalg.norm(q)
     assert quat_angle_deg_xyzw(q, -q) == pytest.approx(0.0, abs=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# load_resolved_configs
+# ---------------------------------------------------------------------------
+#
+# A resolved-configs .pt pickles the agent config too, whose module chain
+# reaches ``lightning``. The deployment interpreter carries only runtime
+# dependencies, so a plain ``torch.load`` dies there and takes ``--ground
+# trimesh`` down with it even though only ``terrain`` is ever read. These tests
+# pin the leniency that fixes it, standing in for that split with a module that
+# is importable at save time and gone at load time.
+
+
+def _save_with_throwaway_module(tmp_path, module_name, key="gone", attrs=None):
+    """``torch.save`` a payload whose class then becomes unimportable.
+
+    Args:
+        tmp_path: pytest tmp dir; doubles as the throwaway module's home.
+        module_name: Unique per test -- the module is removed from ``sys.modules``
+            afterwards, so reusing a name across tests would let one test's class
+            stay importable for the next.
+        key: Which config key the unpicklable object is stored under.
+        attrs: Extra attributes to set on it, for callers that read a field off
+            the stub rather than just checking that it survived.
+    """
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Vanishing:\n    def __init__(self, tag):\n        self.tag = tag\n"
+    )
+    sys.path.insert(0, str(tmp_path))
+    try:
+        module = importlib.import_module(module_name)
+        obj = module.Vanishing("kept")
+        for name, value in (attrs or {}).items():
+            setattr(obj, name, value)
+        payload = {key: obj, "kept": {"terrain": 1.5}}
+        out = tmp_path / "resolved_configs_inference.pt"
+        torch.save(payload, out)
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop(module_name, None)
+    return out
+
+
+def test_load_resolved_configs_survives_an_unimportable_class(tmp_path):
+    path = _save_with_throwaway_module(tmp_path, "vanishing_cfg_survives")
+
+    with pytest.raises(ModuleNotFoundError):
+        torch.load(path, map_location="cpu", weights_only=False)
+
+    assert load_resolved_configs(str(path))["kept"] == {"terrain": 1.5}
+
+
+def test_load_resolved_configs_keeps_the_pickled_state_on_the_stub(tmp_path):
+    path = _save_with_throwaway_module(tmp_path, "vanishing_cfg_state")
+
+    stub = load_resolved_configs(str(path))["gone"]
+
+    # A placeholder, not the real class -- but not lossy: what was pickled is
+    # still readable, so a caller that does reach into it can say what it lost.
+    assert type(stub).__name__ == "Vanishing"
+    assert stub.tag == "kept"
+    assert "unavailable" in repr(stub)
+
+
+def test_load_resolved_configs_leaves_importable_entries_as_real_types(tmp_path):
+    """Only the unreachable subtrees degrade; everything else round-trips."""
+    path = tmp_path / "resolved_configs.pt"
+    torch.save({"terrain": ObjectOptions(static_friction=0.75), "n": 3}, path)
+
+    resolved = load_resolved_configs(str(path))
+
+    assert isinstance(resolved["terrain"], ObjectOptions)
+    assert resolved["terrain"].static_friction == 0.75
+    assert resolved["n"] == 3
+
+
+def test_load_resolved_configs_rejects_a_missing_file(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_resolved_configs(str(tmp_path / "nope.pt"))
+
+
+# ---------------------------------------------------------------------------
+# resolve_init_z_offset
+#
+# The spawn lift is the one number that decides whether a seated clip starts in
+# contact with its seat or 5 cm above it, and it lives only in the run's
+# resolved configs -- never in the ONNX export -- so the "auto" path has to keep
+# working through the lenient unpickler and has to be loud when it cannot.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _EnvCfg:
+    ref_respawn_offset: float = 0.05
+
+
+def test_resolve_init_z_offset_reads_the_training_value(tmp_path):
+    path = tmp_path / "resolved_configs_inference.pt"
+    torch.save({"env": _EnvCfg(0.05), "terrain": None}, path)
+
+    assert resolve_init_z_offset("auto", str(path)) == pytest.approx(0.05)
+
+
+def test_resolve_init_z_offset_survives_an_unimportable_env_config(tmp_path):
+    """The env config's module chain is absent from the deployment interpreter.
+
+    The stub still carries the pickled ``__dict__``, so the offset is readable
+    even though the class is not -- which is the whole reason ``auto`` can work
+    from ``isaacsim/python.sh``.
+    """
+    path = _save_with_throwaway_module(
+        tmp_path,
+        "vanishing_env_cfg",
+        key="env",
+        attrs={"ref_respawn_offset": 0.07},
+    )
+
+    assert resolve_init_z_offset("auto", str(path)) == pytest.approx(0.07)
+
+
+def test_resolve_init_z_offset_falls_back_to_flush_without_configs(caplog):
+    with caplog.at_level("WARNING"):
+        assert resolve_init_z_offset("auto", None) == 0.0
+    assert "--resolved-configs" in caplog.text
+
+
+def test_resolve_init_z_offset_falls_back_when_the_key_is_absent(tmp_path, caplog):
+    path = tmp_path / "resolved_configs.pt"
+    torch.save({"terrain": None}, path)
+
+    with caplog.at_level("WARNING"):
+        assert resolve_init_z_offset("auto", str(path)) == 0.0
+    assert "ref_respawn_offset" in caplog.text
+
+
+def test_resolve_init_z_offset_passes_an_explicit_value_through():
+    assert resolve_init_z_offset("0.05", "/does/not/exist.pt") == pytest.approx(0.05)
+    assert resolve_init_z_offset(0.0, None) == 0.0
+
+
+def test_resolve_init_z_offset_rejects_nonsense():
+    with pytest.raises(ValueError):
+        resolve_init_z_offset("high", None)

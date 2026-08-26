@@ -404,3 +404,100 @@ def resolve_link_prim_paths(stage, root_path: str, body_names: list) -> dict:
             # rigid body and the articulation root.
             found.setdefault(name, prim.GetPath().pathString)
     return found
+
+
+def dump_filtered_pairs(root_prim, emit) -> None:
+    """Print every ``physics:filteredPairs`` relation under ``root_prim``.
+
+    The gap this closes: ``physxArticulation:enabledSelfCollisions`` says
+    *whether* an articulation self-collides, but ``physics:filteredPairs`` says
+    which link pairs are exempt -- and that relation appears in no other dump on
+    either side.  The soma23 asset authors it per link with **absolute** targets
+    (``</soma23_humanoid_flat/Hips/Spine2>``), which reference composition has to
+    remap into whatever namespace the asset was brought in under:
+    ``/World/Robot/...`` in the standalone driver, ``/World/envs/env_0/Robot/...``
+    in IsaacLab.  A target that fails to remap does not raise -- it silently
+    stops filtering that pair, and the two stacks then solve a different
+    self-collision problem from the same file.
+
+    Paths are printed relative to ``root_prim`` so the two harnesses' logs diff
+    line-for-line despite the different namespaces, and every target is marked
+    valid or ``[DANGLING]`` so a failed remap is visible rather than inferred
+    from a count.
+
+    Args:
+        root_prim: The prim the robot asset was referenced under.
+        emit: Line sink (``log.info`` / ``print``).
+    """
+    from pxr import Usd
+
+    if not root_prim.IsValid():
+        emit(f"  <invalid root prim {root_prim.GetPath()}>")
+        return
+    stage = root_prim.GetStage()
+    base = root_prim.GetPath().pathString
+
+    def rel(path):
+        return path.pathString[len(base) :].lstrip("/") or "."
+
+    total = dangling = 0
+    for prim in Usd.PrimRange(
+        root_prim, Usd.TraverseInstanceProxies(Usd.PrimAllPrimsPredicate)
+    ):
+        relation = prim.GetRelationship("physics:filteredPairs")
+        if not relation:
+            continue
+        targets = relation.GetTargets()
+        if not targets:
+            continue
+        marks = []
+        for target in sorted(targets):
+            ok = stage.GetPrimAtPath(target).IsValid()
+            total += 1
+            if not ok:
+                dangling += 1
+            marks.append(f"{rel(target)}{'' if ok else ' [DANGLING]'}")
+        emit(f"  {rel(prim.GetPath()):28s} -> {', '.join(marks)}")
+    emit(f"  {total} filtered pair target(s), {dangling} dangling")
+
+
+def dump_physics_scene(stage, emit) -> None:
+    """Print every attribute of the PhysX scene prim, authored or not.
+
+    The scene prim carries the solver's global configuration -- iteration
+    clamps, solver type, CCD, stabilization, friction thresholds, GPU flags,
+    gravity -- and until now each harness reported only the handful of fields it
+    happened to set.  That is the same shape of gap that hid the drive velocity
+    target for three rounds: a value neither dump prints cannot be diffed, and
+    "both stacks leave it at the default" is an assumption until the default is
+    read back on both.
+
+    Every attribute is printed with its value and whether any layer authored it,
+    so a difference in what was *set* and a difference in what the two Kit
+    builds *default to* are distinguishable.
+
+    Args:
+        stage: The USD stage.
+        emit: Line sink (``log.info`` / ``print``).
+    """
+    from pxr import PhysxSchema, Usd
+
+    # `UsdPhysics.Scene` is a typed schema, not an applied API, so it is matched
+    # by prim type; the PhysX extras arrive as the applied `PhysxSceneAPI`.
+    scenes = [
+        prim
+        for prim in Usd.PrimRange.Stage(stage, Usd.PrimAllPrimsPredicate)
+        if prim.IsA(Usd.SchemaRegistry.GetTypeFromName("PhysicsScene"))
+        or prim.HasAPI(PhysxSchema.PhysxSceneAPI)
+    ]
+    if not scenes:
+        emit("  <no prim carries UsdPhysics.SceneAPI / PhysxSchema.PhysxSceneAPI>")
+        return
+    for prim in scenes:
+        emit(f"  {prim.GetPath()}")
+        for attr in sorted(prim.GetAttributes(), key=lambda a: a.GetName()):
+            name = attr.GetName()
+            if not (name.startswith("physxScene:") or name.startswith("physics:")):
+                continue
+            emit(f"    {name:52s} = {attr.Get()}{'' if attr.IsAuthored() else '  *'}")
+    emit("  (trailing '*' = unauthored, i.e. the Kit build's schema default)")

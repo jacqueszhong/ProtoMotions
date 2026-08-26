@@ -137,6 +137,19 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--self-collisions",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help=(
+            "Override robot.asset.self_collisions before the sim is built. "
+            "'auto' runs what training resolved. The mirror of "
+            "test_tracker_isaacsim.py's flag of the same name: with both stacks "
+            "forced to the same setting, the drive probe's remaining divergence "
+            "can be attributed to (or cleared of) self-contact resolution, which "
+            "no pose-anchored probe case can do on its own."
+        ),
+    )
+    p.add_argument(
         "--action-tape",
         default=None,
         help=(
@@ -898,6 +911,34 @@ def dump_material_stack(env) -> None:
     except Exception as e:  # pragma: no cover - version dependent
         emit(f"  robot physics-view material read-back failed: {e}")
 
+    # Self-collision filter set, printed by the *same* helper the driver uses so
+    # the two logs diff line-for-line. `enabledSelfCollisions` only says whether
+    # the articulation self-collides at all; `physics:filteredPairs` says which
+    # link pairs are exempt, and the soma23 asset authors those with absolute
+    # targets that reference composition has to remap into this namespace.
+    # Joint limits: the one solver-visible per-joint quantity neither dump used
+    # to report, and a limit is a force -- a pose outside it is pushed back with
+    # no contact and no drive torque involved.
+    try:
+        limits = robot.root_physx_view.get_dof_limits()[0].detach().cpu().numpy()
+    except Exception as e:  # pragma: no cover - version dependent
+        log.warning(f"dof_limits read-back failed: {e}")
+        limits = None
+    if limits is not None:
+        emit("")
+        emit("  dof_limits (sim joint order, [lower, upper] rad):")
+        for name, (lower, upper) in zip(robot.joint_names, limits):
+            emit(f"    {name:18s} [{lower:+.6f}, {upper:+.6f}]")
+
+    emit("")
+    emit("=== PhysX scene prim (IsaacLab) ===")
+    physx_probe.dump_physics_scene(stage, emit)
+
+    emit("")
+    emit("=== Self-collision filtered pairs (IsaacLab) ===")
+    physx_probe.dump_filtered_pairs(stage.GetPrimAtPath(robot_root), emit)
+    emit("")
+
     robot_colliders = colliders_under(stage, robot_root)
     bound = [p for p in robot_colliders if bound_material(p) is not None]
     emit(
@@ -1023,7 +1064,7 @@ def run_drive_probe(env, joint_names: list, out_dir: Path) -> None:
         out = torch.as_tensor(np.asarray(array), dtype=torch.float32, device=device)
         return out if index is None else out[index]
 
-    target_readback, vel_target_readback = [], []
+    target_readback, vel_target_readback, actuation_readback = [], [], []
     for case in range(recorder.num_cases):
         # xyzw -> wxyz: write_root_state_to_sim takes IsaacLab's convention.
         quat_xyzw = np.asarray(spec["spec__root_quat_xyzw"][case])
@@ -1048,6 +1089,13 @@ def run_drive_probe(env, joint_names: list, out_dir: Path) -> None:
         _sample(case)
         target_readback.append(_prop("get_dof_position_targets"))
         vel_target_readback.append(_prop("get_dof_velocity_targets"))
+        # What PhysX is handed as an *explicit* joint force, on top of the
+        # implicit drive. IsaacLab writes this every substep
+        # (`Articulation.write_data_to_sim` -> `set_dof_actuation_forces`); the
+        # driver never writes it at all. Nothing else in either probe would show
+        # a difference here, and a force is the only thing that can move a joint
+        # in a contact-free, zero-drive-error case.
+        actuation_readback.append(_prop("get_dof_actuation_forces"))
 
         for _ in range(recorder.substeps):
             robot.write_data_to_sim()
@@ -1057,6 +1105,7 @@ def run_drive_probe(env, joint_names: list, out_dir: Path) -> None:
     out_path = Path(args.drive_probe_out)
     recorder.write(
         out_path,
+        actuation_readback=actuation_readback,
         target_readback=target_readback,
         vel_target_readback=vel_target_readback,
         stiffness=_prop("get_dof_stiffnesses"),
@@ -1140,6 +1189,14 @@ def main() -> None:
             new_simulator="isaaclab",
             robot_config=robot_config,
         )
+
+    if args.self_collisions != "auto":
+        wanted = args.self_collisions == "on"
+        log.info(
+            f"robot.asset.self_collisions {robot_config.asset.self_collisions} "
+            f"-> {wanted} (--self-collisions {args.self_collisions})"
+        )
+        robot_config.asset.self_collisions = wanted
 
     assert_deterministic(env_config, robot_config, simulator_config)
 

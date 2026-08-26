@@ -20,7 +20,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deployment.obs_assembly import build_onnx_inputs
+from deployment.obs_assembly import ActionHistory, build_onnx_inputs
 from deployment.state_utils import (
     apply_heading_offset_to_positions_np,
     compute_yaw_offset_np,
@@ -267,3 +267,65 @@ class TestReferenceRealignment:
         q = np.array([0.0, 0.0, np.sin(np.pi / 4), np.cos(np.pi / 4)], dtype=np.float64)
         out = quat_rotate_np(q, np.array([[1.0, 0.0, 0.0]]))
         np.testing.assert_allclose(out[0], [0.0, 1.0, 0.0], atol=1e-7)
+
+
+class TestActionHistory:
+    """The observed action window must lag ProtoMotions' buffer by one step.
+
+    ``BaseEnv.post_physics_step`` writes the action that was just applied into
+    ``StateHistoryBuffer`` index 0, and the observation is
+    ``HistoricalView.actions == buffer.actions[:, 1:]`` -- so the most recent
+    action is deliberately excluded. Measured against a recorded IsaacLab
+    trace, the ``previous_actions`` observation at control step ``s`` is the
+    action from step ``s - 2``. A driver that keeps only ``steps`` slots feeds
+    ``s - 1`` instead, which is a real observation mismatch, not a rounding
+    one.
+    """
+
+    @staticmethod
+    def _action(value: float, num_dofs: int = 3) -> np.ndarray:
+        return np.full(num_dofs, value, dtype=np.float32)
+
+    def test_view_starts_zero_filled(self):
+        # Matches env.py `_reset_state_history` ("Zero actions for historical reset").
+        history = ActionHistory(steps=2, num_dofs=3)
+        np.testing.assert_array_equal(history.view(), np.zeros((2, 3), np.float32))
+
+    def test_first_push_is_not_yet_observed(self):
+        # The action just applied lands in the skipped slot, so the policy's
+        # first two steps both observe zeros -- this is the off-by-one.
+        history = ActionHistory(steps=1, num_dofs=3)
+        history.push(self._action(1.0))
+        np.testing.assert_array_equal(history.view(), np.zeros((1, 3), np.float32))
+
+    def test_view_lags_the_pushes_by_one_step(self):
+        history = ActionHistory(steps=1, num_dofs=3)
+        for value in (1.0, 2.0, 3.0):
+            history.push(self._action(value))
+        # Pushed a1, a2, a3; the newest (a3) is the skipped current slot.
+        np.testing.assert_array_equal(history.view(), self._action(2.0)[None])
+
+    def test_deeper_history_is_newest_first_after_the_skip(self):
+        history = ActionHistory(steps=2, num_dofs=3)
+        for value in (1.0, 2.0, 3.0):
+            history.push(self._action(value))
+        np.testing.assert_array_equal(
+            history.view(), np.stack([self._action(2.0), self._action(1.0)])
+        )
+
+    def test_reset_clears_the_whole_buffer(self):
+        history = ActionHistory(steps=2, num_dofs=3)
+        for value in (1.0, 2.0, 3.0):
+            history.push(self._action(value))
+        history.reset()
+        np.testing.assert_array_equal(history.view(), np.zeros((2, 3), np.float32))
+        # The skipped slot must be cleared too, or the first push after a reset
+        # would surface a stale action from the previous episode.
+        history.push(self._action(9.0))
+        np.testing.assert_array_equal(history.view(), np.zeros((2, 3), np.float32))
+
+    def test_view_shape_matches_the_declared_contract(self):
+        # The ONNX input is [batch, history_steps, num_dofs]; view() supplies
+        # the last two dims, so an extra buffer slot must not leak into it.
+        history = ActionHistory(steps=3, num_dofs=7)
+        assert history.view().shape == (3, 7)

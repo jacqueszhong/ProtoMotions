@@ -128,6 +128,43 @@ Isaac Sim specifics (read before pointing this at a new robot)
   what found it was ``--drive-probe``, which puts the robot out of contact and
   isolates the drive's stiffness and damping terms from each other.
 
+  **Round 5, the SOMA sitting demo -- two causes, and neither works alone.**
+  ``soma_sit_1`` held its posture under IsaacLab and curled up here. The gap was
+  27.4 deg of mean torso tilt over 149 control steps; it is now **0.57 deg**, and
+  it took both of:
+
+  1. *The CPU solver is not training's solver.* ``--device`` unset leaves
+     ``physxScene:enableGPUDynamics=False`` with the MBP broadphase; training
+     runs GPU dynamics with the GPU broadphase. Per control step from IsaacLab's
+     own state (``--resync-state``) that is worth mean |d root_quat| **4.51 deg
+     on CPU vs 0.057 deg on cuda:0** and |d root_pos| 5.3 mm vs 0.25 mm; the
+     contact-free ``--drive-probe`` splits the same way (4.70 deg vs 0.070 deg),
+     so it is the articulation solver, not contact generation. This is the value
+     the scene-prim dump was added to catch -- see
+     :func:`deployment.physx_probe.dump_physics_scene`, and note that the earlier
+     rounds' whole-prim comparison had never been done.
+  2. *The spawn lift.* ProtoMotions resets at ``env.config.ref_respawn_offset``
+     (0.05 m) above the reference and applies the same offset to the **scene**
+     (``BaseEnv.move_reset_robot_obj_states_to_respawn_position``); this driver
+     spawned flush. ``--init-z-offset`` now defaults to ``auto`` and reads the
+     value out of ``--resolved-configs``, lifting robot and objects together.
+
+  They are not additive, which is why round 3 measured each alone and called both
+  negative: on CPU the lift is *worse* than flush (37.97 deg vs 27.43 deg), and on
+  GPU without the lift the robot slides off the chair (end root_h 0.176 m vs
+  IsaacLab's 0.552 m). Together: 0.57 deg mean tilt, 0.8 mm mean root height,
+  0.0058 rad mean joint error, stable over 5 loops. The same pair also improves
+  the standing box demo that already looked fine (mean |d tilt| 3.60 -> 0.96 deg).
+
+  The **defaults are unchanged** -- ``--device`` stays CPU because that is the
+  deployment target -- so a run that takes the CPU path now says so in its log
+  (:func:`_warn_if_diverging_from_training`) instead of only on screen.
+
+  Still open, and small: a constant ~0.066 rad offset on the wrist DOFs, present
+  in every ``--drive-probe`` case including the contact-free ones and unchanged
+  by the solver device. It moves the root by 0.25 mm and 0.057 deg per control
+  step, i.e. it is not what the sitting failure was about.
+
 - **``--scenes-file`` spawns a SceneLib scene's objects.**  Without it this
   driver authors robot + ground + lights and nothing else, so a policy trained
   against a scene -- ``examples/experiments/mimic/g1_pick_box.py``, whose G1
@@ -146,6 +183,15 @@ Isaac Sim specifics (read before pointing this at a new robot)
     ``SceneLib._is_static_object`` (``not obj.has_motion()``) is a data
     property that only gates the z respawn lift in ``get_scene_pose``.  A
     single-frame object is still an ordinary body that falls.
+  - *A kinematic object needs its USD transform authored, not just its physics
+    pose.*  PhysX writes poses back out to USD/Fabric only for dynamic actors;
+    a kinematic one is assumed to be driven *from* USD, so a physics-view-only
+    write leaves it colliding in the right place and **rendering at its spawn
+    pose**.  Every box scene predating the sit task was ``fix_base_link=False``
+    and so never hit it.  :meth:`SceneObjects._write_kinematic_xforms` writes
+    both.  Same asymmetry for velocities: PhysX errors out on
+    ``setLinearVelocity`` for a kinematic body, so ``reset`` zeroes only the
+    dynamic subset.
   - *Collider offsets are authored on objects but not on the robot*, which is
     not the contradiction it looks like -- see
     :func:`_author_scene_object_physics`.  In short: the robot's colliders are
@@ -153,10 +199,13 @@ Isaac Sim specifics (read before pointing this at a new robot)
     never lands and matching training means not authoring; freshly authored
     object prims are not instance proxies, so IsaacLab's request *does* land
     there.
-  - *Incompatible with ``--resync-state``.*  The action tape has no object
-    channel, so resyncing the robot while the objects drift would quietly
-    invalidate that mode's one-step-experiment claim; the combination exits.
-    Plain ``--action-tape`` warns and runs.
+  - *``--resync-state`` is allowed only for an all-kinematic scene.*  The action
+    tape has no object channel, so resyncing the robot while a *dynamic* object
+    drifts would quietly invalidate that mode's one-step-experiment claim and the
+    combination exits.  ``fix_base_link`` objects cannot drift, so a scene made
+    only of those (the sitting chair) is accepted -- see
+    :func:`_reject_resync_with_dynamic_objects`.  Plain ``--action-tape`` warns
+    and runs.
 
 - **Root articulation prim**: found by searching for
   ``UsdPhysics.ArticulationRootAPI`` (:meth:`TrackerPolicy._find_articulation_root`),
@@ -428,8 +477,23 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Physics device, e.g. 'cuda:0'. Default (unset) runs PhysX on the CPU "
-            "with the numpy backend -- a different solver path from the GPU "
-            "pipeline used in training. Pass cuda:0 to match training."
+            "(`physxScene:enableGPUDynamics=False`, MBP broadphase); training "
+            "runs GPU dynamics with the GPU broadphase. Those are different "
+            "solvers, and on a contact-rich quasi-static clip the difference is "
+            "not small. Measured on soma_sit_1 against the IsaacLab run of the "
+            "same checkpoint, per control step from IsaacLab's own state "
+            "(--resync-state): mean |d root_quat| 4.51 deg on CPU vs 0.057 deg "
+            "on cuda:0, mean |d root_pos| 5.3 mm vs 0.25 mm. Contact-free "
+            "(--drive-probe) the same split shows up as |d root_quat| 4.70 deg "
+            "vs 0.070 deg over one control step, so it is the articulation "
+            "solver rather than contact generation. "
+            "**Pair it with the spawn lift**: cuda:0 *alone* is not a fix "
+            "(closed-loop mean |d tilt| 27.4 -> 18.5 deg but the robot slides off "
+            "the chair, end root_h 0.176 m vs 0.552 m), and --init-z-offset alone "
+            "is worse than nothing on CPU (37.97 deg). Together they track: 0.57 "
+            "deg mean tilt error, 0.8 mm mean root height error over 149 steps. "
+            "The default stays CPU because that is the deployment target; the "
+            "startup log names the divergence on every run that takes it."
         ),
     )
     p.add_argument(
@@ -505,12 +569,22 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--init-z-offset",
-        type=float,
-        default=0.0,
+        type=str,
+        default="auto",
+        metavar="METRES|auto",
         help=(
-            "Add this to the spawn height. ProtoMotions resets with "
-            "env.config.ref_respawn_offset = 0.05 m above the reference; the "
-            "driver spawns flush. Use to test that difference empirically."
+            "Lift the whole spawn -- robot *and* scene objects -- by this much, "
+            "reproducing ProtoMotions' env.config.ref_respawn_offset (0.05 m by "
+            "default), which training applies to both "
+            "(BaseEnv.move_reset_robot_obj_states_to_respawn_position). 'auto' "
+            "reads the value out of --resolved-configs and falls back to 0.0 "
+            "(flush) with a warning when those are not supplied. This is not "
+            "cosmetic on a seated clip: measured on soma_sit_1 against the "
+            "IsaacLab run of the same checkpoint, GPU PhysX with the lift tracks "
+            "to 0.57 deg mean tilt error, and the same run spawned flush falls "
+            "off the chair (end root_h 0.176 m vs 0.552 m). It needs the GPU "
+            "solver to help: on CPU PhysX the lift alone is *worse* than flush "
+            "(37.97 deg vs 27.43 deg). See --device."
         ),
     )
     p.add_argument(
@@ -542,6 +616,19 @@ def _parse_args() -> argparse.Namespace:
             "no joint damping and hypersensitive to contact-solve quality. The "
             "sign may not survive re-measurement; 'plane' remains the "
             "deployment-faithful default either way."
+        ),
+    )
+    p.add_argument(
+        "--self-collisions",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help=(
+            "Articulation self-collision. 'auto' takes the robot config's value "
+            "(what training spawns with); 'on'/'off' force it. A forced value is "
+            "an ablation instrument, not a tuning knob: the sitting pose folds "
+            "thighs against the torso and arms against the legs, so self-contact "
+            "carries real force there, and forcing it off is how you test "
+            "whether the configured value actually reached PhysX."
         ),
     )
     p.add_argument(
@@ -694,9 +781,10 @@ from isaacsim.core.utils.viewports import set_camera_view  # noqa: E402
 from pxr import PhysxSchema, Usd, UsdPhysics, UsdShade  # noqa: E402
 
 from deployment import physx_probe  # noqa: E402
+from deployment import scene_utils  # noqa: E402
 from deployment.physx_probe import CONTACT_FORCE_THRESHOLD_N  # noqa: E402
 from deployment.motion_utils import MotionPlayer  # noqa: E402
-from deployment.obs_assembly import build_onnx_inputs  # noqa: E402
+from deployment.obs_assembly import ActionHistory, build_onnx_inputs  # noqa: E402
 from deployment.state_utils import (  # noqa: E402
     apply_heading_offset_np,
     apply_heading_offset_to_positions_np,
@@ -1041,10 +1129,20 @@ class TrackerPolicy:
         init_z_offset: float = 0.0,
         author_collider_offsets: bool = False,
         resync_state: bool = False,
+        control_in_loop: bool = True,
+        self_collisions: str = "auto",
         scene_objects=None,
     ) -> None:
+        # None = take the robot config's value; True/False = forced ablation.
+        self.self_collisions_override = (
+            None if self_collisions == "auto" else (self_collisions == "on")
+        )
         self.author_collider_offsets = bool(author_collider_offsets)
         self.resync_state = bool(resync_state)
+        # Which of the two control shapes main() drives this policy with. Only
+        # the open-loop tape cares: the two paths need *different* anchoring at
+        # reset -- see reset_episode's note.
+        self.control_in_loop = bool(control_in_loop)
         # Spawned SceneLib objects (--scenes-file), or None. Physics and scoring
         # only: the ONNX graph carries no scene channel, so the policy does not
         # observe them -- see the module docstring.
@@ -1240,11 +1338,15 @@ class TrackerPolicy:
         self._isaac_to_policy: np.ndarray | None = None
         self._isaac_to_policy_body: np.ndarray | None = None
         self._anchor_link_index: int | None = None
-        self._prev_actions: np.ndarray | None = None
-        # Newest-first ring of raw (pre-tanh) policy outputs, for policies whose
-        # action-history input is `historical.actions` rather than
-        # `historical.processed_actions`. Depth comes from the ONNX input shape.
-        self._raw_action_history: np.ndarray | None = None
+        # Both action histories carry ProtoMotions' one-step lag: the action
+        # just computed goes in, but the *observed* window starts one step
+        # further back. See ActionHistory -- getting this wrong feeds the policy
+        # a fresher action than it ever saw in training.
+        self._prev_actions = ActionHistory(1, self.num_dofs)
+        # Raw (pre-tanh) policy outputs, for policies whose action-history input
+        # is `historical.actions` rather than `historical.processed_actions`.
+        # Depth comes from the ONNX input shape.
+        self._raw_action_history = ActionHistory(self._raw_action_steps, self.num_dofs)
         self._prev_pd: np.ndarray | None = None
         self._prev_prev_pd: np.ndarray | None = None
         self._ema_prev_targets: np.ndarray | None = None
@@ -1556,6 +1658,24 @@ class TrackerPolicy:
             magnitudes = np.asarray(forces[frame], dtype=np.float64)
             row["foot_contact"] = int(np.sum(magnitudes > CONTACT_FORCE_THRESHOLD_N))
             row["foot_force_max"] = float(np.nanmax(magnitudes))
+
+        # Full per-joint and per-link deltas. The scalar summaries above rank
+        # steps; only the vectors say *where* a step went wrong -- whether one
+        # joint carries the error (a drive/property difference) or a whole limb
+        # translates (contact). 66 + 23 floats a step is cheap next to being
+        # unable to tell those apart.
+        row["dof_delta"] = (dof_pos - ref["sim__dof_pos"][frame]).tolist()
+        row["dof_vel_delta"] = (dof_vel - ref["sim__dof_vel"][frame]).tolist()
+        if "sim__link_pos" in ref:
+            link_tf = self._read_link_transforms()
+            if link_tf is not None:
+                # Both sides are raw ``get_link_transforms()`` output, i.e. PhysX's
+                # own link order -- *not* the policy's body order. Do not reorder
+                # one of them: ``sim__link_pos`` is recorded unmapped on the
+                # IsaacLab side for exactly this comparison.
+                row["link_pos_delta"] = np.linalg.norm(
+                    link_tf[:, 0:3] - ref["sim__link_pos"][frame], axis=-1
+                ).tolist()
         return row
 
     def _replay_tape_step(self) -> None:
@@ -1570,10 +1690,16 @@ class TrackerPolicy:
         to make an open-loop replay of a fast clip diverge, which would be read
         as an actuator difference that is not there.
 
-        So the tape is anchored at reset instead: frame 0 is recorded and
+        So on that path the tape is anchored at reset: frame 0 is recorded and
         ``tape[0]`` applied *before* any physics runs (see ``reset_episode``),
         and every later call lands on a whole control-step boundary
         (``t = 20k`` ms) -- exactly IsaacLab's read/apply points.
+
+        ``control_step`` (the default) needs no anchor: it already calls this
+        method at the top of each control step, before its substeps, which *is*
+        IsaacLab's read/apply order. ``reset_episode`` therefore skips the anchor
+        there; anchoring both ways was a one-control-step shift of the entire
+        replay, with ``tape[0]`` never reaching physics at all.
 
         Deliberately does **not** advance ``_prev_actions`` / ``_prev_pd`` /
         ``_prev_prev_pd`` / ``_ema_prev_targets`` / the heading offset: there is
@@ -1831,6 +1957,8 @@ class TrackerPolicy:
         """
         props = self.joint_properties or {}
         self_collisions = props.get("self_collisions")
+        if self.self_collisions_override is not None:
+            self_collisions = self.self_collisions_override
         if self_collisions is None:
             return
 
@@ -2384,16 +2512,26 @@ class TrackerPolicy:
         # moves the robot to IsaacLab's absolute spawn, so the objects take the
         # same translation -- ProtoMotions applies one offset to both.
         if self.scene_objects is not None:
-            root_offset = (
-                self._init_state.get("respawn_root_offset")
-                if self._init_state is not None
-                else None
-            )
+            if self._init_state is not None:
+                root_offset = self._init_state.get("respawn_root_offset")
+            elif self.init_z_offset:
+                # ProtoMotions' respawn lift moves the robot *and the scene*
+                # together (`BaseEnv.move_reset_robot_obj_states_to_respawn_position`
+                # adds the same `respawn_root_offset` to both), so lifting only
+                # the robot would push it 5 cm out of the seat it is fitted to --
+                # the opposite of matching training. Note this is not
+                # `--scene-object-z-offset`, which mirrors ProtoMotions'
+                # *separate* `ref_object_respawn_offset` and, like it, reaches
+                # only objects that carry a trajectory; a static chair is exactly
+                # the case that one skips.
+                root_offset = (0.0, 0.0, self.init_z_offset)
+            else:
+                root_offset = None
             self.scene_objects.reset(motion_time=0.0, root_offset=root_offset)
 
         self._frame_idx = 0
         self._decimation_counter = 0
-        self._prev_actions = None
+        self._prev_actions.reset()
         self._prev_pd = None
         self._prev_prev_pd = None
         self._ema_prev_targets = None
@@ -2402,18 +2540,27 @@ class TrackerPolicy:
         self._robot_pivot = None
         # ProtoMotions zero-fills the action history on reset
         # (env.py `_reset_state_history`: "Zero actions for historical reset").
-        self._raw_action_history = (
-            np.zeros((self._raw_action_steps, self.num_dofs), dtype=np.float32)
-            if self._needs_raw_actions
-            else None
-        )
+        self._raw_action_history.reset()
         self._pd_targets_isaac = dof_pos_isaac.copy()
         self._max_ref_err = 0.0
 
-        # Open-loop replay is anchored here, before any physics runs: record
-        # frame 0 from the reset state and load tape[0], so the tape's action k
-        # spans the same window IsaacLab applied it over. See _replay_tape_step.
-        if self._action_tape is not None:
+        # Open-loop replay anchoring, and the two control shapes need opposite
+        # treatment here -- getting this wrong shifts the whole replay by one
+        # control step, which reads as a physics divergence that is not there.
+        #
+        # ``forward()`` (callback path) fires *after* each substep and only calls
+        # into the tape on every ``decimation``-th one, so nothing would read
+        # frame 0 or apply ``tape[0]`` before the first four substeps run. It
+        # needs the anchor.
+        #
+        # ``control_step()`` (the default) already opens every control step with
+        # ``_tape_step()`` *before* its substeps -- IsaacLab's own order. Calling
+        # the anchor as well would make the loop's first call re-read the same
+        # untouched reset state as frame 1 and apply ``tape[1]``, so ``tape[0]``
+        # would never reach physics and every recorded frame ``k`` would hold the
+        # state after ``k-1`` control steps. The tell is ``dof_vel`` at frame 1
+        # being bit-identical to frame 0.
+        if self._action_tape is not None and not self.control_in_loop:
             self._tape_step()
 
         log.info(
@@ -2670,9 +2817,11 @@ class TrackerPolicy:
             anchor_body_index=self.anchor_body_index,
             onnx_name_to_key=self.onnx_name_to_key,
             num_dofs=self.num_dofs,
-            prev_actions=self._prev_actions,
+            prev_actions=self._prev_actions.view()[0],
             body_state=body_state,
-            raw_action_history=self._raw_action_history,
+            raw_action_history=(
+                self._raw_action_history.view() if self._needs_raw_actions else None
+            ),
             ground_height=self._ground_height_under_root(),
             num_bodies=self.num_bodies,
         )
@@ -2727,24 +2876,20 @@ class TrackerPolicy:
 
         # `historical.processed_actions` is the actually-commanded position, i.e.
         # after the accel clamp and EMA filter -- not the raw policy output.
-        self._prev_actions = pd_targets.copy()
+        self._prev_actions.push(pd_targets)
 
         # `historical.actions` is the other thing: the raw pre-tanh network
-        # output, straight off the `actions` head, unfiltered. ProtoMotions
-        # stores it as `actions[:, 1:]`, i.e. newest first with index 0 being
-        # the previous control step, so push to the front and drop the oldest.
+        # output, straight off the `actions` head, unfiltered. Both histories
+        # are pushed here, at the end of the control step, mirroring
+        # `BaseEnv.post_physics_step`; ActionHistory owns the `actions[:, 1:]`
+        # view that keeps the observed window one step behind this push.
         if self._needs_raw_actions:
             raw = (
                 ort_out[self.onnx_out_names.index("actions")]
                 .squeeze()
                 .astype(np.float32)
             )
-            if self._raw_action_history is None:
-                self._raw_action_history = np.zeros(
-                    (self._raw_action_steps, self.num_dofs), dtype=np.float32
-                )
-            self._raw_action_history = np.roll(self._raw_action_history, 1, axis=0)
-            self._raw_action_history[0] = raw
+            self._raw_action_history.push(raw)
 
         self._pd_targets_isaac = self._to_isaac_order(pd_targets)
 
@@ -3128,6 +3273,11 @@ class TrackerPolicy:
         log.info("\n=== Per-joint PhysX properties (driver, sim joint order) ===")
         physics_view = getattr(view, "_physics_view", None)
         log.info(f"  sim joint order: {list(view.dof_names)}")
+        # `get_dof_limits` is [num_envs, num_dofs, 2] rather than per-DOF scalar,
+        # so it is printed separately below. It is here because it was the one
+        # solver-visible per-joint quantity no dump on either side reported, and
+        # a limit is a *force*: a pose outside it is pushed back with no contact
+        # and no drive torque involved.
         for label, method in (
             ("stiffness", "get_dof_stiffnesses"),
             ("damping", "get_dof_dampings"),
@@ -3150,7 +3300,34 @@ class TrackerPolicy:
                 f"values={np.round(vals, 4).tolist()}"
             )
 
+        limits = None
+        if physics_view is not None:
+            try:
+                limits = _to_numpy(physics_view.get_dof_limits()).reshape(-1, 2)
+            except Exception as e:  # pragma: no cover - version dependent
+                log.warning(f"  dof_limits read-back failed: {e}")
+        if limits is not None:
+            log.info("  dof_limits (sim joint order, [lower, upper] rad):")
+            for name, (lower, upper) in zip(view.dof_names, limits):
+                log.info(f"    {name:18s} [{lower:+.6f}, {upper:+.6f}]")
+
+        log.info("\n=== PhysX scene prim (driver) ===")
+        physx_probe.dump_physics_scene(get_current_stage(), log.info)
+
+        self.dump_collision_filtering()
         self.dump_material_stack()
+
+    def dump_collision_filtering(self) -> None:
+        """Print the articulation's self-collision filter set.
+
+        Delegates to :func:`deployment.physx_probe.dump_filtered_pairs`, which
+        the IsaacLab dump calls too, so the two logs come out of one reader --
+        see that function for why the relation matters.
+        """
+        stage = get_current_stage()
+        root = stage.GetPrimAtPath(self._prim_path)
+        log.info("\n=== Self-collision filtered pairs (driver) ===")
+        physx_probe.dump_filtered_pairs(root, log.info)
 
     def dump_material_stack(self) -> None:
         """Read back both operands of every foot-ground friction pair (E1).
@@ -3441,7 +3618,7 @@ class TrackerPolicy:
                 root_quat_xyzw=wxyz_to_xyzw(_to_numpy(root_quat_wxyz)),
             )
 
-        target_readback, vel_target_readback = [], []
+        target_readback, vel_target_readback, actuation_readback = [], [], []
         for case in range(recorder.num_cases):
             self._write_robot_state(
                 root_pos=spec["spec__root_pos"][case],
@@ -3461,6 +3638,12 @@ class TrackerPolicy:
             vel_target_readback.append(
                 self._probe_dof_read(physics_view, "get_dof_velocity_targets")
             )
+            # Mirror of the IsaacLab read: the explicit joint force PhysX holds,
+            # separate from the implicit drive. See the note in
+            # trace_tracker_isaaclab.run_drive_probe.
+            actuation_readback.append(
+                self._probe_dof_read(physics_view, "get_dof_actuation_forces")
+            )
 
             for _ in range(substeps):
                 self._apply_pd_targets(action)
@@ -3469,6 +3652,7 @@ class TrackerPolicy:
 
         recorder.write(
             out_path,
+            actuation_readback=actuation_readback,
             target_readback=target_readback,
             vel_target_readback=vel_target_readback,
             stiffness=self._probe_dof_read(physics_view, "get_dof_stiffnesses"),
@@ -3772,6 +3956,37 @@ def _configure_physics_scene(world, robot_props: dict) -> None:
         f"gpu_dynamics={ctx.is_gpu_dynamics_enabled()} "
         f"iterations={iterations}"
     )
+    _warn_if_diverging_from_training(ctx)
+
+
+def _warn_if_diverging_from_training(ctx) -> None:
+    """Name every live setting that differs from what ProtoMotions trained with.
+
+    Each of these is a deliberate default, and each has now been measured as a
+    real behavioural difference rather than a theoretical one, so a run that
+    takes them should say so in its own log instead of only on screen. Round 3
+    of this investigation spent four runs re-deriving that the demo was in a
+    divergent configuration; a line in the log is cheaper.
+
+    Only settings that are *live* are reported -- pass the matching flag and the
+    warning goes away, which is what makes it worth reading.
+
+    Args:
+        ctx: The live ``PhysicsContext``, read after ``world.reset()``.
+    """
+    divergences = []
+    if not ctx.is_gpu_dynamics_enabled():
+        divergences.append(
+            "PhysX runs on the CPU (dynamics off the GPU, MBP broadphase); "
+            "training runs GPU dynamics with the GPU broadphase "
+            "(`physxScene:enableGPUDynamics=True`, measured on both stacks). "
+            "These are different solvers, not the same solver on different "
+            "hardware: on soma_sit_1 the per-control-step root-orientation error "
+            "against IsaacLab is 4.51 deg on the CPU and 0.057 deg on the GPU. "
+            "Pass --device cuda:0 to match training."
+        )
+    for message in divergences:
+        log.warning(f"DIVERGES FROM TRAINING: {message}")
 
 
 def _add_physics_material(
@@ -3845,6 +4060,15 @@ def add_protomotions_trimesh_ground(
     robot walking off the collision mesh and "falling" for a reason that has
     nothing to do with physics parity.
 
+    **Measured null on the seated task (round 3).** Against the IsaacLab
+    reference for ``soma_sit_1`` (149 control steps), swapping the analytic
+    plane for this mesh moves nothing on the CPU solver: closed-loop mean
+    |Δ tilt| 27.43° → 27.38°, |Δ root_h| 0.0225 → 0.0230 m, |Δ foot_z| 0.0624 →
+    0.0591 m; open-loop mean |Δ dof|∞ 0.6260 → 0.6246 rad. The
+    contact-generation difference this function exists to test is real, but it
+    does not explain the sit gap, so the plane stays the default. It is *not*
+    null in combination with GPU dynamics -- see the ``--device`` note.
+
     Args:
         resolved_configs_path: Path to a run's ``resolved_configs_inference.pt``.
         friction: Static and dynamic friction for the terrain material.
@@ -3854,9 +4078,13 @@ def add_protomotions_trimesh_ground(
     import torch
     from pxr import UsdGeom
 
+    from deployment.scene_utils import load_resolved_configs
     from protomotions.components.terrains.terrain import Terrain
 
-    resolved = torch.load(resolved_configs_path, map_location="cpu", weights_only=False)
+    # Lenient unpickling: a resolved-configs file also pickles the agent config,
+    # whose module chain reaches ``lightning``, which the deployment interpreter
+    # does not carry. Only ``terrain`` is read here. See load_resolved_configs.
+    resolved = load_resolved_configs(resolved_configs_path)
     terrain_config = resolved["terrain"]
     terrain = Terrain(config=terrain_config, num_envs=1, device=torch.device("cpu"))
 
@@ -4195,7 +4423,9 @@ class SceneObjects:
     carried across the room would trace as a perfectly stationary object.
     """
 
-    def __init__(self, scene_lib, prim_paths: list, z_offset: float = 0.0) -> None:
+    def __init__(
+        self, scene_lib, prim_paths: list, specs=None, z_offset: float = 0.0
+    ) -> None:
         """Wrap the spawned object prims.
 
         Args:
@@ -4203,6 +4433,11 @@ class SceneObjects:
                 :func:`deployment.scene_utils.build_scene_lib`.
             prim_paths: Prim paths from :func:`add_scene_objects`, in SceneLib
                 object order.
+            specs: The :class:`~deployment.scene_utils.SceneObjectSpec` list the
+                prims were built from, same order. Only ``fix_base_link`` is
+                read, to tell kinematic bodies from dynamic ones -- see
+                :meth:`reset`. ``None`` treats every object as dynamic, which is
+                what every pre-chair scene was.
             z_offset: ``respawn_offset`` for ``get_scene_pose``
                 (``--scene-object-z-offset``).
         """
@@ -4212,6 +4447,12 @@ class SceneObjects:
         self.prim_paths = list(prim_paths)
         self.z_offset = float(z_offset)
         self.num_objects = len(self.prim_paths)
+        self.kinematic = (
+            [bool(spec.fix_base_link) for spec in specs]
+            if specs is not None
+            else [False] * self.num_objects
+        )
+        self._dynamic_indices = [i for i, kin in enumerate(self.kinematic) if not kin]
         # Latched by reset(); applied by reference_pose() so the trace scores
         # against the same frame the objects were written in.
         self.root_offset = None
@@ -4281,15 +4522,71 @@ class SceneObjects:
             positions=TrackerPolicy._for_view(self.view, pos.astype(np.float32)),
             orientations=TrackerPolicy._for_view(self.view, quat_wxyz),
         )
-        self.view.set_velocities(
-            TrackerPolicy._for_view(
-                self.view, np.zeros((self.num_objects, 6), dtype=np.float32)
+        # The physics write above is enough for a *dynamic* body: PhysX pushes
+        # its pose back out to USD/Fabric every step, so the render transform
+        # follows. A **kinematic** actor gets no such writeback -- PhysX assumes
+        # it is driven *from* USD -- so the prim would keep rendering at its
+        # spawn pose forever while colliding in the right place. Measured on a
+        # kinematic/dynamic cuboid pair: the kinematic one read (-0.006, 0.099,
+        # 0.381) from the physics view and (0, 0, 0) from both USD and Fabric.
+        # Author the transform for those, which is also how a kinematic body is
+        # meant to be positioned in the first place.
+        self._write_kinematic_xforms(pos, quat_wxyz)
+
+        # Velocities are a dynamic-body concept: PhysX rejects
+        # setLinearVelocity/setAngularVelocity on a kinematic actor with an
+        # error per call. Write only the bodies that can actually carry one.
+        if self._dynamic_indices:
+            self.view.set_velocities(
+                TrackerPolicy._for_view(
+                    self.view,
+                    np.zeros((len(self._dynamic_indices), 6), dtype=np.float32),
+                ),
+                indices=TrackerPolicy._for_view(
+                    self.view,
+                    np.asarray(self._dynamic_indices, dtype=np.int32),
+                    "int32",
+                ),
             )
-        )
         log.info(
             f"    scene objects reset to t={motion_time:.3f}s, "
             f"pos={np.round(pos, 3).tolist()}"
         )
+
+    def _write_kinematic_xforms(self, pos, quat_wxyz) -> None:
+        """Author the USD transform of every kinematic object prim.
+
+        The render-side half of :meth:`reset`. Writes the ops the spawner
+        already authored (``DynamicCuboid`` and friends lay down
+        ``translate``/``orient``/``scale``, in that order) rather than appending
+        new ones, which would invalidate the op order.
+
+        Args:
+            pos: ``[N, 3]`` world positions, in prim order.
+            quat_wxyz: ``[N, 4]`` world orientations in **wxyz** -- the same
+                array handed to ``set_world_poses``, not the xyzw one
+                ``get_link_transforms`` returns.
+        """
+        from pxr import Gf, UsdGeom
+
+        stage = get_current_stage()
+        for index, prim_path in enumerate(self.prim_paths):
+            if not self.kinematic[index]:
+                continue
+            prim = stage.GetPrimAtPath(prim_path)
+            translate = [float(v) for v in pos[index]]
+            w, x, y, z = (float(v) for v in quat_wxyz[index])
+            for op in UsdGeom.Xformable(prim).GetOrderedXformOps():
+                op_type = op.GetOpType()
+                double = op.GetPrecision() == UsdGeom.XformOp.PrecisionDouble
+                if op_type == UsdGeom.XformOp.TypeTranslate:
+                    op.Set(Gf.Vec3d(*translate) if double else Gf.Vec3f(*translate))
+                elif op_type == UsdGeom.XformOp.TypeOrient:
+                    op.Set(
+                        Gf.Quatd(w, Gf.Vec3d(x, y, z))
+                        if double
+                        else Gf.Quatf(w, Gf.Vec3f(x, y, z))
+                    )
 
     def measured_pose(self):
         """Current object poses off the physics view.
@@ -4337,23 +4634,53 @@ def _resolve_scenes_file(raw: str | None) -> str | None:
     return None if raw.lower() in ("none", "null") else raw
 
 
+def _reject_resync_with_dynamic_objects(specs, scenes_file: str) -> None:
+    """Exit if ``--resync-state`` would leave a *movable* object off the resync.
+
+    ``--resync-state`` rests on one claim: every control step starts from
+    IsaacLab's exact recorded state. The action tape has no object channel, so
+    anything in the scene that physics can move is outside that guarantee --
+    resyncing the robot each step while the object keeps whatever pose it drifted
+    to means step *k* no longer starts from IsaacLab's state, and the "N
+    independent one-step experiments" reading is silently void.
+
+    A ``fix_base_link`` object cannot drift: it is spawned kinematic, nothing
+    writes it after ``SceneObjects.reset``, and PhysX never integrates it. For a
+    scene made only of those -- the sitting chair is two kinematic boxes -- the
+    missing channel carries no information and the probe stays interpretable, so
+    the combination is allowed. That matters: the sit task is the one that needs
+    the probe, and a blanket rejection put its sharpest instrument out of reach.
+
+    Args:
+        specs: :class:`~deployment.scene_utils.SceneObjectSpec` list for the scene.
+        scenes_file: Path, for the error message.
+
+    Raises:
+        SystemExit: If any object is dynamic.
+    """
+    dynamic = [i for i, spec in enumerate(specs) if not spec.fix_base_link]
+    if dynamic:
+        raise SystemExit(
+            f"--resync-state cannot be combined with {scenes_file}: object(s) "
+            f"{dynamic} are dynamic (fix_base_link=False) and the action tape "
+            "records no object state, so they would diverge from the recording "
+            "while the robot is resynced to it, and the one-step divergence "
+            "would no longer be interpretable. Scenes whose objects are all "
+            "kinematic are allowed."
+        )
+    log.info(
+        f"--resync-state with {len(specs)} kinematic scene object(s): allowed, "
+        "they cannot drift from the recording."
+    )
+
+
 def main() -> None:
     if args.drive_probe and not args.drive_probe_out:
         raise SystemExit("--drive-probe requires --drive-probe-out")
     scenes_file = _resolve_scenes_file(args.scenes_file)
     if scenes_file is not None:
-        if args.resync_state:
-            # The tape has no object channel. Resync would restore the robot to
-            # IsaacLab's recorded state every step and leave the object wherever
-            # it drifted, so step k would no longer start from IsaacLab's state
-            # -- silently voiding the "N independent one-step experiments" claim
-            # the whole mode rests on.
-            raise SystemExit(
-                "--resync-state cannot be combined with --scenes-file: the "
-                "action tape records no object state, so the objects would "
-                "diverge from the recording while the robot is resynced to it, "
-                "and the one-step divergence would no longer be interpretable."
-            )
+        # The --resync-state / --scenes-file check needs the object specs, so it
+        # lives where they are built (see _reject_resync_with_dynamic_objects).
         if args.action_tape is not None:
             log.warning(
                 "--action-tape with --scenes-file: the replay drives the robot "
@@ -4496,8 +4823,6 @@ def main() -> None:
     # Also before world.reset(), because PhysX only reads the stage on play.
     scene_objects = None
     if scenes_file is not None:
-        from deployment import scene_utils
-
         scene_index = scene_utils.resolve_scene_index(
             scenes_file, args.motion_index, explicit=args.scene_index
         )
@@ -4505,6 +4830,8 @@ def main() -> None:
             scenes_file, scene_index, asset_root=args.scenes_asset_root
         )
         specs = scene_utils.scene_object_specs(scene_lib)
+        if args.resync_state:
+            _reject_resync_with_dynamic_objects(specs, scenes_file)
         if not specs:
             # A scene with no objects is a valid SceneLib state and nothing to
             # spawn; an empty RigidPrim view would fail on initialize() instead.
@@ -4518,7 +4845,10 @@ def main() -> None:
                 mesh_collision_approximation=scene_lib.config.mesh_collision_approximation,
             )
             scene_objects = SceneObjects(
-                scene_lib, prim_paths, z_offset=args.scene_object_z_offset
+                scene_lib,
+                prim_paths,
+                specs=specs,
+                z_offset=args.scene_object_z_offset,
             )
 
     policy = TrackerPolicy(
@@ -4536,9 +4866,13 @@ def main() -> None:
         joint_friction_mode=args.joint_friction,
         action_tape=args.action_tape,
         init_state=args.init_state,
-        init_z_offset=args.init_z_offset,
+        init_z_offset=scene_utils.resolve_init_z_offset(
+            args.init_z_offset, args.resolved_configs
+        ),
         author_collider_offsets=args.author_collider_offsets,
         resync_state=args.resync_state,
+        control_in_loop=args.control_in_loop,
+        self_collisions=args.self_collisions,
         scene_objects=scene_objects,
     )
     policy.num_loops = (

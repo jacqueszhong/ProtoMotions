@@ -121,3 +121,63 @@ def build_onnx_inputs(
             "Add them to build_onnx_inputs' table."
         )
     return onnx_inputs
+
+
+class ActionHistory:
+    """Ring buffer of past actions, with ProtoMotions' one-step lag built in.
+
+    Reproduces ``StateHistoryBuffer`` (``protomotions/envs/obs/state_history_buffer.py``)
+    and the view the observations are actually built from. Those are two
+    separate things, and conflating them is a silent off-by-one:
+
+    ``rotate_and_update`` runs in ``BaseEnv.post_physics_step``, *after* the
+    physics substeps, and writes the action that was just applied into index 0.
+    ``HistoricalView.actions`` is then ``buffer.actions[:, 1:]`` -- so the
+    observation deliberately **excludes** the most recent action and starts one
+    step further back. Measured on a recorded IsaacLab trace: the
+    ``previous_actions`` observation the policy consumes at control step ``s``
+    is the action from step ``s - 2``, not ``s - 1``.
+
+    A driver that keeps only ``steps`` slots and feeds all of them is therefore
+    always one control step too fresh. Keeping ``steps + 1`` and feeding
+    ``[1:]`` is the whole point of this class.
+
+    Attributes:
+        steps: Number of history steps the policy observes.
+        num_dofs: Width of one action.
+    """
+
+    def __init__(self, steps: int, num_dofs: int) -> None:
+        """Allocate a zero-filled buffer.
+
+        Args:
+            steps: History steps the exported contract asks for (the ONNX
+                input's middle dimension).
+            num_dofs: Action width.
+        """
+        self.steps = int(steps)
+        self.num_dofs = int(num_dofs)
+        # steps + 1: index 0 mirrors ProtoMotions' "current" slot, which the
+        # observation view skips.
+        self._buffer = np.zeros((self.steps + 1, self.num_dofs), dtype=np.float32)
+
+    def reset(self) -> None:
+        """Zero-fill, matching ``BaseEnv._reset_state_history(..., actions=None)``."""
+        self._buffer[:] = 0.0
+
+    def push(self, action: np.ndarray) -> None:
+        """Insert the action just applied at index 0, dropping the oldest.
+
+        Args:
+            action: ``[num_dofs]`` action for the control step that just ran.
+        """
+        self._buffer = np.roll(self._buffer, 1, axis=0)
+        self._buffer[0] = np.asarray(action, dtype=np.float32).reshape(self.num_dofs)
+
+    def view(self) -> np.ndarray:
+        """The observed history: ``[steps, num_dofs]``, newest first.
+
+        Skips index 0 exactly as ``HistoricalView.actions`` skips the buffer's
+        current slot.
+        """
+        return self._buffer[1 : self.steps + 1]

@@ -32,9 +32,19 @@ the drive.
 
 The case set is designed so a divergence names its own cause:
 
+``zero_pose``
+    The articulation straightened to all-zero joint angles, at rest, target
+    zero.  No drive torque, and -- run with ``--self-collisions off`` on both
+    harnesses -- no contact either, so nothing acts at all and both stacks must
+    be exactly still.  The reference case: read every other case against it,
+    because a divergence *here* is the articulation integrator and a divergence
+    only elsewhere is not.
 ``gravity_only``
-    Zero position error, zero velocity.  Drive torque is ~0, so any divergence
-    is articulation integration / gravity, not the drive law.
+    Zero position error, zero velocity, from the run's **post-reset pose**.
+    Drive torque is ~0, so a divergence is articulation integration, gravity, or
+    -- for a folded pose such as a seated clip's -- self-collision.  Divergence
+    here with ``zero_pose`` null means the two stacks resolve self-contact
+    differently.
 ``step_*``
     Zero velocity, pure position error.  Isolates the **stiffness** term.  A
     divergence scaling with the offset amplitude is a stiffness-side difference
@@ -178,7 +188,24 @@ def build_spec(
 
     zero = np.zeros(n)
 
-    # Drive torque ~0: whatever this case shows is articulation integration.
+    # Drive torque ~0 from the articulation's straightened zero pose. This case
+    # exists because ``gravity_only`` below cannot carry the claim its name makes:
+    # it anchors on the run's *post-reset* pose, and a seated clip's reset pose
+    # folds thighs against the torso and hands onto the thighs, so self-collision
+    # impulses -- not integration -- dominate it.
+    #
+    # The zero pose is not automatically contact-free either (soma23's arms hang
+    # along the body there, and with self-collision on it measured 1.9e-02 rad of
+    # divergence). Run it with ``--self-collisions off`` on *both* harnesses and
+    # it becomes the one unconditionally force-free case: measured on
+    # soma23/soma_sit it drops to 3e-07 rad on the CPU solver and 3e-14 on
+    # cuda:0, while ``gravity_only`` stays at 5.5e-02 either way. That pairing is
+    # what separated "the two stacks integrate differently" (they do not) from
+    # "they resolve contact differently" (they do).
+    add("zero_pose", zero, zero, zero)
+
+    # Zero drive torque from the run's own reset pose. NOT force-free if that
+    # pose self-collides; read it next to ``zero_pose``, not alone.
     add("gravity_only", q0, zero, q0)
 
     # Stiffness only: zero velocity, pure position error.
@@ -365,6 +392,25 @@ def compare(path_a, path_b) -> str:
         lines.append(
             f"  {tag:10s} target read-back max|commanded - PhysX| = {err.max():.3e} rad"
         )
+    # An explicit joint *force*, written on top of the implicit drive, is the
+    # only thing that can move a joint in a case with no contact and no drive
+    # error -- and it appears in no property dump, only here.  IsaacLab writes
+    # this array every substep (`Articulation.write_data_to_sim` ->
+    # `set_dof_actuation_forces`); the standalone driver never writes it.  Both
+    # must read back zero for the probe's "only gravity and the drive act"
+    # premise to hold.
+    for tag, data in ((name_a, a), (name_b, b)):
+        if "res__actuation_readback" not in data.files:
+            lines.append(f"  {tag:16s} actuation force: <not recorded>")
+            continue
+        forces = data["res__actuation_readback"]
+        worst = int(np.abs(forces).argmax())
+        lines.append(
+            f"  {tag:16s} actuation force read-back: max|tau| = "
+            f"{np.abs(forces).max():.3e} Nm"
+            + (f" ({joints[worst % len(joints)]})" if np.abs(forces).max() > 0 else "")
+        )
+
     # The *velocity* target is the one read that can cancel the damping term
     # while leaving the stiffness term intact: PhysX applies
     # ``kp*(qTarget - q) + kd*(vTarget - v)``, so a vTarget that tracks v damps
@@ -470,13 +516,18 @@ def compare(path_a, path_b) -> str:
         )
         for i, label in enumerate(labels)
     }
+    zero_case = by_case.get("zero_pose", math.nan)
     grav = by_case.get("gravity_only", math.nan)
     damp = max((v for k, v in by_case.items() if k.startswith("damp_")), default=0.0)
     step = max((v for k, v in by_case.items() if k.startswith("step_")), default=0.0)
     lines.append("  Attribution:")
     lines.append(
-        f"    gravity_only (no drive torque)      |d qd|inf = {grav:.3e}"
+        f"    zero_pose    (no force, no contact) |d qd|inf = {zero_case:.3e}"
         "   <- articulation integration alone"
+    )
+    lines.append(
+        f"    gravity_only (no drive torque)      |d qd|inf = {grav:.3e}"
+        "   <- integration + self-contact of the reset pose"
     )
     lines.append(f"    step_*       (stiffness term only)  |d qd|inf = {step:.3e}")
     lines.append(f"    damp_*       (damping term only)    |d qd|inf = {damp:.3e}")
