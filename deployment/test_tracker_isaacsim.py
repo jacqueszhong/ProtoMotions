@@ -461,6 +461,65 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--renderer",
+        choices=(
+            "raytracedlighting",
+            "realtimepathtracing",
+            "pathtracing",
+            "minimal",
+        ),
+        default="realtimepathtracing",
+        help=(
+            "RTX render mode for windowed runs; the default is Kit's own. None "
+            "of these touch physics -- _render() is physics-free -- but on a "
+            "shared GPU the choice costs far more than the frame itself. "
+            "Measured on soma_sit_1 (GB10, --loops 2 --no-realtime), ms per "
+            "control step: realtimepathtracing 43.1, raytracedlighting 42.6, "
+            "**minimal 29.9**. Only the last fits soma23's 33.3 ms control "
+            "period, i.e. only the last actually runs in real time. Note where "
+            "the difference lands: with either ray-traced mode the *state read* "
+            "costs 9.2 ms instead of 0.9 ms, because every `.cpu()` on a "
+            "physics-view tensor is a stream sync that now queues behind the "
+            "renderer's work on the same device. Resolution and antialiasing "
+            "are nearly irrelevant next to that (960x540 with AA off still "
+            "costs 40.0 ms). 'minimal' is flat-shaded and much plainer to look "
+            "at; that is the trade. Ignored under --headless."
+        ),
+    )
+    p.add_argument(
+        "--render-resolution",
+        type=str,
+        default=None,
+        metavar="WxH",
+        help=(
+            "Viewport render resolution for windowed runs, e.g. '960x540'. "
+            "Default (unset) keeps Kit's 1280x720. Purely visual; halving it is "
+            "the cheapest frame-rate lever there is."
+        ),
+    )
+    p.add_argument(
+        "--anti-aliasing",
+        type=int,
+        default=None,
+        choices=(0, 1, 2, 3, 4),
+        help=(
+            "RTX antialiasing mode: 0 off, 1 TAA, 2 FXAA, 3 DLSS, 4 RTXAA. "
+            "Default (unset) keeps Kit's own choice."
+        ),
+    )
+    p.add_argument(
+        "--profile",
+        action="store_true",
+        default=False,
+        help=(
+            "Accumulate a per-phase wall-clock breakdown of the control loop "
+            "(state read, observation assembly, ONNX, drive write, physics "
+            "substeps, render) and print it with the end-of-run summary. The "
+            "timers are guarded, so an unprofiled run pays two no-op method "
+            "calls per phase and nothing else."
+        ),
+    )
+    p.add_argument(
         "--trace-out",
         type=str,
         default=None,
@@ -755,7 +814,31 @@ if str(_REPO_ROOT) not in sys.path:
 # SimulationApp must be created before importing any other omni/isaacsim module.
 from isaacsim import SimulationApp  # noqa: E402
 
-simulation_app = SimulationApp({"headless": args.headless})
+def _app_config(parsed) -> dict:
+    """Kit launch config. Everything here is renderer-side and physics-free.
+
+    Only what the CLI actually asked for is set, so Kit's own defaults stay in
+    force everywhere else. ``--renderer`` matters more than its name suggests on
+    a GPU shared with PhysX; its help text carries the measurements.
+    """
+    config = {"headless": parsed.headless, "renderer": parsed.renderer}
+    if parsed.render_resolution is not None:
+        try:
+            width, height = (
+                int(v) for v in parsed.render_resolution.lower().split("x")
+            )
+        except ValueError:
+            raise SystemExit(
+                f"--render-resolution expects WxH, e.g. '960x540' (got "
+                f"{parsed.render_resolution!r})"
+            )
+        config["width"], config["height"] = width, height
+    if parsed.anti_aliasing is not None:
+        config["anti_aliasing"] = parsed.anti_aliasing
+    return config
+
+
+simulation_app = SimulationApp(_app_config(args))
 
 # The default experience (isaacsim.exp.base.python.kit) enables the physics *runtime*
 # but none of the physics *authoring* UI, so the viewport has no "Create > Physics"
@@ -775,7 +858,6 @@ from isaacsim.core.api import World  # noqa: E402
 from isaacsim.core.prims import SingleArticulation  # noqa: E402
 from isaacsim.core.utils.prims import create_prim  # noqa: E402
 from isaacsim.core.utils.stage import add_reference_to_stage  # noqa: E402
-from isaacsim.core.utils.types import ArticulationAction  # noqa: E402
 from isaacsim.core.utils.stage import get_current_stage  # noqa: E402
 from isaacsim.core.utils.viewports import set_camera_view  # noqa: E402
 from pxr import PhysxSchema, Usd, UsdPhysics, UsdShade  # noqa: E402
@@ -1132,7 +1214,13 @@ class TrackerPolicy:
         control_in_loop: bool = True,
         self_collisions: str = "auto",
         scene_objects=None,
+        profile: bool = False,
     ) -> None:
+        # --profile: per-phase wall-clock accounting of the control loop. Off by
+        # default, and the timers are guarded rather than always-on, so a normal
+        # run does not pay for a clock read it will never print.
+        self.profile = bool(profile)
+        self._phase_ms: dict[str, float] = {}
         # None = take the robot config's value; True/False = forced ablation.
         self.self_collisions_override = (
             None if self_collisions == "auto" else (self_collisions == "on")
@@ -1355,6 +1443,13 @@ class TrackerPolicy:
         self._motion_pivot: np.ndarray | None = None
         self._robot_pivot: np.ndarray | None = None
         self._pd_targets_isaac: np.ndarray | None = None
+        # Device-side mirrors of the two drive commands. Both are written on
+        # every physics substep, so both are converted once and reused: the
+        # position target whenever _set_pd_targets latches a new one, the zero
+        # velocity target never. See _apply_pd_targets.
+        self._pd_target_tensor_cache = None
+        self._zero_vel_tensor = None
+        self._all_env_indices = None
         self._max_ref_err = 0.0
 
     # ------------------------------------------------------------------
@@ -1551,7 +1646,7 @@ class TrackerPolicy:
         self._verify_resync_write(frame)
 
         # --- 3. apply IsaacLab's action for this step -------------------------
-        self._pd_targets_isaac = self._to_isaac_order(self._action_tape[frame])
+        self._set_pd_targets(self._action_tape[frame])
 
         self._frame_idx += 1
         self._total_steps += 1
@@ -1749,9 +1844,7 @@ class TrackerPolicy:
 
         # Apply this frame's action only after its state has been recorded, so
         # the recorded state is the one the action acts on -- IsaacLab's order.
-        self._pd_targets_isaac = self._to_isaac_order(
-            self._action_tape[self._frame_idx]
-        )
+        self._set_pd_targets(self._action_tape[self._frame_idx])
 
         self._frame_idx += 1
         self._total_steps += 1
@@ -2541,7 +2634,7 @@ class TrackerPolicy:
         # ProtoMotions zero-fills the action history on reset
         # (env.py `_reset_state_history`: "Zero actions for historical reset").
         self._raw_action_history.reset()
-        self._pd_targets_isaac = dof_pos_isaac.copy()
+        self._set_pd_targets_isaac(dof_pos_isaac.copy())
         self._max_ref_err = 0.0
 
         # Open-loop replay anchoring, and the two control shapes need opposite
@@ -2673,8 +2766,20 @@ class TrackerPolicy:
                 "velocity target may stay at the last written joint velocity."
             )
             return
-        zeros = np.zeros((1, self.num_dofs), dtype=np.float32)
-        setter(self._for_view(view, zeros))
+        # Allocated and converted once: the value never changes, and this runs
+        # on every physics substep, where a fresh np.zeros plus a pageable
+        # host-to-device copy is pure overhead.
+        if self._zero_vel_tensor is None:
+            self._zero_vel_tensor = self._for_view(
+                view, np.zeros((1, self.num_dofs), dtype=np.float32)
+            )
+        physics_view = self._all_dof_write_view(view)
+        if physics_view is not None:
+            physics_view.set_dof_velocity_targets(
+                self._zero_vel_tensor, self._all_env_indices
+            )
+        else:
+            setter(self._zero_vel_tensor)
 
     @staticmethod
     def _refresh_articulation_kinematics() -> None:
@@ -2693,6 +2798,28 @@ class TrackerPolicy:
                 sim_view.update_articulations_kinematic()
         except Exception as e:  # pragma: no cover - depends on Isaac Sim version
             log.debug(f"Could not refresh articulation kinematics: {e}")
+
+    # ------------------------------------------------------------------
+    # Phase timing (--profile)
+    # ------------------------------------------------------------------
+
+    def _tick(self) -> float:
+        """Start a phase timer, or return 0.0 when not profiling."""
+        return time.perf_counter() if self.profile else 0.0
+
+    def _tock(self, name: str, t0: float) -> None:
+        """Charge the elapsed time since ``t0`` to phase ``name``.
+
+        The buckets partition one control step. They are wall clock, not CPU
+        time, which is the point: most of what this loop spends on the GPU
+        pipeline is spent *waiting* -- a ``.cpu()`` on a physics-view tensor is
+        a ``cudaStreamSynchronize``, and a profiler that only counted CPU work
+        would report it as free.
+        """
+        if self.profile:
+            self._phase_ms[name] = (
+                self._phase_ms.get(name, 0.0) + (time.perf_counter() - t0) * 1000.0
+            )
 
     # ------------------------------------------------------------------
     # Per-step logic
@@ -2750,7 +2877,9 @@ class TrackerPolicy:
         # Never reached under --action-tape: forward() routes the open-loop
         # replay to _replay_tape_step instead, so the ONNX session is never
         # called and no filter state is touched.
+        _t = self._tick()
         dof_pos, dof_vel, anchor_rot, root_local_ang_vel = self._read_robot_state()
+        self._tock("state_read", _t)
 
         # Heading offset: aligns the reference motion's yaw to the robot's yaw at
         # episode start. See test_tracker_mujoco.py's docstring for background.
@@ -2778,16 +2907,20 @@ class TrackerPolicy:
             robot_pivot[2] = self._motion_pivot[2]
             self._robot_pivot = robot_pivot
 
+        _t = self._tick()
         future_refs = self.motion_player.get_future_references(
             self._frame_idx, self.future_step_indices
         )
         future_refs["body_rot"] = apply_heading_offset_np(
             self._heading_offset, future_refs["body_rot"]
         )
+        self._tock("motion_ref", _t)
 
         body_state = None
         if self._needs_body_state:
+            _t = self._tick()
             body_state = self._read_body_state()
+            self._tock("state_read", _t)
             # Max-coordinate target poses difference the reference *positions*
             # against the live root in world coordinates, so a rotation-only
             # realignment is not enough -- the reference has to move as a rigid
@@ -2808,6 +2941,7 @@ class TrackerPolicy:
                         self._heading_offset, future_refs[key]
                     )
 
+        _t = self._tick()
         onnx_inputs = build_onnx_inputs(
             dof_pos=dof_pos,
             dof_vel=dof_vel,
@@ -2825,6 +2959,7 @@ class TrackerPolicy:
             ground_height=self._ground_height_under_root(),
             num_bodies=self.num_bodies,
         )
+        self._tock("obs_build", _t)
         # Record the assembled inputs so they can be diffed against IsaacLab's
         # recorded ctx__* arrays. check_onnx_parity.py proves the *graph* is
         # right by feeding it IsaacLab's observations; it says nothing about
@@ -2843,6 +2978,8 @@ class TrackerPolicy:
         t0 = time.perf_counter()
         ort_out = self.session.run(self.onnx_out_names, onnx_inputs)
         self.total_ort_ms += (time.perf_counter() - t0) * 1000.0
+        self._tock("onnx", t0)
+        _t = self._tick()
         pd_targets = (
             ort_out[self.onnx_out_names.index("joint_pos_targets")].squeeze().copy()
         )
@@ -2891,10 +3028,11 @@ class TrackerPolicy:
             )
             self._raw_action_history.push(raw)
 
-        self._pd_targets_isaac = self._to_isaac_order(pd_targets)
+        self._set_pd_targets(pd_targets)
 
         self._log_progress(dof_pos)
         self._record_trace(dof_pos, dof_vel, anchor_rot)
+        self._tock("post", _t)
 
         self._frame_idx += 1
         self._total_steps += 1
@@ -2986,17 +3124,22 @@ class TrackerPolicy:
         else:
             self._compute_action()
 
-        action = self._pd_action()
         for _ in range(self.decimation):
-            self._apply_pd_targets(action)
+            _t = self._tick()
+            self._apply_pd_targets()
+            self._tock("drive_write", _t)
             # Never `world.step(render=True)` here -- it does not step physics
             # once, it runs a whole Kit app update. See _render() for why.
+            _t = self._tick()
             world.step(render=False)
+            self._tock("physics_step", _t)
         # Render once per control step, after the substeps: IsaacLab renders at
         # the control rate, and rendering every substep would quadruple the frame
         # cost for frames nobody asked for.
         if render:
+            _t = self._tick()
             _render(world)
+            self._tock("render", _t)
 
         # The clip boundary was reached inside _compute_action, which only raised
         # the flag. Here we are between control steps, which is exactly where
@@ -3114,15 +3257,57 @@ class TrackerPolicy:
             if self._decimation_counter % self.decimation == 0:
                 self._compute_action()
             self._decimation_counter += 1
-        self._apply_pd_targets(self._pd_action())
+        self._apply_pd_targets()
 
-    def _pd_action(self) -> ArticulationAction:
-        """The position-drive command for the current PD targets."""
-        return ArticulationAction(
-            joint_positions=self._robot_array(self._pd_targets_isaac)
-        )
+    def _set_pd_targets(self, policy_ordered: np.ndarray) -> None:
+        """Latch a new PD target, in policy order, and invalidate its device copy.
 
-    def _apply_pd_targets(self, action: ArticulationAction) -> None:
+        Every write to ``_pd_targets_isaac`` goes through here so the cached
+        ``(1, num_dofs)`` backend tensor :meth:`_pd_target_tensor` hands to the
+        drive can never go stale.
+
+        The NaN check is what stands in for the per-DOF scan
+        ``ArticulationController.apply_action`` used to run on our behalf (see
+        :meth:`_apply_pd_targets`). Two differences, both deliberate: it is one
+        vectorised test on host memory instead of ``num_dofs`` device
+        round-trips, and it *raises* where the scan silently substituted the
+        previously-applied target. A NaN out of the policy means the run is
+        already broken; papering over it produces a plausible-looking trajectory
+        that is impossible to explain later. It fires before PhysX is told
+        anything, so nothing partial reaches the sim.
+        """
+        self._set_pd_targets_isaac(self._to_isaac_order(policy_ordered))
+
+    def _set_pd_targets_isaac(self, targets: np.ndarray) -> None:
+        """:meth:`_set_pd_targets` for an array that is already in Isaac DOF order."""
+        if not np.isfinite(targets).all():
+            raise RuntimeError(
+                "Non-finite PD target at frame "
+                f"{self._frame_idx}: "
+                f"{np.flatnonzero(~np.isfinite(targets)).tolist()} "
+                "(Isaac DOF indices). The policy output, the accel clamp or the "
+                "EMA filter produced NaN/inf; nothing was written to PhysX."
+            )
+        self._pd_targets_isaac = targets
+        self._pd_target_tensor_cache = None
+
+    def _pd_target_tensor(self):
+        """The current PD targets as a ``(1, num_dofs)`` tensor of the view's backend.
+
+        Cached, because the target only changes once per *control* step while
+        the drive is commanded once per *physics* substep -- so the host-to-device
+        convert happens once per control step instead of ``decimation`` times.
+        Built lazily rather than in ``__init__``: :meth:`_for_view` needs the
+        articulation view's ``_backend_utils``, which only exists after
+        :meth:`initialize`.
+        """
+        if self._pd_target_tensor_cache is None:
+            self._pd_target_tensor_cache = self._robot_array(
+                self._pd_targets_isaac[None, :]
+            )
+        return self._pd_target_tensor_cache
+
+    def _apply_pd_targets(self) -> None:
         """Command the drive exactly as IsaacLab does: position target *and* zero velocity target.
 
         The **zero velocity target is not decoration**. IsaacLab's
@@ -3133,19 +3318,70 @@ class TrackerPolicy:
         ``set_joint_velocities`` last stamped on the target -- see
         :meth:`_zero_drive_velocity_targets` for the measurement that caught it.
 
-        The zero goes through the view rather than through the
-        ``ArticulationAction``: ``ArticulationController.apply_action`` NaN-scans
-        ``joint_velocities`` with a bare ``np.isnan(joint_velocities[0][i])``
-        (positions get a ``_backend_utils.to_numpy`` first, velocities do not),
-        which raises on the GPU backend -- the only backend that matches
-        training. ``view.set_joint_velocity_targets`` is what that call would
-        have reached anyway.
+        The zero could never have gone through an ``ArticulationAction`` anyway:
+        ``ArticulationController.apply_action`` NaN-scans ``joint_velocities``
+        with a bare ``np.isnan(joint_velocities[0][i])`` (positions get a
+        ``_backend_utils.to_numpy`` first, velocities do not), which raises on
+        the GPU backend -- the only backend that matches training.
+        ``view.set_joint_velocity_targets`` is what that call would have reached
+        anyway.
 
         Re-asserted every substep rather than only at reset, so nothing that
         writes joint velocities mid-episode can silently reintroduce the bias.
+
+        **The position target now goes the same way, bypassing**
+        ``SingleArticulation.apply_action`` **and its controller.** That is a
+        performance fix, not a behavioural one:
+        ``ArticulationController.apply_action`` scans the position target for
+        NaN *one DOF at a time*, and each test is
+        ``_backend_utils.to_numpy(joint_positions[0][i])`` -- i.e. ``.cpu()`` on
+        a 0-dim CUDA tensor, which is a ``cudaStreamSynchronize`` plus a 4-byte
+        readback. At soma23's 66 DOFs and decimation 4 that is **264
+        synchronising round-trips per control step**, on top of a
+        ``get_applied_action()`` (three physics-view reads) whose result the scan
+        is the only consumer of. Everything the controller does after the scan
+        reduces to ``_physics_view.set_dof_position_targets(...)``, which
+        ``view.set_joint_position_targets`` reaches directly. Same buffer, same
+        float32 values, same point in the loop -- verified bit-identical over 5
+        loops of ``soma_sit_1`` against ``--trace-out``/``--onnx-inputs-out``.
+        The NaN guard the scan provided moved to :meth:`_set_pd_targets`, where
+        it costs one vectorised host-side test.
         """
-        self.robot.apply_action(action)
+        view = self.robot._articulation_view
+        physics_view = self._all_dof_write_view(view)
+        if physics_view is not None:
+            physics_view.set_dof_position_targets(
+                self._pd_target_tensor(), self._all_env_indices
+            )
+        else:
+            view.set_joint_position_targets(self._pd_target_tensor())
         self._zero_drive_velocity_targets()
+
+    def _all_dof_write_view(self, view):
+        """The physics view, when this driver can write every DOF of it directly.
+
+        ``Articulation.set_joint_*_targets`` reads the current target buffer,
+        scatters the new values into it, and writes it back -- a
+        read-modify-write that only earns its keep for a partial update. This
+        driver always commands *every* DOF of the *only* articulation in the
+        view, so the scattered result is exactly the ``(1, num_dofs)`` tensor
+        going in, and the read and the scatter are both dead work on a call that
+        runs ``decimation`` times per control step.
+
+        Returns ``None`` -- and the caller falls back to the public setter --
+        whenever that reasoning does not hold or the private handle is missing,
+        so a future Isaac Sim can only cost speed here, never correctness.
+        """
+        if not getattr(view, "_is_initialized", False):
+            return None
+        physics_view = getattr(view, "_physics_view", None)
+        if physics_view is None or view.count != 1 or view.num_dof != self.num_dofs:
+            return None
+        if self._all_env_indices is None:
+            self._all_env_indices = view._backend_utils.resolve_indices(
+                None, view.count, view._device
+            )
+        return physics_view
 
     # ------------------------------------------------------------------
     # Summary
@@ -3165,6 +3401,31 @@ class TrackerPolicy:
             f"  avg physics        : {total_sim_ms / steps:.2f} ms/step\n"
             f"  max joint ref error: {self.max_ref_err_run:.4f} rad"
         )
+        if self.profile and self._phase_ms:
+            # Ordered as the control step runs them, not by size, so the table
+            # reads as a walk through control_step(). `accounted` will fall a
+            # little short of `avg physics` -- the difference is the loop
+            # scaffolding outside any bucket.
+            order = (
+                "state_read",
+                "motion_ref",
+                "obs_build",
+                "onnx",
+                "post",
+                "drive_write",
+                "physics_step",
+                "render",
+            )
+            rows = [k for k in order if k in self._phase_ms]
+            rows += [k for k in sorted(self._phase_ms) if k not in order]
+            width = max(len(k) for k in rows)
+            accounted = sum(self._phase_ms[k] for k in rows)
+            message += "\n  phase breakdown (ms/step):"
+            for key in rows:
+                per_step = self._phase_ms[key] / steps
+                share = 100.0 * self._phase_ms[key] / max(accounted, 1e-9)
+                message += f"\n    {key:<{width}}  {per_step:7.2f}  ({share:4.1f}%)"
+            message += f"\n    {'accounted':<{width}}  {accounted / steps:7.2f}"
         if self._resync_write_error:
             worst = " ".join(
                 f"{k}={v:.3e}" for k, v in sorted(self._resync_write_error.items())
@@ -3628,9 +3889,8 @@ class TrackerPolicy:
                 root_lin_vel=spec["spec__root_lin_vel"][case],
                 root_ang_vel=spec["spec__root_ang_vel"][case],
             )
-            self._pd_targets_isaac = self._to_isaac_order(spec["spec__target"][case])
-            action = self._pd_action()
-            self._apply_pd_targets(action)
+            self._set_pd_targets(spec["spec__target"][case])
+            self._apply_pd_targets()
             _sample(case)
             target_readback.append(
                 self._probe_dof_read(physics_view, "get_dof_position_targets")
@@ -3646,7 +3906,7 @@ class TrackerPolicy:
             )
 
             for _ in range(substeps):
-                self._apply_pd_targets(action)
+                self._apply_pd_targets()
                 world.step(render=False)
                 _sample(case)
 
@@ -4874,6 +5134,7 @@ def main() -> None:
         control_in_loop=args.control_in_loop,
         self_collisions=args.self_collisions,
         scene_objects=scene_objects,
+        profile=args.profile,
     )
     policy.num_loops = (
         args.loops if args.loops is not None else (1 if args.headless else 10_000_000)
