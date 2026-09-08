@@ -736,6 +736,7 @@ class TrackerPolicy:
         control_in_loop: bool = True,
         self_collisions: str = "auto",
         scene_objects=None,
+        projectiles=None,
         profile: bool = False,
     ) -> None:
         # --profile: per-phase wall-clock accounting of the control loop. Off by
@@ -757,6 +758,10 @@ class TrackerPolicy:
         # only: the ONNX graph carries no scene channel, so the policy does not
         # observe them -- see the module docstring.
         self.scene_objects = scene_objects
+        # Projectile pool (--projectiles), or None. Held only so a clip restart
+        # can clear cubes that are still in flight; throwing is the runtime's
+        # job, not the policy's.
+        self.projectiles = projectiles
         robot_meta = meta["robot"]
         timing = meta["timing"]
         motion_meta = meta["motion"]
@@ -2148,6 +2153,11 @@ class TrackerPolicy:
             else:
                 root_offset = None
             self.scene_objects.reset(motion_time=0.0, root_offset=root_offset)
+
+        # Clear anything still in flight, so a new loop does not start with a
+        # cube already mid-arc at the robot. Same window as the writes above.
+        if self.projectiles is not None:
+            self.projectiles.hide_all()
 
         self._frame_idx = 0
         self._decimation_counter = 0
@@ -3953,7 +3963,11 @@ _PHYSX_DEFAULT_FRICTION = 0.5
 
 
 def _author_scene_object_physics(
-    stage, prim_path: str, spec, mesh_collision_approximation=None
+    stage,
+    prim_path: str,
+    spec,
+    mesh_collision_approximation=None,
+    contact_offset: float = _OBJECT_CONTACT_OFFSET,
 ) -> None:
     """Write one scene object's PhysX properties onto an already-created prim.
 
@@ -3993,6 +4007,10 @@ def _author_scene_object_physics(
         spec: The :class:`deployment.scene_utils.SceneObjectSpec` to apply.
         mesh_collision_approximation: ``SceneLibConfig.mesh_collision_approximation``,
             applied to mesh colliders when set.
+        contact_offset: ``physxCollision:contactOffset`` for every collider.
+            Defaults to the scene-object value IsaacLab spawns with; the
+            projectile pool overrides it, because IsaacLab spawns *those* with
+            its own, larger one (see :func:`add_projectiles`).
     """
     prim = stage.GetPrimAtPath(prim_path)
 
@@ -4012,7 +4030,7 @@ def _author_scene_object_physics(
     colliders = _find_prims_with_api(stage, prim_path, UsdPhysics.CollisionAPI)
     for collider in colliders:
         PhysxSchema.PhysxCollisionAPI.Apply(collider)
-        _set_prim_attr(collider, "physxCollision:contactOffset", _OBJECT_CONTACT_OFFSET)
+        _set_prim_attr(collider, "physxCollision:contactOffset", float(contact_offset))
         _set_prim_attr(collider, "physxCollision:restOffset", _OBJECT_REST_OFFSET)
         if spec.kind == "mesh" and mesh_collision_approximation is not None:
             mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(collider)
@@ -4389,6 +4407,373 @@ class SceneObjects:
         return pos, wxyz_to_xyzw(quat_wxyz)
 
 
+# ---------------------------------------------------------------------------
+# Projectiles
+# ---------------------------------------------------------------------------
+
+#: Collider offsets IsaacLab spawns *projectiles* with -- ten times the scene
+#: object's contact offset (``CollisionPropertiesCfg(contact_offset=0.02,
+#: rest_offset=0.0)``, ``isaaclab/utils/scene.py``). A cube arrives far faster
+#: than a chair moves, so it gets a wider band to generate contacts in.
+_PROJECTILE_CONTACT_OFFSET = 0.02
+
+#: The red IsaacLab paints its projectile cubes
+#: (``PreviewSurfaceCfg(diffuse_color=(0.8, 0.1, 0.1))``). Distinct from
+#: ``_OBJECT_COLOR_DEFAULTS["box"]`` on purpose: a thrown cube should not be
+#: mistakable for a scene object the policy is supposed to interact with.
+_PROJECTILE_COLOR = (0.8, 0.1, 0.1)
+
+
+@dataclass
+class ProjectileConfig:
+    """Cube-projectile pool settings.
+
+    Mirrors ``ProjectileConfig`` in
+    ``protomotions/simulator/base_simulator/config.py`` field for field, so a
+    cube thrown here hits as hard as a cube thrown in IsaacLab. Kept as a copy
+    rather than an import for the reason :func:`add_scene_objects` gives about
+    its own authoring: this path must not drag the ProtoMotions package into a
+    run that does not otherwise need it. The original is also torch- and
+    ``num_envs``-shaped, while everything here is single-robot NumPy.
+
+    **One default deliberately diverges.** ProtoMotions launches at 30-40 m/s
+    (ASE's range); this defaults to a quarter of that. At 40 m/s and a 1/200 s
+    physics step a cube moves ~0.2 m per step -- wider than a G1's forearm --
+    so it can pass clean through a limb without ever generating a contact.
+    Neither IsaacLab nor IsaacGym enables CCD on projectiles, so matching them
+    means not enabling it here either; throwing slower is what makes the hits
+    land. Raise ``speed_range`` back to (30, 40) for parity with training, and
+    author ``physxRigidBody:enableCCD`` on the cubes if you need both.
+
+    Attributes:
+        num_projectiles: Pool size. Cubes are reused round-robin, so this is
+            how many can be in flight at once. ``0`` disables the feature.
+        cube_half_size_range: Half-extent of the smallest and largest cube;
+            pool indices interpolate between them.
+        density: kg/m^3. Mass follows from the cube's volume, so bigger pool
+            indices also hit harder.
+        speed_range: Launch speed in m/s. See the note above.
+        spawn_distance_range: How far from the robot a cube appears, metres.
+        spawn_height_range: Spawn height relative to the robot's *root*, metres
+            -- the negative end aims at the legs, the positive at the head.
+        direction_noise_std: Std of the Gaussian added to the aim direction, so
+            a throw is not a guaranteed hit.
+        hide_delay: Seconds a cube stays in the world before being parked.
+        hide_z: Depth cubes are parked at, below the ground plane.
+        hide_spacing: Vertical gap between parked cubes. See
+            :meth:`Projectiles.hide_all` for why they are not colocated.
+    """
+
+    num_projectiles: int = 0
+    cube_half_size_range: tuple = (0.05, 0.15)
+    density: float = 500.0
+    speed_range: tuple = (7.5, 10.0)
+    spawn_distance_range: tuple = (4.0, 5.0)
+    spawn_height_range: tuple = (-0.65, 1.1)
+    direction_noise_std: float = 0.1
+    hide_delay: float = 2.0
+    hide_z: float = -2.0
+    hide_spacing: float = 4.0
+
+    def get_sizes(self) -> list:
+        """Per-pool-index half sizes, linearly interpolated."""
+        lo, hi = self.cube_half_size_range
+        n = self.num_projectiles
+        if n == 1:
+            return [lo]
+        return [lo + (hi - lo) * i / (n - 1) for i in range(n)]
+
+    def hidden_z_for_index(self, projectile_index: int) -> float:
+        """Parked z for one pool index, spaced to avoid cube-cube overlap."""
+        return self.hide_z - self.hide_spacing * projectile_index
+
+
+def add_projectiles(
+    cfg: ProjectileConfig, root_path: str = "/World/Projectiles"
+) -> list:
+    """Spawn the projectile cubes onto the stage as PhysX rigid bodies.
+
+    The same shape as :func:`add_scene_objects`, and the same two constraints:
+    cubes are spawned at their parked pose rather than where they will be used
+    (:class:`Projectiles` writes the real pose), and this **must be called
+    before ``world.reset()``**, because PhysX only reads the stage when the sim
+    starts playing.
+
+    Geometry and physics both follow IsaacLab's ``projectile_{i}``
+    ``RigidObjectCfg`` (``protomotions/simulator/isaaclab/utils/scene.py``): a
+    unit cube scaled to ``2 * half_size``, density-derived mass, no explicit
+    physics material (so PhysX's own default governs friction), and the wider
+    ``_PROJECTILE_CONTACT_OFFSET``.
+
+    Args:
+        cfg: The pool description.
+        root_path: Scope to author the cubes under.
+
+    Returns:
+        The created prim paths, in pool order.
+    """
+    from isaacsim.core.api.objects import DynamicCuboid
+
+    stage = get_current_stage()
+    sizes = cfg.get_sizes()
+    log.info(
+        f"Projectiles: spawning {cfg.num_projectiles} cube(s) under {root_path} "
+        f"(half sizes {[round(s, 3) for s in sizes]}, density {cfg.density} kg/m^3, "
+        f"speed {cfg.speed_range[0]}-{cfg.speed_range[1]} m/s)"
+    )
+
+    prim_paths = []
+    for index, half_size in enumerate(sizes):
+        prim_path = f"{root_path}/Projectile_{index}"
+        extent = float(half_size) * 2.0
+        # size=1.0 + scale is how IsaacLab expresses a box too -- a unit cube
+        # carrying its dimensions in the xform scale. See add_scene_objects.
+        DynamicCuboid(
+            prim_path=prim_path,
+            name=f"projectile_{index}",
+            size=1.0,
+            scale=np.array([extent, extent, extent], dtype=np.float32),
+            color=np.asarray(_PROJECTILE_COLOR, dtype=np.float32),
+            position=np.array(
+                [float(index), float(index), cfg.hidden_z_for_index(index)],
+                dtype=np.float32,
+            ),
+        )
+        # A locally built spec, so the cubes go through the *same* property
+        # path as every other spawned body. SceneObjectSpec is a plain
+        # dataclass; constructing one imports nothing from ProtoMotions.
+        spec = scene_utils.SceneObjectSpec(
+            kind="box",
+            size=(extent, extent, extent),
+            fix_base_link=False,
+            mass=None,
+            density=float(cfg.density),
+        )
+        _author_scene_object_physics(
+            stage, prim_path, spec, contact_offset=_PROJECTILE_CONTACT_OFFSET
+        )
+        # IsaacLab's RigidBodyPropertiesCfg(enable_gyroscopic_forces=True). The
+        # cubes launch with zero spin so it changes little, but it is free.
+        _set_prim_attr(
+            stage.GetPrimAtPath(prim_path),
+            "physxRigidBody:enableGyroscopicForces",
+            True,
+        )
+        prim_paths.append(prim_path)
+
+    return prim_paths
+
+
+def _world_time(world) -> float:
+    """Simulated seconds since the sim started playing.
+
+    ``World.current_time`` is the authority, and the reason the projectile
+    clock is read off the world rather than accumulated: it agrees across both
+    stepping paths -- the CLI's loop and Kit's timeline -- without either
+    having to know how much sim time its own iteration covered. Fall back to
+    the step counter on a core that does not expose it.
+    """
+    now = getattr(world, "current_time", None)
+    if now is not None:
+        return float(now)
+    return float(getattr(world, "current_time_step_index", 0)) * float(
+        world.get_physics_dt()
+    )
+
+
+class Projectiles:
+    """Runtime handle on the spawned cubes: throw one, park the expired ones.
+
+    The single-robot NumPy port of ``_throw_projectile`` / ``_update_projectiles``
+    / ``_hide_projectiles_for_envs`` in
+    ``protomotions/simulator/base_simulator/simulator.py``, which in turn
+    follows ASE's ``humanoid_perturb.py``.
+
+    Like :class:`SceneObjects`, all reads and writes go through the initialized
+    :class:`isaacsim.core.prims.RigidPrim` view rather than the USD stage --
+    see that class on why a stage read would report a cube in flight as
+    stationary.
+    """
+
+    def __init__(self, cfg: ProjectileConfig, prim_paths: list) -> None:
+        """Wrap the spawned cube prims.
+
+        Args:
+            cfg: The pool description the prims were built from.
+            prim_paths: Prim paths from :func:`add_projectiles`, in pool order.
+        """
+        from isaacsim.core.prims import RigidPrim
+
+        self.cfg = cfg
+        self.prim_paths = list(prim_paths)
+        self.num_projectiles = len(self.prim_paths)
+        #: Which cube the next throw uses. Round-robin over the pool.
+        self._next_idx = 0
+        #: Sim time each cube was last thrown at; -inf means "parked".
+        self._throw_time = np.full(self.num_projectiles, -np.inf, dtype=np.float64)
+        # An explicit path list, not a regex, for the reason SceneObjects
+        # gives: regex views order by string match, so "Projectile_10" would
+        # sort before "Projectile_2" and stop agreeing with pool order.
+        self.view = RigidPrim(prim_paths_expr=self.prim_paths, name="projectiles")
+
+    def initialize(self) -> None:
+        """Create the physics view. Call after ``world.reset()``."""
+        self.view.initialize()
+        self.hide_all()
+        log.info(
+            f"Projectiles initialized: {self.num_projectiles} cube(s) "
+            f"({', '.join(self.prim_paths)})"
+        )
+
+    def throw(self, robot_pos, robot_lin_vel, now: float) -> None:
+        """Launch the next cube at the robot.
+
+        **Call only from outside the physics step** -- writing a body's pose
+        mid-step is undefined, the same rule
+        :meth:`TrackerPolicy.reset_episode` states for the articulation.
+        :meth:`TrackerRuntime.request_throw` is the safe entry point.
+
+        Follows the ProtoMotions/ASE recipe exactly:
+
+        1. spawn at a random bearing and distance around the robot, at a height
+           relative to its root;
+        2. aim at the root, with Gaussian noise on all three direction
+           components so a throw is not a guaranteed hit;
+        3. lead the target by adding the robot's horizontal velocity, so a
+           walking robot is not trivially missed.
+
+        Args:
+            robot_pos: ``[3]`` world position of the robot root.
+            robot_lin_vel: ``[3]`` world linear velocity of the robot root.
+                Only the XY components are used.
+            now: Current sim time, seconds -- see :func:`_world_time`.
+        """
+        cfg = self.cfg
+        if self.num_projectiles == 0:
+            return
+        index = self._next_idx
+        robot_pos = np.asarray(robot_pos, dtype=np.float32).reshape(3)
+
+        angle = np.random.rand() * 2.0 * math.pi
+        dist_min, dist_max = cfg.spawn_distance_range
+        distance = np.random.rand() * (dist_max - dist_min) + dist_min
+        h_min, h_max = cfg.spawn_height_range
+        height_offset = np.random.rand() * (h_max - h_min) + h_min
+
+        spawn_pos = robot_pos.copy()
+        spawn_pos[0] += math.cos(angle) * distance
+        spawn_pos[1] += math.sin(angle) * distance
+        spawn_pos[2] = robot_pos[2] + height_offset
+
+        launch_dir = robot_pos - spawn_pos
+        launch_dir = launch_dir + cfg.direction_noise_std * np.random.randn(3).astype(
+            np.float32
+        )
+        launch_dir = launch_dir / (np.linalg.norm(launch_dir) + 1e-8)
+        speed_min, speed_max = cfg.speed_range
+        speed = np.random.rand() * (speed_max - speed_min) + speed_min
+        velocity = (launch_dir * speed).astype(np.float32)
+
+        # Lead the target with the robot's horizontal velocity.
+        velocity[0:2] += np.asarray(robot_lin_vel, dtype=np.float32).reshape(3)[0:2]
+
+        indices = TrackerPolicy._for_view(
+            self.view, np.array([index], dtype=np.int32), "int32"
+        )
+        # set_world_poses speaks wxyz. The launch orientation is identity, but
+        # spell it in wxyz anyway so the convention is visible at the boundary,
+        # as SceneObjects.reset does.
+        quat_wxyz = np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+        self.view.set_world_poses(
+            positions=TrackerPolicy._for_view(
+                self.view, spawn_pos.reshape(1, 3).astype(np.float32)
+            ),
+            orientations=TrackerPolicy._for_view(self.view, quat_wxyz),
+            indices=indices,
+        )
+        # [1, 6]: linear then angular, launched without spin.
+        velocities = np.zeros((1, 6), dtype=np.float32)
+        velocities[0, 0:3] = velocity
+        self.view.set_velocities(
+            TrackerPolicy._for_view(self.view, velocities), indices=indices
+        )
+
+        self._throw_time[index] = now
+        self._next_idx = (index + 1) % self.num_projectiles
+        log.info(
+            f"Projectile {index} thrown from {np.round(spawn_pos, 2).tolist()} "
+            f"at {np.linalg.norm(velocity):.1f} m/s"
+        )
+
+    def update(self, now: float) -> None:
+        """Park every cube whose ``hide_delay`` has run out.
+
+        Cheap enough to call every step: it does no physics write at all until
+        a cube actually expires.
+
+        Args:
+            now: Current sim time, seconds.
+        """
+        if self.num_projectiles == 0:
+            return
+        expired = np.nonzero(
+            np.isfinite(self._throw_time)
+            & (now - self._throw_time > self.cfg.hide_delay)
+        )[0]
+        if expired.size == 0:
+            return
+        self._park(expired)
+        self._throw_time[expired] = -np.inf
+
+    def hide_all(self) -> None:
+        """Park every cube. Used on initialize and on every clip restart."""
+        if self.num_projectiles == 0:
+            return
+        self._park(np.arange(self.num_projectiles))
+        self._throw_time[:] = -np.inf
+
+    def _park(self, indices) -> None:
+        """Move the given cubes to their own slots below the ground.
+
+        Each cube gets a **distinct** parked position ``(i, i, hide_z - i *
+        hide_spacing)`` rather than a shared one. ProtoMotions documents why
+        (``_hide_projectiles_for_envs``, issue #210): colocating hidden
+        projectile bodies at a single world point triggers a PhysX broadphase
+        aliasing bug that stamps the parked pose onto unrelated scene-object
+        bodies on a later step. Spreading them costs nothing and the scene
+        objects here are exactly what would be corrupted.
+
+        Args:
+            indices: Pool indices to park.
+        """
+        indices = np.asarray(indices, dtype=np.int32)
+        positions = np.stack(
+            [
+                indices.astype(np.float32),
+                indices.astype(np.float32),
+                np.array(
+                    [self.cfg.hidden_z_for_index(int(i)) for i in indices],
+                    dtype=np.float32,
+                ),
+            ],
+            axis=-1,
+        )
+        quats = np.zeros((indices.size, 4), dtype=np.float32)
+        quats[:, 0] = 1.0  # identity, wxyz
+        view_indices = TrackerPolicy._for_view(self.view, indices, "int32")
+        self.view.set_world_poses(
+            positions=TrackerPolicy._for_view(self.view, positions),
+            orientations=TrackerPolicy._for_view(self.view, quats),
+            indices=view_indices,
+        )
+        self.view.set_velocities(
+            TrackerPolicy._for_view(
+                self.view, np.zeros((indices.size, 6), dtype=np.float32)
+            ),
+            indices=view_indices,
+        )
+
+
 def setup_lighting() -> None:
     """Add a key light and a fill dome light to /World."""
     create_prim(
@@ -4504,6 +4889,13 @@ class TrackerRuntimeConfig:
     scene_index: int | None = None
     scene_object_z_offset: float = 0.0
 
+    # -- projectiles ---------------------------------------------------------
+    #: Cube-projectile pool, or ``None`` to spawn none. Throwing is triggered by
+    #: the host: the CLI binds it to J, an extension calls
+    #: :meth:`TrackerSession.throw`. There is deliberately no key field here --
+    #: input is a decision of the host application, like ``--headless``.
+    projectiles: ProjectileConfig | None = None
+
     # -- world / physics -----------------------------------------------------
     #: PhysX device, e.g. "cuda:0". None runs PhysX on the CPU, a *different
     #: solver* from the GPU pipeline training uses -- see the --device help text.
@@ -4564,12 +4956,22 @@ class TrackerRuntime:
     """
 
     def __init__(
-        self, *, cfg, world, policy, scene_objects, robot_props, physics_dt, control_dt
+        self,
+        *,
+        cfg,
+        world,
+        policy,
+        scene_objects,
+        robot_props,
+        physics_dt,
+        control_dt,
+        projectiles=None,
     ):
         self.cfg = cfg
         self.world = world
         self.policy = policy
         self.scene_objects = scene_objects
+        self.projectiles = projectiles
         self.robot_props = robot_props
         self.physics_dt = physics_dt
         self.control_dt = control_dt
@@ -4581,6 +4983,7 @@ class TrackerRuntime:
         self._substep_idx = 0
         self._callback_added = False
         self._initialized = False
+        self._pending_throw = False
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -4595,6 +4998,8 @@ class TrackerRuntime:
         _configure_physics_scene(self.world, self.robot_props)
         self.policy.initialize()
         self.policy.post_reset()
+        if self.projectiles is not None:
+            self.projectiles.initialize()
         self._initialized = True
 
     def add_physics_callback(self) -> None:
@@ -4628,6 +5033,8 @@ class TrackerRuntime:
                 log.debug(f"teardown: could not deregister {name!r}: {e}")
         self.policy = None
         self.scene_objects = None
+        self.projectiles = None
+        self._pending_throw = False
         self._initialized = False
 
     # -- stepping (CLI path; Kit's timeline replaces this) -------------------
@@ -4656,8 +5063,48 @@ class TrackerRuntime:
                 _render(self.world)
         step_s = time.perf_counter() - t0
         self.total_sim_ms += step_s * 1000.0
-        self.drain_pending_reset()
+        self.drain_deferred()
         return step_s
+
+    def request_throw(self) -> None:
+        """Ask for a projectile on the next safe boundary.
+
+        The one call a trigger needs: the CLI's J-key handler and
+        :meth:`TrackerSession.throw` both land here. A no-op when the run has no
+        projectile pool, so a host can bind a key unconditionally.
+
+        Only sets a flag. Launching writes a rigid body's pose and velocity,
+        which is undefined from inside a physics step, and a Kit input callback
+        gives no guarantee about where in the frame it fires -- so the write
+        itself is deferred to :meth:`drain_deferred`, exactly as
+        :attr:`TrackerPolicy._pending_reset` defers a clip restart.
+        """
+        if self.projectiles is None:
+            log.warning("request_throw(): this run has no projectiles; ignoring.")
+            return
+        self._pending_throw = True
+
+    def drain_deferred(self) -> None:
+        """Run everything that had to wait for a gap between physics steps.
+
+        The full between-steps housekeeping pass: a deferred clip restart, a
+        deferred projectile throw, and the projectile expiry timer. Both drivers
+        call this once per iteration -- the CLI from :meth:`step_once`,
+        ``TrackerSession`` from its app-update subscription.
+        """
+        self.drain_pending_reset()
+        if self.projectiles is None:
+            return
+        now = _world_time(self.world)
+        if self._pending_throw:
+            self._pending_throw = False
+            if self.policy is not None:
+                self.projectiles.throw(
+                    robot_pos=_to_numpy(self.policy.robot.get_world_pose()[0]),
+                    robot_lin_vel=_to_numpy(self.policy.robot.get_linear_velocity()),
+                    now=now,
+                )
+        self.projectiles.update(now)
 
     def drain_pending_reset(self) -> None:
         """Run a deferred clip restart, outside the physics callback.
@@ -4894,6 +5341,13 @@ def build_runtime(cfg: TrackerRuntimeConfig, *, world=None) -> TrackerRuntime:
         _build_scene_objects(cfg, scenes_file) if scenes_file is not None else None
     )
 
+    # Projectiles too must be authored before world.reset(). The pool is parked
+    # below the ground until something throws one, so spawning it costs a run
+    # that never presses the key nothing but the bodies themselves.
+    projectiles = None
+    if cfg.projectiles is not None and cfg.projectiles.num_projectiles > 0:
+        projectiles = Projectiles(cfg.projectiles, add_projectiles(cfg.projectiles))
+
     policy = TrackerPolicy(
         meta=meta,
         prim_path=cfg.prim_path,
@@ -4917,6 +5371,7 @@ def build_runtime(cfg: TrackerRuntimeConfig, *, world=None) -> TrackerRuntime:
         control_in_loop=cfg.control_in_loop,
         self_collisions=cfg.self_collisions,
         scene_objects=scene_objects,
+        projectiles=projectiles,
         profile=cfg.profile,
     )
     policy.num_loops = cfg.loops if cfg.loops is not None else 10_000_000
@@ -4932,6 +5387,7 @@ def build_runtime(cfg: TrackerRuntimeConfig, *, world=None) -> TrackerRuntime:
         world=world,
         policy=policy,
         scene_objects=scene_objects,
+        projectiles=projectiles,
         robot_props=robot_props,
         physics_dt=physics_dt,
         control_dt=control_dt,
