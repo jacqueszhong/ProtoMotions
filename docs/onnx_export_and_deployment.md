@@ -305,6 +305,74 @@ pickle is code execution, ~1 GB of dependencies plus a Python interpreter is a
 lot to put on robot compute, and the GIL/allocator/GC give a long latency tail.
 For a fixed-rate control loop the p99.9 is what you design against.
 
+## 7. Running the tracker inside Isaac Sim
+
+`deployment/test_tracker_isaacsim.py` is a *CLI*: it creates its own
+`SimulationApp`, so importing it from an already-running Isaac Sim would create a
+second app, which is invalid. The driver itself therefore lives one layer down,
+in **`deployment/tracker_runtime.py`**, which contains no `argparse`, no
+`SimulationApp`, no `logging.basicConfig` and no stepping loop — and so is
+importable inside a live Kit process.
+
+| Layer | File | Owns |
+|---|---|---|
+| Core | `deployment/tracker_runtime.py` | `TrackerPolicy`, the stage/physics authoring, `TrackerRuntimeConfig` / `TrackerRuntime` / `build_runtime`. Also the deployment-contract reference docstring. |
+| Kit lifecycle | `deployment/tracker_session.py` | `TrackerSession`: timeline, app-update subscription, teardown. Kit-only. |
+| CLI | `deployment/test_tracker_isaacsim.py` | The 40-odd flags, `SimulationApp`, the root logger, the diagnostic modes, the `while` loop. Behaviour unchanged. |
+| Extension | `deployment/exts/protomotions.tracker/` | A shim that puts the repo root on `sys.path` and re-exports the API. |
+
+### From the Isaac Sim GUI
+
+```bash
+~/isaacsim/isaac-sim.sh \
+  --ext-folder ~/dev_nv/ProtoMotions/deployment/exts \
+  --enable protomotions.tracker
+```
+
+Then in **Window → Script Editor**:
+
+```python
+from protomotions_tracker import TrackerSession, TrackerRuntimeConfig
+
+s = TrackerSession(TrackerRuntimeConfig(
+    onnx="results/soma_sit_1/compiled_models/unified_pipeline.onnx",
+    motion="configs/soma_sit_0/soma_sit_motion_seatcontacts.pt",
+    scenes_file="configs/soma_sit_0/soma_sit_chair.pt",
+    resolved_configs="results/soma_sit_1/resolved_configs_inference.pt",
+    robot="soma23", device="cuda:0"))
+s.load()   # builds the stage, adopts World.instance(), starts the sim
+s.play()   # hands physics to Kit's timeline
+print(s.metrics)
+s.close()
+```
+
+The extension is library-API-only — no menu, no window — and enabling it imports
+nothing heavy; torch, onnxruntime and the driver load on first use.
+
+### What does *not* carry over
+
+Inside Kit the **timeline drives physics**, so there is no loop to own: real-time
+comes from `World(physics_dt=…, rendering_dt=control_dt)`. Everything that owns
+its own stepping stays CLI-only — `--control-in-loop`, `--action-tape`,
+`--resync-state`, `--drive-probe`, `--dump-physx-properties`, `--trace-out`,
+`--onnx-inputs-out`, `--profile` — as do the flags that are the host app's
+decision (`--headless`, `--renderer`, `--render-resolution`, `--anti-aliasing`,
+`--no-physics-ui`). Their implementations still live in `tracker_runtime.py`;
+they are simply not wired into `TrackerSession`.
+
+Two constraints worth knowing before you compare numbers. First, the CLI
+defaults to `--control-in-loop`, which scores better (0.0454 rad vs 0.0537 on
+the G1 reference clip) but owns the stepping loop; a `TrackerSession` can only
+run the physics-callback path and rejects `control_in_loop=True` rather than
+silently doing nothing. Second, tracking is only valid at the physics rate the
+policy trained at. If the host app already has a `World` at a different `physics_dt`,
+`build_runtime` raises `TrackerConfigError` instead of silently running at the
+host's rate.
+
+See `deployment/exts/protomotions.tracker/docs/Overview.md` for the extension's
+own README, including why its python module is `protomotions_tracker` and not
+`protomotions.tracker`.
+
 ## See also
 
 - `docs/source/tutorials/workflows/g1_deployment.rst` — end-to-end worked
@@ -313,3 +381,5 @@ For a fixed-rate control loop the p99.9 is what you design against.
   and why the exporter needs it.
 - `protomotions/envs/action/action_functions.py` — the contract an action
   function must satisfy to be exportable.
+- `deployment/tracker_runtime.py` — the Isaac Sim driver's module docstring is
+  the fullest write-up of the PhysX-side deployment contract.
