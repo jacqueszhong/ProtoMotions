@@ -1,5 +1,5 @@
 [package]
-version = "0.1.0"
+version = "0.2.0"
 title = "ProtoMotions Tracker Driver"
 description = "Run a ProtoMotions ONNX tracker policy inside any Isaac Sim 6 app."
 authors = ["The ProtoMotions Developers"]

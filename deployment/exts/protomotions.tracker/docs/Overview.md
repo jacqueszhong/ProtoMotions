@@ -42,6 +42,43 @@ live counters and the worst tracking error; `s.summary()` logs the end-of-run
 stats; `s.close()` detaches everything so you can load another run in the same
 session.
 
+## Throwing things at the robot
+
+`ProtoMotions`' simulator binds **J** to throwing a cube at the humanoid, for
+eyeballing how well a policy takes a hit. The same thing works here on an
+exported ONNX policy -- configure a pool, then call `throw()`:
+
+```python
+from protomotions_tracker import TrackerSession, TrackerRuntimeConfig
+from deployment.tracker_runtime import ProjectileConfig
+
+s = TrackerSession(TrackerRuntimeConfig(
+    onnx=..., motion=..., robot="g1", device="cuda:0",
+    projectiles=ProjectileConfig(num_projectiles=4),
+))
+s.load(); s.play()
+s.throw()   # cube launches on the next app update
+```
+
+Cubes appear at a random bearing 4-5 m out, aimed at the robot's root with a
+little noise and led by its horizontal velocity, and are parked below the floor
+`hide_delay` seconds later. The pool is reused round-robin, so `num_projectiles`
+is how many can be airborne at once; cube size grows with pool index, giving a
+light-to-heavy set off one call. `ProjectileConfig` mirrors ProtoMotions'
+`ProjectileConfig` field for field -- read its docstring for the knobs, and for
+why `speed_range` is the one default that deliberately differs.
+
+**No key is bound for you.** This extension installs no input handling, so bind
+`session.throw()` to whatever your app already uses. The CLI, which owns its
+app, does bind **J**:
+
+```bash
+~/isaacsim/python.sh deployment/test_tracker_isaacsim.py \
+    --robot g1 --onnx <export>/unified_pipeline.onnx \
+    --motion data/motion_for_trackers/g1_bones_seed_mini.pt \
+    --projectiles 4
+```
+
 `TrackerRuntimeConfig` is a plain dataclass -- read its field comments in
 `deployment/tracker_runtime.py` for what each knob does. Flags that are the
 *host app's* decision (headless, renderer, resolution, anti-aliasing) have no

@@ -31,6 +31,10 @@ What stays here, and only here:
   extension the host app has already made;
 - ``logging.basicConfig(force=True)``, which reconfigures the *root* logger and
   so must never run inside Kit;
+- keyboard input (**J** throws a projectile), for the same reason: this script
+  owns its app, whereas an extension is a guest in someone else's and must not
+  grab their keys. The projectiles themselves live in ``tracker_runtime``; only
+  the binding is here;
 - the diagnostic modes that own their own stepping: ``--control-in-loop``,
   ``--action-tape``, ``--resync-state``, ``--drive-probe``,
   ``--dump-physx-properties``, ``--trace-out``, ``--onnx-inputs-out``,
@@ -158,6 +162,76 @@ def _parse_args() -> argparse.Namespace:
             "so like ProtoMotions' env.config.ref_object_respawn_offset it lifts "
             "only objects that carry a motion trajectory. Defaults to 0.0, "
             "matching this driver's flush-spawn stance for the robot."
+        ),
+    )
+    p.add_argument(
+        "--projectiles",
+        dest="num_projectiles",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Spawn a pool of N cube projectiles and bind the J key to throw one "
+            "at "
+            "the robot -- the deployment-side equivalent of the simulator's "
+            "J-key perturbation (protomotions/simulator/base_simulator/"
+            "simulator.py:_throw_projectile), for eyeballing how well an "
+            "exported policy takes a hit. Cubes appear at a random bearing 4-5 "
+            "m out, aimed at the robot's root with noise, and are parked below "
+            "the floor 2 s later; the pool is reused round-robin, so N is how "
+            "many can be airborne at once. Cube size grows with pool index "
+            "(--projectile-size), so a pool of 4 gives you a light-to-heavy "
+            "set on one key. Default 0 spawns nothing at all. Needs a viewport "
+            "-- see --headless."
+        ),
+    )
+    p.add_argument(
+        "--projectile-speed",
+        type=float,
+        nargs=2,
+        default=(7.5, 10.0),
+        metavar=("MIN", "MAX"),
+        help=(
+            "Launch speed range in m/s. Note this defaults to a *quarter* of "
+            "ProtoMotions' 30-40 (ASE's range): nothing here enables CCD -- "
+            "IsaacLab does not either -- and at 40 m/s with a 1/200 s physics "
+            "step a cube advances ~0.2 m per step, wider than a G1's forearm, "
+            "so it often passes clean through without ever generating a "
+            "contact. Slower cubes actually land. Pass '30 40' for parity with "
+            "what training threw."
+        ),
+    )
+    p.add_argument(
+        "--projectile-size",
+        type=float,
+        nargs=2,
+        default=(0.05, 0.15),
+        metavar=("MIN", "MAX"),
+        help=(
+            "Cube half-extent range in metres, interpolated across the pool: "
+            "index 0 gets MIN, the last gets MAX. With --projectile-density "
+            "fixed, mass goes as the cube of this, so the largest cube of the "
+            "default pool hits 27x harder than the smallest."
+        ),
+    )
+    p.add_argument(
+        "--projectile-density",
+        type=float,
+        default=500.0,
+        help=(
+            "Cube density in kg/m^3, matching ProtoMotions' default. Mass is "
+            "derived from it rather than set directly, exactly as IsaacLab "
+            "spawns its projectiles."
+        ),
+    )
+    p.add_argument(
+        "--projectile-hide-delay",
+        type=float,
+        default=2.0,
+        help=(
+            "Seconds a cube stays in the world before being parked below the "
+            "floor. Raise it to leave cubes lying around the scene; lower it to "
+            "keep the ground clear between throws."
         ),
     )
     p.add_argument(
@@ -576,6 +650,7 @@ if not args.headless and not args.no_physics_ui:
 # Safe now that the app is up: tracker_runtime imports isaacsim.* and pxr at
 # module scope.
 from deployment.tracker_runtime import (  # noqa: E402
+    ProjectileConfig,
     TrackerConfigError,
     TrackerRuntimeConfig,
     build_runtime,
@@ -614,6 +689,30 @@ def _validate_flags(parsed) -> None:
                 "root and joint state, which is undefined from inside a physics "
                 "callback (see TrackerPolicy.reset_episode)."
             )
+    if parsed.num_projectiles > 0:
+        if parsed.headless:
+            log.warning(
+                "--projectiles with --headless: throwing is bound to J, and a "
+                "headless run has no window to press it in, so the cubes will "
+                "spawn and never move. Drop --headless, or drive "
+                "runtime.request_throw() yourself."
+            )
+        measuring = [
+            name
+            for name, active in (
+                ("--action-tape", parsed.action_tape is not None),
+                ("--resync-state", parsed.resync_state),
+                ("--trace-out", bool(parsed.trace_out)),
+            )
+            if active
+        ]
+        if measuring:
+            log.warning(
+                f"--projectiles with {', '.join(measuring)}: a thrown cube "
+                "perturbs the robot, and nothing IsaacLab recorded threw one. "
+                "Every step after the first hit is measuring the impact, not "
+                "the policy. Valid as a demo; not a parity measurement."
+            )
     if parsed.scenes_file and parsed.action_tape is not None:
         log.warning(
             "--action-tape with --scenes-file: the replay drives the robot "
@@ -641,7 +740,63 @@ def _runtime_config(parsed) -> TrackerRuntimeConfig:
     # runs inside someone else's stage and does neither by default.
     cfg.setup_lighting = not parsed.headless
     cfg.move_camera = not parsed.headless
+    # Assembled by hand rather than mapped by name: the flags are flat scalars
+    # and the field is a dataclass. Left None when the pool is empty, so a run
+    # without --projectiles never authors a projectile prim.
+    if parsed.num_projectiles > 0:
+        cfg.projectiles = ProjectileConfig(
+            num_projectiles=parsed.num_projectiles,
+            cube_half_size_range=tuple(parsed.projectile_size),
+            density=parsed.projectile_density,
+            speed_range=tuple(parsed.projectile_speed),
+            hide_delay=parsed.projectile_hide_delay,
+        )
     return cfg
+
+
+def _subscribe_throw_key(runtime):
+    """Bind **J** to throwing a projectile. Returns a zero-arg unsubscribe.
+
+    ``carb.input`` only imports once ``SimulationApp`` exists, hence the
+    function-local import -- the same reason ``enable_extension`` is imported
+    where it is used above.
+
+    ``KEY_PRESS`` is already the leading edge (auto-repeat arrives separately as
+    ``KEY_REPEAT``), so unlike ProtoMotions' IsaacLab keyboard path -- which has
+    to synthesise releases to stop a one-shot binding sticking -- no debounce is
+    needed here.
+
+    A closure is returned rather than the subscription itself because
+    ``subscribe_to_keyboard_events`` hands back a bare integer handle, not an
+    object with an ``unsubscribe()``: releasing it needs the keyboard and the
+    interface too, so bundle all three here rather than at the call site.
+    """
+    import carb.input  # noqa: E402
+    import omni.appwindow  # noqa: E402
+
+    input_iface = carb.input.acquire_input_interface()
+    keyboard = omni.appwindow.get_default_app_window().get_keyboard()
+
+    def _on_key(event, *args, **kwargs):
+        if (
+            event.type == carb.input.KeyboardEventType.KEY_PRESS
+            and event.input == carb.input.KeyboardInput.J
+        ):
+            runtime.request_throw()
+        return True
+
+    handle = input_iface.subscribe_to_keyboard_events(keyboard, _on_key)
+    log.info("Press J to throw a projectile at the robot.")
+
+    def _unsubscribe():
+        input_iface.unsubscribe_to_keyboard_events(keyboard, handle)
+
+    # Pin the callback to the closure the caller holds. Every Isaac Sim example
+    # that does this keeps its callback alive as a bound method on a long-lived
+    # object; here it is a local, and a collected callback is a J key that
+    # silently stops working.
+    _unsubscribe.callback = _on_key
+    return _unsubscribe
 
 
 def main() -> None:
@@ -672,6 +827,11 @@ def main() -> None:
     if not args.control_in_loop:
         runtime.add_physics_callback()
 
+    # Windowed runs only -- there is no keyboard otherwise.
+    unsubscribe_throw_key = None
+    if runtime.projectiles is not None and not args.headless:
+        unsubscribe_throw_key = _subscribe_throw_key(runtime)
+
     # Real-time pacing only makes sense when there is something to watch; a
     # headless run is a measurement, so it always goes as fast as it can.
     realtime = not args.no_realtime and not args.headless
@@ -690,6 +850,8 @@ def main() -> None:
     if args.tape_divergence_out:
         policy.write_divergence(args.tape_divergence_out)
 
+    if unsubscribe_throw_key is not None:
+        unsubscribe_throw_key()
     runtime.teardown()
     simulation_app.close()
 

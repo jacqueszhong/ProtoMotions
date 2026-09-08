@@ -140,6 +140,20 @@ class TrackerSession:
         self.runtime.policy.reset_episode()
         self._done_fired = False
 
+    def throw(self) -> None:
+        """Throw a projectile cube at the robot.
+
+        Needs ``TrackerRuntimeConfig.projectiles`` to have been set; without a
+        pool this warns and does nothing.
+
+        The cube launches on the next app update rather than instantly, so this
+        is safe to call from anywhere -- a UI button, a key binding, the Script
+        Editor. No key is bound for you: this extension deliberately installs no
+        input handling of its own (the CLI, which owns its app, binds J).
+        """
+        self._require_loaded()
+        self.runtime.request_throw()
+
     def close(self) -> None:
         """Stop, unsubscribe and detach the runtime. Safe to call twice."""
         if self._update_sub is not None:
@@ -185,7 +199,7 @@ class TrackerSession:
         """Per-frame housekeeping: the CLI loop body minus the stepping."""
         if self.runtime is None:
             return
-        self.runtime.drain_pending_reset()
+        self.runtime.drain_deferred()
         if self.runtime.done and not self._done_fired:
             self._done_fired = True
             self._timeline.stop()
