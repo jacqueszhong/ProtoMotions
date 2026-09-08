@@ -1,0 +1,37 @@
+[package]
+version = "0.1.0"
+title = "ProtoMotions Tracker Driver"
+description = "Run a ProtoMotions ONNX tracker policy inside any Isaac Sim 6 app."
+authors = ["The ProtoMotions Developers"]
+category = "Simulation"
+keywords = ["protomotions", "tracker", "onnx", "humanoid", "policy"]
+readme = "docs/Overview.md"
+changelog = "docs/CHANGELOG.md"
+# Library API only -- no omni.ui panel, so nothing to preview.
+preview_image = ""
+icon = ""
+
+[dependencies]
+# The driver builds the stage and the articulation through these three. They
+# live in extsDeprecated/ in 6.0 and print migration warnings; porting to
+# isaacsim.core.experimental.* is a separate, larger job.
+"isaacsim.core.api" = {}
+"isaacsim.core.prims" = {}
+"isaacsim.core.utils" = {}
+"omni.physx" = {}
+# torch 2.11+cu128, used lazily for motion/config/terrain loading. Not on the
+# python.sh PYTHONPATH, so it has to come in as a dependency.
+"omni.isaac.ml_archive" = {}
+# pyyaml -- the ONNX deployment contract is a .yaml next to the .onnx.
+"omni.pip.compute" = {}
+
+# NOTE the deliberate name mismatch with the extension id: Kit puts an
+# extension's root dir on sys.path, so a python package named `protomotions`
+# here would shadow the real ProtoMotions package. See docs/Overview.md.
+[[python.module]]
+name = "protomotions_tracker"
+
+[settings]
+# Absolute path to the ProtoMotions repo root. Empty means "derive it from this
+# file's location", which is right whenever the extension sits in-tree.
+exts."protomotions.tracker".repoRoot = ""
