@@ -46,6 +46,7 @@ from protomotions.simulator.base_simulator.config import (
     SimBodyOrdering,
     ActionNoiseDomainRandomizationConfig,
     FrictionDomainRandomizationConfig,
+    BodyMassDomainRandomizationConfig,
     ObjectAssetDomainRandomizationConfig,
     CenterOfMassDomainRandomizationConfig,
     ProjectileConfig,
@@ -134,6 +135,15 @@ class Simulator(RecordingMixin, ABC):
         self.decimation: int = self.config.sim.decimation
         self.dt: float = self.decimation * 1.0 / self.config.sim.fps
 
+        latency_config = (
+            self.config.domain_randomization.latency
+            if self.config.domain_randomization is not None
+            else None
+        )
+        self._max_action_latency_ms = (
+            latency_config.max_latency_ms if latency_config is not None else 0.0
+        )
+
         self._num_bodies: int = self.robot_config.kinematic_info.num_bodies
         self._num_dof: int = self.robot_config.kinematic_info.num_dofs
         self._dof_names: List[str] = self.robot_config.kinematic_info.dof_names
@@ -168,6 +178,12 @@ class Simulator(RecordingMixin, ABC):
             self.robot_config.number_of_actions,
             device=self.device,
             dtype=torch.float,
+        )
+        self._sampled_action_latency_ms = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.float
+        )
+        self._action_latency_elapsed_ms = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.float
         )
         # Steps since last reset per env, for skipping accel clamp on first 2 steps
         self._steps_since_reset = torch.zeros(
@@ -709,6 +725,13 @@ class Simulator(RecordingMixin, ABC):
         if self.config.pd_target_max_accel is not None:
             self._apply_accel_clamp()
 
+        if self._max_action_latency_ms > 0.0:
+            self._sampled_action_latency_ms.uniform_(0.0, self._max_action_latency_ms)
+            # A reset must not blend the first command with action history from
+            # the previous episode.
+            self._sampled_action_latency_ms[self._steps_since_reset == 0] = 0.0
+            self._action_latency_elapsed_ms.zero_()
+
         self._steps_since_reset += 1
         self._physics_step()
 
@@ -746,8 +769,11 @@ class Simulator(RecordingMixin, ABC):
             env_ids = torch.arange(self.num_envs, device=self.device)
         new_states = new_states.convert_to_sim(self.data_conversion)
 
+        self._common_actions[env_ids] = 0.0
         self._previous_actions[env_ids] = 0.0
         self._prev_prev_actions[env_ids] = 0.0
+        self._sampled_action_latency_ms[env_ids] = 0.0
+        self._action_latency_elapsed_ms[env_ids] = 0.0
         self._steps_since_reset[env_ids] = 0
         if new_object_states is not None:
             if self.scene_lib.num_objects_per_scene > 0:
@@ -1291,8 +1317,10 @@ class Simulator(RecordingMixin, ABC):
         All three control modes are co-located here. Child simulators call this method
         from _physics_step() instead of branching on control_type themselves.
         """
+        actions = self._get_actions_for_physics_step()
+
         if self.control_type == ControlType.BUILT_IN_PD:
-            targets = self._common_actions
+            targets = actions
             if (
                 self._domain_randomization is not None
                 and "action_noise" in self._domain_randomization
@@ -1306,7 +1334,7 @@ class Simulator(RecordingMixin, ABC):
             self._apply_simulator_pd_targets(sim_targets)
 
         elif self.control_type == ControlType.PROPORTIONAL:
-            targets = self._common_actions
+            targets = actions
             if (
                 self._domain_randomization is not None
                 and "action_noise" in self._domain_randomization
@@ -1330,7 +1358,7 @@ class Simulator(RecordingMixin, ABC):
             self._apply_simulator_torques(sim_torques)
 
         elif self.control_type == ControlType.TORQUE:
-            torques = self._common_actions
+            torques = actions
 
             if (
                 self._domain_randomization is not None
@@ -1349,6 +1377,40 @@ class Simulator(RecordingMixin, ABC):
 
         else:
             raise NameError(f"Unknown controller type: {self.control_type}")
+
+        self._advance_action_latency()
+
+    def _get_actions_for_physics_step(self) -> torch.Tensor:
+        """Return the fractionally delayed action for one physics substep.
+
+        Hold the previous action until the sampled delay expires.  When the
+        arrival time falls inside this physics substep, use the time-average of
+        the old and new actions over the substep.  This preserves delays shorter
+        than the physics timestep without turning the full delay into a ramp.
+        """
+        if self._max_action_latency_ms == 0.0:
+            return self._common_actions
+
+        substep_ms = 1000.0 / self.config.sim.fps
+        interpolation = (
+            (
+                self._action_latency_elapsed_ms
+                + substep_ms
+                - self._sampled_action_latency_ms
+            )
+            / substep_ms
+        ).clamp_(0.0, 1.0)
+        return torch.lerp(
+            self._previous_actions,
+            self._common_actions,
+            interpolation.unsqueeze(-1),
+        )
+
+    def _advance_action_latency(self) -> None:
+        """Advance the sampled latency by one physics timestep."""
+        if self._max_action_latency_ms == 0.0:
+            return
+        self._action_latency_elapsed_ms.add_(1000.0 / self.config.sim.fps)
 
     def _process_control_properties(self) -> None:
         """
@@ -1417,6 +1479,12 @@ class Simulator(RecordingMixin, ABC):
             domain_randomization_dict["friction"] = (
                 self._process_friction_domain_randomization(
                     self.config.domain_randomization.friction
+                )
+            )
+        if self.config.domain_randomization.body_mass is not None:
+            domain_randomization_dict["body_mass"] = (
+                self._process_body_mass_domain_randomization(
+                    self.config.domain_randomization.body_mass
                 )
             )
         if self.config.domain_randomization.center_of_mass is not None:
@@ -1519,6 +1587,26 @@ class Simulator(RecordingMixin, ABC):
             "restitution": restitution,
         }
         return friction_dict
+
+    def _process_body_mass_domain_randomization(
+        self, domain_randomization: BodyMassDomainRandomizationConfig
+    ) -> Dict[str, Any]:
+        """Resolve robot body selectors and sample absolute mass buckets."""
+
+        body_indices = get_matching_indices(
+            self.robot_config.kinematic_info.body_names,
+            domain_randomization.body_names,
+            domain_randomization.body_indices,
+        )
+        if not body_indices:
+            raise ValueError("body mass randomization matched no robot bodies.")
+        num_samples = min(self.num_envs, domain_randomization.num_buckets)
+        return {
+            "body_indices": body_indices,
+            "mass": domain_randomization.sample(
+                num_samples, len(body_indices), device=self.device
+            ),
+        }
 
     def _process_center_of_mass_domain_randomization(
         self, domain_randomization: CenterOfMassDomainRandomizationConfig

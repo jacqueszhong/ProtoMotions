@@ -12,6 +12,7 @@ outside of the full ProtoMotions training framework:
         obs_assembly.py  -- build_onnx_inputs / ActionHistory
         scene_utils.py   -- resolved-config + SceneLib loading for scene tasks
         physx_probe.py   -- PhysX property/contact introspection helpers
+        export_tracker_onnx.py -- ONNX export for standard tracker policies
         export_bm_tracker_onnx.py -- ONNX export for BeyondMimic tracker policies
         test_tracker_mujoco.py -- standalone MuJoCo inference loop
 
@@ -38,9 +39,11 @@ Typical workflow
 ----------------
 1. Export the ONNX model once::
 
-    python deployment/export_bm_tracker_onnx.py \\
+    python deployment/export_tracker_onnx.py \\
         --checkpoint results/my_exp/last.ckpt \\
         --output deployment/models/
+
+   Use ``export_bm_tracker_onnx.py`` instead for BeyondMimic checkpoints.
 
 2. Test with MuJoCo (first run also caches the motion at 50fps)::
 

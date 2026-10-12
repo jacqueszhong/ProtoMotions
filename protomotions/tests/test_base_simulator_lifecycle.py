@@ -11,9 +11,11 @@ import torch
 from protomotions.robot_configs.base import ControlType
 from protomotions.simulator.base_simulator.config import (
     ActionNoiseDomainRandomizationConfig,
+    BodyMassDomainRandomizationConfig,
     CenterOfMassDomainRandomizationConfig,
     DomainRandomizationConfig,
     FrictionDomainRandomizationConfig,
+    LatencyDomainRandomizationConfig,
     MarkerState,
     ProjectileConfig,
     PushDomainRandomizationConfig,
@@ -402,6 +404,7 @@ def test_simulator_reset_and_park_env_paths_with_and_without_objects():
     assert state_arg.state_conversion is StateConversion.SIMULATOR
     assert object_arg.state_conversion is StateConversion.SIMULATOR
     assert torch.equal(ids_arg, env_ids)
+    assert torch.equal(sim._common_actions[env_ids], torch.zeros(1, 2))
     assert torch.equal(sim._previous_actions[env_ids], torch.zeros(1, 2))
 
     sim.park_envs(torch.tensor([], dtype=torch.long))
@@ -472,6 +475,137 @@ def test_simulator_control_modes_and_domain_randomization_helpers():
     original_actions = no_due._common_actions.clone()
     no_due._apply_accel_clamp()
     assert torch.equal(no_due._common_actions, original_actions)
+
+
+def test_action_latency_holds_then_blends_at_fractional_boundary():
+    assert _sim()._max_action_latency_ms == 0.0
+    simulator = _sim(
+        sim=SimParams(fps=200, decimation=4),
+        domain_randomization=DomainRandomizationConfig(
+            latency=LatencyDomainRandomizationConfig(max_latency_ms=20.0),
+        ),
+    )
+    assert simulator._max_action_latency_ms == 20.0
+    simulator._common_actions.fill_(1.0)
+    simulator._previous_actions.zero_()
+
+    # Across a complete control interval, the integrated new-action fraction
+    # must equal the interval remaining after the sampled pure delay.
+    simulator._sampled_action_latency_ms[:] = torch.tensor([1.0, 7.5])
+    simulator._action_latency_elapsed_ms.zero_()
+    applied_fractions = []
+    for _ in range(simulator.config.sim.decimation):
+        applied_fractions.append(simulator._get_actions_for_physics_step()[:, 0])
+        simulator._advance_action_latency()
+    substep_ms = 1000.0 / simulator.config.sim.fps
+    assert torch.allclose(
+        torch.stack(applied_fractions).sum(dim=0),
+        (simulator.dt * 1000.0 - simulator._sampled_action_latency_ms) / substep_ms,
+    )
+
+    # Sub-substep delays remain distinct. With a 5 ms physics substep, the
+    # boundary blend is the fraction of that substep after the action arrives.
+    simulator._sampled_action_latency_ms[:] = torch.tensor([1.0, 2.5])
+    simulator._action_latency_elapsed_ms.zero_()
+    assert torch.allclose(
+        simulator._get_actions_for_physics_step(),
+        torch.tensor([[0.8, 0.8], [0.5, 0.5]]),
+    )
+
+    # A delay on a substep boundary holds the old action for the whole first
+    # substep. A boundary inside the second substep blends only that substep.
+    simulator._sampled_action_latency_ms[:] = torch.tensor([5.0, 7.5])
+    simulator._action_latency_elapsed_ms.zero_()
+    assert torch.equal(
+        simulator._get_actions_for_physics_step(), torch.zeros(2, 2)
+    )
+    simulator._advance_action_latency()
+    assert torch.allclose(
+        simulator._get_actions_for_physics_step(),
+        torch.tensor([[1.0, 1.0], [0.5, 0.5]]),
+    )
+
+    # Zero delay is exactly current, while a full control-interval delay holds
+    # the previous action for all four substeps and switches at 20 ms.
+    simulator._sampled_action_latency_ms[:] = torch.tensor([0.0, 20.0])
+    simulator._action_latency_elapsed_ms.zero_()
+    assert torch.equal(
+        simulator._get_actions_for_physics_step(),
+        torch.tensor([[1.0, 1.0], [0.0, 0.0]]),
+    )
+    for _ in range(3):
+        simulator._advance_action_latency()
+        assert torch.equal(
+            simulator._get_actions_for_physics_step(),
+            torch.tensor([[1.0, 1.0], [0.0, 0.0]]),
+        )
+    simulator._advance_action_latency()
+    assert torch.equal(
+        simulator._get_actions_for_physics_step(), torch.ones(2, 2)
+    )
+
+    with pytest.raises(ValueError, match="one control interval"):
+        _sim(
+            sim=SimParams(fps=200, decimation=4),
+            domain_randomization=DomainRandomizationConfig(
+                latency=LatencyDomainRandomizationConfig(max_latency_ms=20.1),
+            ),
+        )
+    substep_latency = _sim(
+        sim=SimParams(fps=200, decimation=4),
+        domain_randomization=DomainRandomizationConfig(
+            latency=LatencyDomainRandomizationConfig(max_latency_ms=1.0),
+        ),
+    )
+    assert substep_latency._max_action_latency_ms == 1.0
+
+
+def test_action_latency_does_not_leak_action_history_across_reset():
+    simulator = _sim(
+        sim=SimParams(fps=200, decimation=4),
+        domain_randomization=DomainRandomizationConfig(
+            latency=LatencyDomainRandomizationConfig(max_latency_ms=5.0),
+        ),
+    )
+    simulator._initialize_with_markers(None)
+    simulator._common_actions.fill_(9.0)
+    simulator._previous_actions.fill_(8.0)
+    simulator._prev_prev_actions.fill_(7.0)
+
+    env_ids = torch.tensor([0])
+    reset_state = ResetState(
+        root_pos=torch.ones(1, 3),
+        root_rot=_identity_quat(1),
+        root_vel=torch.zeros(1, 3),
+        root_ang_vel=torch.zeros(1, 3),
+        dof_pos=torch.ones(1, 2),
+        dof_vel=torch.zeros(1, 2),
+        state_conversion=StateConversion.COMMON,
+    )
+    simulator.reset_envs(reset_state, env_ids=env_ids)
+
+    assert torch.equal(simulator._common_actions[env_ids], torch.zeros(1, 2))
+    assert torch.equal(simulator._previous_actions[env_ids], torch.zeros(1, 2))
+    assert torch.equal(simulator._prev_prev_actions[env_ids], torch.zeros(1, 2))
+
+    new_actions = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    simulator.step(new_actions)
+
+    # The reset environment bypasses latency for its first command and its
+    # exposed previous action remains the reset value, not the old episode.
+    assert simulator._sampled_action_latency_ms[0] == 0.0
+    assert torch.equal(simulator._previous_actions[0], torch.zeros(2))
+    assert torch.equal(simulator._get_actions_for_physics_step()[0], new_actions[0])
+
+
+def test_base_simulator_prepares_body_mass_randomization_for_backends():
+    simulator = _sim(
+        domain_randomization=DomainRandomizationConfig(
+            body_mass=BodyMassDomainRandomizationConfig(body_indices=[0]),
+        ),
+    )
+
+    assert "body_mass" in simulator._domain_randomization
 
 
 def test_simulator_joint_limit_mismatch_raises():

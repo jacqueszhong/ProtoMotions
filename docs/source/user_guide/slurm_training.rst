@@ -26,44 +26,62 @@ The script is a **template** designed to be customized for your specific cluster
 Configuring for Your Cluster
 ----------------------------
 
-Before using SLURM training, edit the configuration section at the top of 
-``protomotions/train_slurm.py``:
+Describe your cluster in a **site YAML** rather than editing ``train_slurm.py``.
+The launcher looks for one at ``--site-config PATH``, then
+``$PROTOMOTIONS_SLURM_SITE``, then ``slurm_site.yaml`` in the repository root:
 
-.. code-block:: python
+.. code-block:: yaml
 
-   # =============================================================================
-   # CLUSTER CONFIGURATION - EDIT THIS SECTION FOR YOUR CLUSTER
-   # =============================================================================
+   login_node: login.mycluster.edu
+   base_dir: /scratch/{account}/experiments   # {account} is filled from --account
+   account: my_allocation
+   partition: gpu
+   container_mounts: /scratch:/scratch:rw
+   container_images:
+     isaacgym: /containers/isaacgym.sqsh
+     isaaclab: /containers/isaaclab.sqsh
+     newton: /containers/newton.sqsh
+   python_executables:
+     isaacgym: python
+     isaaclab: /workspace/isaaclab/isaaclab.sh -p
+     newton: python
 
-   # Login node hostname (e.g., "login.mycluster.edu")
-   CLUSTER_LOGIN_NODE = "YOUR_CLUSTER_LOGIN_NODE"
+Check what resolved before submitting anything:
 
-   # Base directory for experiments on the cluster filesystem
-   CLUSTER_BASE_DIR = "/path/to/your/experiments/directory"
+.. code-block:: bash
 
-   # Container images (Singularity .sif or Enroot .sqsh format)
-   CONTAINER_IMAGES = {
-       "isaacgym": "/path/to/containers/isaacgym.sqsh",
-       "isaaclab": "/path/to/containers/isaaclab.sqsh",
-       "newton": "/path/to/containers/newton.sqsh",
-   }
+   python protomotions/train_slurm.py --print-site
 
-   # Default SLURM account (your allocation/project)
-   DEFAULT_SLURM_ACCOUNT = "your_account"
+Submitting with an unfilled placeholder is refused, naming each unset setting,
+before any code is synced.
 
-   # Default SLURM partitions
-   DEFAULT_SLURM_PARTITION = "gpu"
+Choosing Between Multiple Clusters
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-   # Filesystem mounts for container
-   CONTAINER_MOUNTS = "/scratch:/scratch:rw"
+If the same allocation runs on more than one cluster, list them under
+``clusters:`` and select one with ``--cluster NAME``. Keys at the top level are
+shared by every cluster -- keep ``account`` there, since the allocation is the
+axis that does *not* change when you switch cluster -- and each cluster overrides
+only what differs (its login node, partition, container images):
 
-**Key settings to configure:**
+.. code-block:: yaml
 
-* ``CLUSTER_LOGIN_NODE``: SSH hostname for your cluster's login node
-* ``CLUSTER_BASE_DIR``: Directory where experiment code will be synced
-* ``CONTAINER_IMAGES``: Paths to your container images (Singularity/Enroot)
-* ``DEFAULT_SLURM_ACCOUNT``: Your SLURM allocation or project name
-* ``CONTAINER_MOUNTS``: Filesystem paths to mount inside the container
+   account: my_allocation          # shared: same on every cluster
+   base_dir: /scratch/{account}/experiments
+   container_mounts: /scratch:/scratch:rw
+   default_cluster: a100           # used when --cluster is omitted
+   clusters:
+     a100:
+       login_node: a100-login.mycluster.edu
+       partition: gpu
+       container_images: {isaaclab: /containers/isaaclab.sqsh}
+     l40:
+       login_node: l40-login.mycluster.edu
+       partition: batch
+       container_images: {isaaclab: /containers/isaaclab.sqsh}
+
+Then ``--cluster l40`` submits the same job to the L40 cluster with the same
+account. ``--print-site --cluster l40`` shows exactly what that resolves to.
 
 Container Setup
 ~~~~~~~~~~~~~~~
@@ -144,7 +162,7 @@ Once configured, launch training from your local machine:
        --num-envs=4096 \
        --batch-size=16384 \
        --motion-file=/cluster/path/to/motions.pt \
-       --experiment-path=examples/experiments/mimic/mlp.py \
+       --experiment-path=examples/experiments/mimic/mlp_bm_l2c2.py \
        --experiment-name=g1_motion_tracker \
        --user=myusername \
        --ngpu=4 \
@@ -176,6 +194,8 @@ Once configured, launch training from your local machine:
      - Unique name for this experiment
    * - ``--user``
      - Your cluster username
+   * - ``--cluster``
+     - Which cluster in the site file's ``clusters:`` to submit to (default: ``default_cluster``)
    * - ``--ngpu``
      - GPUs per node
    * - ``--nodes``

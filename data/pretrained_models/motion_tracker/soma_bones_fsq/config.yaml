@@ -1,3 +1,24 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:30ff5e45a4dbb8ebd569a0729a847ee7279eec86146c13eda5f8357e1bc0e7b1
-size 651
+{
+  "robot_name": "soma23",
+  "simulator": "isaaclab",
+  "num_envs": 8192,
+  "batch_size": 16384,
+  "motion_file": "data/motion_for_trackers/soma23_bones_seed_mini.pt",
+  "experiment_path": "examples/experiments/mimic/fsq.py",
+  "experiment_name": "soma23_fsq_tracker",
+  "scenes_file": null,
+  "checkpoint": null,
+  "use_wandb": false,
+  "wandb_project": "physical_animation",
+  "use_slurm": false,
+  "ngpu": 8,
+  "nodes": 3,
+  "headless": true,
+  "seed": 0,
+  "torch_deterministic": false,
+  "training_max_steps": 10000000000000,
+  "training_max_iterations": null,
+  "overrides": [],
+  "create_config_only": true,
+  "wandb_id": null
+}

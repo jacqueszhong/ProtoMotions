@@ -4,7 +4,6 @@
 import pytest
 
 from protomotions.simulator.base_simulator.user_interface import (
-    KeyBindingScope,
     UserInterface,
     KeyBinding,
 )
@@ -87,6 +86,38 @@ def test_user_interface_hold_is_down_but_not_repeated_press():
 
     ui.handle_key_event("L", pressed=False)
     assert not key.down()
+
+
+def test_user_interface_drains_rapid_repeated_presses_one_per_step():
+    ui = UserInterface()
+    key = ui.register_key("Z", owner="target", description="Decrease speed")
+
+    ui.begin_step()
+    for _ in range(3):
+        ui.handle_key_event("Z", pressed=True)
+        ui.handle_key_event("Z", pressed=False)
+
+    # A control consumes one action during each environment step. The other
+    # two clicks remain queued instead of collapsing into one boolean edge.
+    for remaining in (3, 2, 1):
+        assert key.consume()
+        ui.begin_step()
+        assert key.pressed() is (remaining > 1)
+    assert not key.consume()
+
+
+def test_user_interface_discrete_callback_presses_are_not_latched():
+    ui = UserInterface()
+    key = ui.register_key("Z", owner="target", description="Decrease speed")
+
+    ui.begin_step()
+    assert ui.handle_key_press("Z")
+    assert key.consume()
+    ui.begin_step()
+    assert not key.pressed()
+
+    assert ui.handle_key_press("Z")
+    assert key.consume()
 
 
 def test_user_interface_notifies_registration_callbacks_for_existing_and_new_keys():

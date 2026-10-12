@@ -4,6 +4,7 @@
 """MuJoCo CPU-only simulator implementation."""
 
 import atexit
+from contextlib import nullcontext
 import logging
 import os
 import tempfile
@@ -21,6 +22,7 @@ from protomotions.simulator.base_simulator.config import (
     MarkerState,
     ProjectileConfig,
     SimBodyOrdering,
+    VisualizationMarkerConfig,
 )
 from protomotions.simulator.base_simulator.simulator import Simulator
 from protomotions.simulator.base_simulator.simulator_state import (
@@ -31,6 +33,7 @@ from protomotions.simulator.base_simulator.simulator_state import (
     StateConversion,
 )
 from protomotions.simulator.mujoco.config import MujocoSimulatorConfig
+from protomotions.simulator.mujoco.keyboard import MujocoKeyboardWindow
 
 
 def _to_torch_f32(arr: np.ndarray) -> torch.Tensor:
@@ -60,6 +63,14 @@ class MujocoSimulator(Simulator):
         scene_lib,
     ) -> None:
         """Initialize MuJoCo simulator shell."""
+        if (
+            config.domain_randomization is not None
+            and config.domain_randomization.body_mass is not None
+        ):
+            raise NotImplementedError(
+                "MuJoCo does not support body-mass domain randomization."
+            )
+
         assert device.type == "cpu", "MuJoCo simulator only supports CPU device"
         assert config.num_envs == 1, "MuJoCo simulator only supports num_envs=1"
         assert scene_lib.num_scenes() == 0, "MuJoCo simulator does not support scenes"
@@ -77,6 +88,7 @@ class MujocoSimulator(Simulator):
         self.data: Optional[mujoco.MjData] = None
         self.viewer = None
         self._viewer_initialized = False
+        self._keyboard_window = None
 
         # Cached control parameters
         self._kp = None  # [num_dofs] stiffness in common DOF order
@@ -102,6 +114,7 @@ class MujocoSimulator(Simulator):
 
         # Debug counter
         self._step_count = 0
+        self._marker_overflow_warned = False
 
     @staticmethod
     def _load_mjcf_stripped(
@@ -289,6 +302,7 @@ class MujocoSimulator(Simulator):
         log.info("Loading MuJoCo model from: %s", asset_path)
         self.model = self._load_mjcf_stripped(asset_path, self._proj_config)
         self.data = mujoco.MjData(self.model)
+        self._set_robot_geom_friction()
 
         # Set timestep
         self.model.opt.timestep = 1.0 / self.config.sim.fps
@@ -359,6 +373,12 @@ class MujocoSimulator(Simulator):
             self._proj_qpos_start,
             self._proj_qvel_start,
         )
+
+    def _set_robot_geom_friction(self) -> None:
+        """Set sliding friction on character geoms without changing the floor."""
+        robot_body_ids = {self.model.body(name).id for name in self._body_names}
+        geom_ids = np.flatnonzero(np.isin(self.model.geom_bodyid, list(robot_body_ids)))
+        self.model.geom_friction[geom_ids, 0] = self.config.default_robot_friction
 
     def _zero_passive_forces(self) -> None:
         """Zero out passive stiffness/damping from MJCF.
@@ -596,9 +616,15 @@ class MujocoSimulator(Simulator):
             self.data,
             show_left_ui=False,
             show_right_ui=False,
-            key_callback=self._mujoco_key_callback,
+            key_callback=(
+                None
+                if self.config.use_separate_keyboard_window
+                else self._mujoco_key_callback
+            ),
         )
         self._viewer_initialized = True
+        if self.config.use_separate_keyboard_window:
+            self._keyboard_window = MujocoKeyboardWindow()
         # Ensure viewer is closed on exit to prevent hangs
         atexit.register(self._close_viewer)
 
@@ -609,10 +635,84 @@ class MujocoSimulator(Simulator):
         self.viewer.cam.trackbodyid = 1  # Track pelvis (first non-world body)
         self.viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
 
-        log.info("MuJoCo passive viewer launched (tracking body 1)")
+        log.info(
+            "MuJoCo passive viewer launched (tracking body 1); "
+            "separate keyboard window=%s",
+            self.config.use_separate_keyboard_window,
+        )
+
+    @staticmethod
+    def _marker_radius(size: str) -> float:
+        """Map ProtoMotions marker sizes to MuJoCo debug geom radii."""
+        if size == "tiny":
+            return 0.007
+        if size == "small":
+            return 0.01
+        return 0.05
+
+    def _add_mujoco_marker_geom(
+        self,
+        scene: mujoco.MjvScene,
+        marker_type: str,
+        marker_size: str,
+        position: np.ndarray,
+        orientation: np.ndarray,
+        rgba: np.ndarray,
+    ) -> None:
+        """Append one marker debug geom to the MuJoCo viewer scene."""
+        if scene.ngeom >= scene.maxgeom:
+            if not self._marker_overflow_warned:
+                log.warning(
+                    "MuJoCo marker visualizer hit user_scn maxgeom=%d; "
+                    "some markers will be skipped.",
+                    scene.maxgeom,
+                )
+                self._marker_overflow_warned = True
+            return
+
+        geom = scene.geoms[scene.ngeom]
+        radius = self._marker_radius(marker_size)
+        identity_mat = np.eye(3, dtype=np.float64).reshape(-1)
+
+        if marker_type == "sphere":
+            mujoco.mjv_initGeom(
+                geom,
+                mujoco.mjtGeom.mjGEOM_SPHERE,
+                np.array([radius, radius, radius], dtype=np.float64),
+                position,
+                identity_mat,
+                rgba,
+            )
+        elif marker_type == "arrow":
+            direction = np.empty(3, dtype=np.float64)
+            mujoco.mju_rotVecQuat(
+                direction, np.array([1.0, 0.0, 0.0], dtype=np.float64), orientation
+            )
+            mujoco.mjv_initGeom(
+                geom,
+                mujoco.mjtGeom.mjGEOM_ARROW,
+                np.zeros(3, dtype=np.float64),
+                position,
+                identity_mat,
+                rgba,
+            )
+            mujoco.mjv_connector(
+                geom,
+                mujoco.mjtGeom.mjGEOM_ARROW,
+                radius,
+                position,
+                position + direction,
+            )
+        else:
+            raise ValueError(f"Marker type {marker_type} not supported")
+
+        scene.ngeom += 1
 
     def _close_viewer(self) -> None:
         """Close the viewer if it's still running."""
+        if self._keyboard_window is not None:
+            self._keyboard_window.close()
+            self._keyboard_window = None
         if self.viewer is not None and self._viewer_initialized:
             try:
                 self.viewer.close()
@@ -700,13 +800,19 @@ class MujocoSimulator(Simulator):
           - Explicit: We recompute PD torques at each substep (1kHz), matching
             RoboJuDo and real hardware PD loops.
 
-        For TORQUE/PROPORTIONAL modes, torques are applied once and held constant.
+        For TORQUE/PROPORTIONAL modes, torques are applied once and held constant
+        without latency randomization; with latency enabled, they are refreshed
+        at each substep to interpolate the action.
         """
         from protomotions.robot_configs.base import ControlType
 
+        self._poll_keyboard_events()
+        latency_enabled = self._max_action_latency_ms > 0.0
+
         # Apply control (base class calls _apply_simulator_pd_targets
         # or _apply_simulator_torques which write to data.ctrl)
-        self._apply_control()
+        if not latency_enabled:
+            self._apply_control()
 
         use_implicit_pd = getattr(self.config, "use_implicit_pd", True)
         use_explicit_substep_pd = (
@@ -717,12 +823,16 @@ class MujocoSimulator(Simulator):
         if use_explicit_substep_pd:
             # Explicit PD: recompute torques from current state at each substep
             for _ in range(self.decimation):
+                if latency_enabled:
+                    self._apply_control()
                 self._recompute_explicit_pd()
                 # print("Recomputed explicit PD torques")
                 mujoco.mj_step(self.model, self.data)
         else:
             # Implicit PD (position actuators) or TORQUE/PROPORTIONAL mode
             for _ in range(self.decimation):
+                if latency_enabled:
+                    self._apply_control()
                 mujoco.mj_step(self.model, self.data)
 
         self._step_count += 1
@@ -731,9 +841,12 @@ class MujocoSimulator(Simulator):
         if self._step_count % 100 == 1:
             self._print_state_debug()
 
-        # Sync viewer if active
-        if self.viewer is not None and self._viewer_initialized:
-            self.viewer.sync()
+    def _poll_keyboard_events(self) -> None:
+        """Forward queued application keys before the next physics step."""
+        if self._keyboard_window is None:
+            return
+        for key, pressed in self._keyboard_window.drain_events():
+            self.user_interface.handle_key_event(key, pressed=pressed)
 
     def _print_state_debug(self) -> None:
         """Print state summary for debugging."""
@@ -1046,13 +1159,31 @@ class MujocoSimulator(Simulator):
         """
         if keycode < 0 or keycode > 127:
             return
-        self.user_interface.handle_key_event(chr(keycode), pressed=True)
+        # MuJoCo's callback is a discrete press notification; it does not
+        # deliver a matching release. Record it as an edge so repeated
+        # presses remain independent instead of leaving a key latched.
+        self.user_interface.handle_key_press(chr(keycode))
 
     def _write_viewport_to_file(self, file_name: str) -> None:
-        """Render current view to file."""
+        """Render the live viewer camera to a file.
+
+        ``Renderer.update_scene`` defaults to MuJoCo's free camera when no
+        camera is supplied. Reuse the passive viewer camera so recordings
+        match the view shown on screen.
+        """
         renderer = mujoco.Renderer(self.model, height=480, width=640)
-        renderer.update_scene(self.data)
-        pixels = renderer.render()
+        viewer = self.viewer if self._viewer_initialized else None
+        lock = (
+            viewer.lock()
+            if viewer is not None and hasattr(viewer, "lock")
+            else nullcontext()
+        )
+        with lock:
+            if viewer is not None:
+                renderer.update_scene(self.data, camera=viewer.cam)
+            else:
+                renderer.update_scene(self.data)
+            pixels = renderer.render()
 
         import matplotlib.pyplot as plt
 
@@ -1067,8 +1198,53 @@ class MujocoSimulator(Simulator):
     def _update_simulator_markers(
         self, markers_state: Optional[Dict[str, MarkerState]] = None
     ) -> None:
-        """Update visualization markers (no-op for now)."""
-        pass
+        """Update visualization markers with MuJoCo debug geoms."""
+        if self.headless or self.viewer is None or not self._viewer_initialized:
+            return
+
+        marker_configs: Dict[str, VisualizationMarkerConfig] = (
+            self._visualization_markers or {}
+        )
+        lock = self.viewer.lock() if hasattr(self.viewer, "lock") else nullcontext()
+        with lock:
+            scene = self.viewer.user_scn
+            scene.ngeom = 0
+            if markers_state is None:
+                return
+
+            for marker_name, markers_state_item in markers_state.items():
+                if markers_state_item.translation.numel() == 0:
+                    continue
+                assert marker_name in marker_configs, (
+                    f"Marker {marker_name} passed to update_markers but not defined "
+                    "at instantiation"
+                )
+
+                marker_cfg = marker_configs[marker_name]
+                marker_pos = markers_state_item.translation.view(self.num_envs, -1, 3)
+                marker_quat = markers_state_item.orientation.view(self.num_envs, -1, 4)
+                marker_color = markers_state_item.color or marker_cfg.color
+                marker_rgba = np.array([*marker_color, 1.0], dtype=np.float32)
+                num_markers = min(marker_pos.shape[1], len(marker_cfg.markers))
+
+                for env_id in range(self.num_envs):
+                    for marker_id in range(num_markers):
+                        self._add_mujoco_marker_geom(
+                            scene=scene,
+                            marker_type=marker_cfg.type,
+                            marker_size=marker_cfg.markers[marker_id].size,
+                            position=marker_pos[env_id, marker_id]
+                            .detach()
+                            .cpu()
+                            .numpy()
+                            .astype(np.float64),
+                            orientation=marker_quat[env_id, marker_id]
+                            .detach()
+                            .cpu()
+                            .numpy()
+                            .astype(np.float64),
+                            rgba=marker_rgba,
+                        )
 
     def render(self) -> None:
         """Render current simulation state."""
@@ -1080,5 +1256,6 @@ class MujocoSimulator(Simulator):
             # interactions that switch the camera mode don't lose the robot.
             self.viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
             self.viewer.cam.trackbodyid = 1
+            self.viewer.sync()
 
         super().render()

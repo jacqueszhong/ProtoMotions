@@ -17,7 +17,8 @@ or real hardware due to the "reality gap". Domain randomization addresses this b
 2. **Adding action noise** (motor imprecision)
 3. **Adding observation noise** (sensor noise for IMU, encoders)
 4. **Applying external perturbations** (pushes, velocity impulses)
-5. **Forcing the policy** to be robust to parameter variations
+5. **Randomizing action latency** (holding the previous action for a sampled delay)
+6. **Forcing the policy** to be robust to parameter variations
 
 Training with Domain Randomization
 -----------------------------------
@@ -56,6 +57,28 @@ adjust ranges to suit your robot and deployment conditions.
        action_noise_range=(-0.025, 0.025),  # +/-2.5% noise on PD targets
        dof_names=[".*"],  # Apply to all joints
    )
+
+**Action Latency:**
+
+Action latency samples a delay independently for each environment at every control
+step, uniformly between zero and ``max_latency_ms`` milliseconds. The previous
+action is held until that delay expires. If the arrival time falls between two
+physics-substep boundaries, that one substep uses the time-average of the previous
+and new actions; later substeps use the new action. The first command after an
+environment reset is never delayed. The maximum delay must be no greater than one
+control interval (``1000 * sim.decimation / sim.fps`` milliseconds). A value of
+``0.0`` disables latency randomization, which is the default.
+
+.. code-block:: python
+
+   DomainRandomizationConfig(
+       latency=LatencyDomainRandomizationConfig(max_latency_ms=3.0),
+   )
+
+The setting applies to all supported simulator backends: IsaacGym, IsaacLab,
+Newton, Genesis, and MuJoCo. On Newton, enabling action latency disables CUDA
+graph execution because control targets must change between physics substeps;
+expect lower simulation throughput while it is enabled.
 
 **Friction Randomization:**
 
@@ -110,6 +133,22 @@ randomization; it is an absolute local center-of-mass value, and omitted axes
 default to ``0.0``.  IsaacLab and IsaacGym apply these scene object asset
 properties to both primitive and mesh objects.  Newton currently does not spawn
 scene-lib objects, so object asset randomization has no effect there.
+
+**Robot Body Mass Randomization:**
+
+Robot body mass randomization samples absolute masses and scales inertia by the
+same ratio. It is supported by IsaacGym, IsaacLab, and Newton. Body-mass domain
+randomization is not supported yet in MuJoCo or Genesis; those backends fail
+immediately when it is configured instead of silently ignoring it.
+
+.. code-block:: python
+
+   BodyMassDomainRandomizationConfig(
+       num_buckets=64,
+       mass_range=(0.001, 1.0),
+       log_uniform=True,
+       body_names=["left_hand", "right_hand"],
+   )
 
 **Center of Mass Randomization:**
 
@@ -201,17 +240,14 @@ behavior across simulators.
 
 **How it works:**
 
-When running on MuJoCo with an ``AVERAGE`` mode config:
+When a simulator uses ``MAX`` combine mode:
 
-1. Robot shape friction is set to a minimum value (0.01)
-2. Terrain friction is set to the computed effective value
-3. Result: ``max(0.01, effective) = effective`` -- matching the intended behavior
+1. Character shape friction is set from ``simulator.default_robot_friction``
+2. Terrain friction is adjusted to preserve the configured effective value
+3. Domain-randomized character friction overrides the baseline for selected bodies
 
-When domain randomization is configured:
-
-1. Terrain friction is set to minimum (0.01)
-2. Robot friction randomization range is converted to effective values
-3. Result: ``max(robot_dr_value, 0.01) = robot_dr_value`` -- matching intended range
+This keeps the configured character friction explicit even when domain
+randomization is disabled.
 
 This conversion is transparent -- you don't need to change your config for
 different simulators.  The same experiment config works on IsaacGym, IsaacLab,

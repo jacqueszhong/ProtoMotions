@@ -35,7 +35,14 @@ class MujocoSimulatorConfig(SimulatorConfig):
         default=True,
         metadata={
             "help": "PD control mode for BUILT_IN_PD. "
-                    "True: MuJoCo position actuators (implicit PD, stable). "
-                    "False: explicit PD torque computation at each physics substep."
-        }
+            "True: MuJoCo position actuators (implicit PD, stable). "
+            "False: explicit PD torque computation at each physics substep."
+        },
+    )
+    use_separate_keyboard_window: bool = field(
+        default=True,
+        metadata={
+            "help": "Capture application keys in a separate Tk window instead "
+            "of competing with MuJoCo viewer keyboard shortcuts."
+        },
     )

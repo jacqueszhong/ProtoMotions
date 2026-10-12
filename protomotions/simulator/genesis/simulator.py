@@ -52,6 +52,14 @@ class GenesisSimulator(Simulator):
         device: torch.device,
         scene_lib: SceneLib,
     ) -> None:
+        if (
+            config.domain_randomization is not None
+            and config.domain_randomization.body_mass is not None
+        ):
+            raise NotImplementedError(
+                "Genesis does not support body-mass domain randomization."
+            )
+
         super().__init__(
             config=config,
             robot_config=robot_config,
@@ -159,6 +167,7 @@ class GenesisSimulator(Simulator):
         )
 
         self._scene.build(n_envs=self.num_envs)
+        self._robot.set_friction(self.config.default_robot_friction)
 
     def _get_sim_body_ordering(self) -> SimBodyOrdering:
         """Returns the ordering of bodies and DOFs in the simulation."""

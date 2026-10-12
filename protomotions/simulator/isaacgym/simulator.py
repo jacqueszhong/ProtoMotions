@@ -34,6 +34,10 @@ from protomotions.simulator.base_simulator.simulator_state import (
     ResetState,
 )
 from protomotions.simulator.base_simulator.simulator import Simulator, ControlType
+from protomotions.simulator.base_simulator.utils import (
+    get_friction_bucket_count,
+    get_friction_table,
+)
 from protomotions.simulator.base_simulator.config import (
     MarkerState,
     VisualizationMarkerConfig,
@@ -478,6 +482,7 @@ class IsaacGymSimulator(Simulator):
 
         # Load the base humanoid asset
         self._humanoid_asset = humanoid_asset = self._load_humanoid_asset()
+        self._set_robot_friction_on_asset(humanoid_asset)
 
         # Create multiple asset variants for friction domain randomization if needed
         self._humanoid_assets_for_friction = self._create_friction_randomized_assets(
@@ -836,6 +841,9 @@ class IsaacGymSimulator(Simulator):
 
         # Apply COM domain randomization to this specific actor (must be done right after actor creation)
         self._apply_com_domain_randomization_to_actor(env_ptr, humanoid_handle, env_id)
+        self._apply_body_mass_domain_randomization_to_actor(
+            env_ptr, humanoid_handle, env_id
+        )
 
         self._humanoid_handles.append(humanoid_handle)
 
@@ -1125,12 +1133,13 @@ class IsaacGymSimulator(Simulator):
 
     # ===== Group 3: Simulation Steps & State Management =====
     def _physics_step(self) -> None:
-        # For BUILT_IN_PD, set targets once before loop (efficiency)
-        # For PROPORTIONAL/TORQUE, apply inside loop (needs fresh DOF state each substep)
-        if self.control_type == ControlType.BUILT_IN_PD:
+        # Without latency, BUILT_IN_PD targets are set once for efficiency.
+        # Latency and the other control modes are applied at each substep.
+        latency_enabled = self._max_action_latency_ms > 0.0
+        if self.control_type == ControlType.BUILT_IN_PD and not latency_enabled:
             self._apply_control()
         for i in range(self.decimation):
-            if self.control_type != ControlType.BUILT_IN_PD:
+            if self.control_type != ControlType.BUILT_IN_PD or latency_enabled:
                 self._apply_control()
             self._simulate()
             if self.device.type == "cpu":
@@ -1425,6 +1434,13 @@ class IsaacGymSimulator(Simulator):
     # - IsaacGym: Must set friction on asset before actor creation
     #   Solution: Create min(num_buckets, num_envs) assets, evenly distribute to environments
 
+    def _set_robot_friction_on_asset(self, asset) -> None:
+        """Set the configured baseline friction on every character collision shape."""
+        shape_props = self._gym.get_asset_rigid_shape_properties(asset)
+        for shape_prop in shape_props:
+            shape_prop.friction = self.config.default_robot_friction
+        self._gym.set_asset_rigid_shape_properties(asset, shape_props)
+
     def _create_friction_randomized_assets(self, base_asset) -> List:
         """Create multiple asset copies with different friction/restitution values for domain randomization.
 
@@ -1449,10 +1465,15 @@ class IsaacGymSimulator(Simulator):
         ):
             return [base_asset]  # No friction randomization, use single asset
 
+        friction_dr = self._domain_randomization["friction"]
+        friction_table = get_friction_table(friction_dr)
+        restitution = friction_dr.get("restitution")
         # Note: base simulator already creates min(num_buckets, num_envs) samples
-        num_assets_to_create = self._domain_randomization["friction"][
-            "static_friction"
-        ].shape[0]
+        num_assets_to_create = get_friction_bucket_count(friction_dr)
+        if num_assets_to_create == 0 or (
+            friction_table is None and restitution is None
+        ):
+            return [base_asset]
         # body_indices stored for reference but not used (we apply friction to all shapes)
         # body_indices = self._domain_randomization["friction"]["body_indices"]
 
@@ -1476,18 +1497,16 @@ class IsaacGymSimulator(Simulator):
 
             # Use the first body's randomized values for all shapes (simplified approach)
             # For most configs like body_names=[".*"], all bodies get the same randomization anyway
-            sampled_friction = self._domain_randomization["friction"][
-                "static_friction"
-            ][i, 0].item()
-            sampled_restitution = self._domain_randomization["friction"]["restitution"][
-                i, 0
-            ].item()
-
             for shape_prop in shape_props:
                 # Use pre-randomized friction value directly (no adjustment needed - both sims use average mode)
                 # Note: IsaacGym only has single friction property, not separate static/dynamic
-                shape_prop.friction = sampled_friction
-                shape_prop.restitution = sampled_restitution
+                shape_prop.friction = (
+                    friction_table[i, 0].item()
+                    if friction_table is not None
+                    else self.config.default_robot_friction
+                )
+                if restitution is not None:
+                    shape_prop.restitution = restitution[i, 0].item()
 
             self._gym.set_asset_rigid_shape_properties(asset, shape_props)
             assets.append(asset)
@@ -1613,6 +1632,31 @@ class IsaacGymSimulator(Simulator):
         for idx, body_idx in enumerate(body_indices):
             offset = com_offsets[idx].cpu().numpy().tolist()
             self._update_body_com_and_inertia(body_props[body_idx], offset)
+
+        self._gym.set_actor_rigid_body_properties(
+            env_ptr, humanoid_handle, body_props, recomputeInertia=False
+        )
+
+    def _apply_body_mass_domain_randomization_to_actor(
+        self, env_ptr, humanoid_handle, env_id: int
+    ) -> None:
+        """Apply sampled robot body masses immediately after actor creation."""
+
+        if self._domain_randomization is None or "body_mass" not in self._domain_randomization:
+            return
+
+        body_mass = self._domain_randomization["body_mass"]
+        body_props = self._gym.get_actor_rigid_body_properties(env_ptr, humanoid_handle)
+        bucket_id = env_id % body_mass["mass"].shape[0]
+        for body_offset, body_idx in enumerate(body_mass["body_indices"]):
+            new_mass = float(body_mass["mass"][bucket_id, body_offset].item())
+            old_mass = body_props[body_idx].mass
+            if old_mass <= 0:
+                raise ValueError(
+                    f"Cannot randomize non-positive mass for robot body index {body_idx}."
+                )
+            self._scale_body_inertia(body_props[body_idx], new_mass / old_mass)
+            body_props[body_idx].mass = new_mass
 
         self._gym.set_actor_rigid_body_properties(
             env_ptr, humanoid_handle, body_props, recomputeInertia=False

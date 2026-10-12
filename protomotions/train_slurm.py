@@ -22,9 +22,49 @@ It handles code synchronization, container setup, and job submission.
 
 BEFORE USING:
 -------------
-1. Edit the CLUSTER CONFIGURATION section below to match your cluster setup
-2. Ensure you have SSH access to your cluster login node
-3. Prepare your container images (see CONTAINER SETUP below)
+1. Write a site YAML describing your cluster, rather than editing this file.
+   Keys are listed in SITE_DEFAULTS below; any you omit keep their default.
+
+       login_node: login.mycluster.edu
+       base_dir: /scratch/{account}/experiments
+       account: my_allocation
+       partition: gpu
+       container_mounts: /scratch:/scratch:rw
+       container_images:
+         isaacgym: /containers/isaacgym.sqsh
+
+   Point the script at it with --site-config PATH or $PROTOMOTIONS_SLURM_SITE.
+   A file at slurm_site.yaml in the repository root is picked up
+   automatically.
+
+   To reach more than one cluster on the same allocation, list them under
+   `clusters:` and pick one with --cluster NAME. Keys at the top level are
+   shared by every cluster -- put `account` there, since that is the axis that
+   does NOT change when you switch cluster -- and each cluster overrides only
+   what differs (its login_node, partition, container images):
+
+       account: my_allocation          # shared: same on every cluster
+       default_cluster: a100            # used when --cluster is omitted
+       clusters:
+         a100:
+           login_node: a100-login.mycluster.edu
+           partition: gpu
+           container_images: {isaaclab: /containers/isaaclab.sqsh}
+         l40:
+           login_node: l40-login.mycluster.edu
+           partition: batch
+           container_images: {isaaclab: /containers/isaaclab.sqsh}
+
+   Editing this file directly works, but every `git pull` becomes a merge
+   conflict and your cluster paths end up in version control.
+
+2. Check what resolved, before submitting anything (add --cluster NAME to see
+   a specific one):
+
+       python protomotions/train_slurm.py --print-site
+
+3. Ensure you have SSH access to your cluster login node
+4. Prepare your container images (see CONTAINER SETUP below)
 
 USAGE EXAMPLE:
 --------------
@@ -53,44 +93,251 @@ import datetime
 import os
 from pathlib import Path
 import subprocess
+import sys
+import tempfile
+
+# Make `import protomotions...` resolve when this is run as
+# `python protomotions/train_slurm.py` -- then the script's own directory, not the
+# repo root, is on sys.path -- without requiring PYTHONPATH/direnv or an editable
+# install.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from protomotions._train_launch_common import build_train_agent_args  # noqa: E402
 
 
 # =============================================================================
 # CLUSTER CONFIGURATION - EDIT THIS SECTION FOR YOUR CLUSTER
 # =============================================================================
 
-# Login node hostname (e.g., "login.mycluster.edu")
-CLUSTER_LOGIN_NODE = "YOUR_CLUSTER_LOGIN_NODE"
-
-# Base directory for experiments on the cluster filesystem
-CLUSTER_BASE_DIR = "/path/to/your/experiments/directory"
-
-# Container images (Singularity .sif or Enroot .sqsh format)
-CONTAINER_IMAGES = {
-    "isaacgym": "/path/to/containers/isaacgym.sqsh",
-    "isaaclab": "/path/to/containers/isaaclab.sqsh",
-    "newton": "/path/to/containers/newton.sqsh",
+# These are the shipped defaults. They are deliberately not usable: every value
+# below names a placeholder, so a mis-configured submission fails loudly instead
+# of quietly sending a job to the wrong place.
+#
+# Point the script at your cluster with a site file rather than by editing this
+# block. Editing here means every `git pull` is a merge conflict, and a private
+# cluster path is one `git add -p` away from being published. See SITE_CONFIG
+# below for the search order, and `--print-site` to see what was loaded.
+SITE_DEFAULTS = {
+    # Login node hostname, e.g. "login.mycluster.edu".
+    "login_node": "YOUR_CLUSTER_LOGIN_NODE",
+    # Base directory for experiments on the cluster filesystem. May contain
+    # "{account}", substituted with --account, which is how a site with
+    # per-allocation directories keeps one entry here instead of one per team.
+    "base_dir": "/path/to/your/experiments/directory",
+    # Container images, Singularity .sif or Enroot .sqsh, keyed by simulator.
+    "container_images": {
+        "isaacgym": "/path/to/containers/isaacgym.sqsh",
+        "isaaclab": "/path/to/containers/isaaclab.sqsh",
+        "newton": "/path/to/containers/newton.sqsh",
+    },
+    # Python executable inside each container.
+    "python_executables": {
+        "isaacgym": "python",
+        "isaaclab": "/workspace/isaaclab/isaaclab.sh -p",  # Isaac Lab wrapper
+        "newton": "python",
+    },
+    # Default SLURM account (your allocation/project).
+    "account": "your_account",
+    # Default SLURM partitions, comma-separated.
+    "partition": "gpu",
+    # Filesystem mounts for the container.
+    "container_mounts": "/scratch:/scratch:rw",
+    # Job array size for auto-resume: N tasks run sequentially (one at a time),
+    # each up to --slurm-time, so total walltime is N x --slurm-time. A site with
+    # long jobs sets this once here; --array-size / --srun-repeat override it.
+    "array_size": 5,
+    # Extra rsync exclude patterns appended to the built-in list, for
+    # workflow/checkout-specific junk (personal side-project dirs, pre-staged data
+    # directories, etc.) that should not ship to the cluster on every submit.
+    "rsync_excludes": [],
+    # Opt-in startup retry + startup watchdog (see the --startup-* flags). These
+    # default to today's behaviour: no retry loop, no startup watchdog. They live
+    # here so a team can set a cluster-wide default in the site file -- the loader
+    # rejects unknown keys, so a site file could not set them without these entries.
+    "startup_max_attempts": 1,
+    "startup_stall_min": 0,
+    "startup_repeat_limit": 3,
+    "startup_retry_backoff_sec": 15,
 }
 
-# Python executable inside each container
-PYTHON_EXECUTABLES = {
-    "isaacgym": "python",
-    "isaaclab": "/workspace/isaaclab/isaaclab.sh -p",  # Isaac Lab wrapper
-    "newton": "python",
-}
+# Anything still equal to its shipped default is unset, and submitting with one
+# is refused. Matching on the literal rather than a separate "is it configured"
+# flag means a half-filled site file is caught too.
+_PLACEHOLDER_MARKERS = ("YOUR_", "/path/to/", "your_account")
 
-# Default SLURM account (your allocation/project)
-DEFAULT_SLURM_ACCOUNT = "your_account"
+# Where a site file is looked for, first match wins:
+#
+#   1. --site-config PATH
+#   2. $PROTOMOTIONS_SLURM_SITE
+#   3. slurm_site.yaml, beside the repository this script lives in
+#
+# Entry 3 is what lets a fork keep cluster settings in the tree, shared through
+# git, without them reaching anyone downstream: the file is excluded from the
+# release projection, so it is version-controlled but never published.
+SITE_CONFIG_ENV = "PROTOMOTIONS_SLURM_SITE"
+SITE_CONFIG_DEFAULT_RELPATH = Path("slurm_site.yaml")
 
-# Default SLURM partitions (comma-separated)
-DEFAULT_SLURM_PARTITION = "gpu"
+# A site file may describe several clusters that share one allocation. These two
+# top-level keys structure that: `clusters` maps a name to the settings that
+# differ on that cluster, and `default_cluster` names the one used when --cluster
+# is omitted. Everything else at the top level (notably `account`) is shared by
+# every cluster, which is what keeps the allocation a separate axis from the
+# cluster. They are recognised in addition to the per-cluster keys in
+# SITE_DEFAULTS.
+CLUSTERS_KEY = "clusters"
+DEFAULT_CLUSTER_KEY = "default_cluster"
 
-# Filesystem mounts for container (cluster-specific)
-CONTAINER_MOUNTS = "/scratch:/scratch:rw"
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _overlay(site, incoming, *, replace_dicts=False):
+    """Overlay `incoming` onto `site`. Dict values merge key-by-key unless
+    replace_dicts is set, in which case they replace the whole dict.
+
+    A cluster's overrides replace dicts: a cluster that supports only some
+    simulators lists only those container images, and must not inherit the other
+    simulators' placeholder paths from SITE_DEFAULTS (which would then be flagged
+    as unconfigured and refuse a submission that never needed them)."""
+    for key, value in incoming.items():
+        if (
+            isinstance(value, dict)
+            and isinstance(site.get(key), dict)
+            and not replace_dicts
+        ):
+            site[key].update(value)
+        else:
+            site[key] = dict(value) if isinstance(value, dict) else value
+
+
+def load_site_config(explicit_path=None, cluster=None):
+    """Return SITE_DEFAULTS overlaid with the first site file found.
+
+    A site file is either flat (one cluster, keys at the top level) or defines a
+    `clusters:` mapping of named clusters that each override the shared top-level
+    settings. `cluster` (from --cluster), else `default_cluster:`, selects one;
+    with a single cluster and neither given, that one is used. `account` stays a
+    shared top-level key so the same allocation is used whichever cluster is
+    picked. The resolved cluster name is recorded under "_cluster"."""
+    candidates = []
+    if explicit_path:
+        candidates.append(Path(explicit_path))
+    if os.environ.get(SITE_CONFIG_ENV):
+        candidates.append(Path(os.environ[SITE_CONFIG_ENV]))
+    candidates.append(_repo_root() / SITE_CONFIG_DEFAULT_RELPATH)
+
+    allowed = set(SITE_DEFAULTS)
+    site = {
+        k: (dict(v) if isinstance(v, dict) else v) for k, v in SITE_DEFAULTS.items()
+    }
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        import yaml
+
+        loaded = yaml.safe_load(candidate.read_text()) or {}
+        clusters = loaded.pop(CLUSTERS_KEY, None) or {}
+        default_cluster = loaded.pop(DEFAULT_CLUSTER_KEY, None)
+
+        unknown = set(loaded) - allowed
+        if unknown:
+            raise ValueError(
+                f"{candidate}: unknown key(s) {sorted(unknown)}; expected any of "
+                f"{sorted(allowed | {CLUSTERS_KEY, DEFAULT_CLUSTER_KEY})}"
+            )
+        # Shared, top-level settings (e.g. account); a cluster may override any.
+        _overlay(site, loaded)
+
+        chosen = None
+        if clusters:
+            if not isinstance(clusters, dict):
+                raise ValueError(
+                    f"{candidate}: '{CLUSTERS_KEY}' must be a mapping of name -> settings"
+                )
+            chosen = cluster or default_cluster
+            if chosen is None:
+                if len(clusters) == 1:
+                    chosen = next(iter(clusters))
+                else:
+                    raise ValueError(
+                        f"{candidate}: defines clusters {sorted(clusters)} but none was "
+                        f"selected; pass --cluster NAME or set '{DEFAULT_CLUSTER_KEY}'"
+                    )
+            if chosen not in clusters:
+                raise ValueError(
+                    f"{candidate}: unknown cluster {chosen!r}; available: {sorted(clusters)}"
+                )
+            overrides = clusters[chosen] or {}
+            unknown_c = set(overrides) - allowed
+            if unknown_c:
+                raise ValueError(
+                    f"{candidate}: cluster {chosen!r} has unknown key(s) {sorted(unknown_c)}; "
+                    f"expected any of {sorted(allowed)}"
+                )
+            _overlay(site, overrides, replace_dicts=True)
+        elif cluster is not None:
+            raise ValueError(
+                f"{candidate}: --cluster {cluster!r} was given but this site file defines "
+                f"no '{CLUSTERS_KEY}'"
+            )
+        elif default_cluster is not None:
+            # A default_cluster with nothing to select from is a mis-structured
+            # file, not a silent no-op.
+            raise ValueError(
+                f"{candidate}: '{DEFAULT_CLUSTER_KEY}' is set to {default_cluster!r} but no "
+                f"'{CLUSTERS_KEY}' mapping is defined"
+            )
+
+        site["_source"] = str(candidate)
+        site["_cluster"] = chosen
+        site["_clusters_available"] = sorted(clusters)
+        return site
+
+    site["_source"] = None
+    site["_cluster"] = None
+    site["_clusters_available"] = []
+    return site
+
+
+def unconfigured_values(site):
+    """Names of settings still carrying a shipped placeholder."""
+    unset = []
+    for key, value in site.items():
+        if key.startswith("_"):
+            continue
+        items = value.items() if isinstance(value, dict) else [(None, value)]
+        for sub, val in items:
+            if isinstance(val, str) and any(m in val for m in _PLACEHOLDER_MARKERS):
+                unset.append(key if sub is None else f"{key}.{sub}")
+    return unset
+
 
 # =============================================================================
 # END CLUSTER CONFIGURATION
 # =============================================================================
+
+# The names used throughout the rest of this file. Seeded from the shipped
+# defaults so importing the module is side-effect free; main() replaces them
+# with the loaded site before anything touches the cluster.
+CLUSTER_LOGIN_NODE = SITE_DEFAULTS["login_node"]
+CLUSTER_BASE_DIR = SITE_DEFAULTS["base_dir"]
+CONTAINER_IMAGES = dict(SITE_DEFAULTS["container_images"])
+PYTHON_EXECUTABLES = dict(SITE_DEFAULTS["python_executables"])
+CONTAINER_MOUNTS = SITE_DEFAULTS["container_mounts"]
+DEFAULT_SLURM_ACCOUNT = SITE_DEFAULTS["account"]
+DEFAULT_SLURM_PARTITION = SITE_DEFAULTS["partition"]
+
+
+def apply_site(site):
+    """Publish a loaded site into the module-level names used below."""
+    globals().update(
+        CLUSTER_LOGIN_NODE=site["login_node"],
+        CLUSTER_BASE_DIR=site["base_dir"],
+        CONTAINER_IMAGES=site["container_images"],
+        PYTHON_EXECUTABLES=site["python_executables"],
+        CONTAINER_MOUNTS=site["container_mounts"],
+    )
 
 
 def subprocess_run(cmd, ignore_err=False, **kwargs):
@@ -108,7 +355,9 @@ def check_wandb_credentials(user):
     """
     # Check for ~/.netrc with wandb.ai entry
     check_cmd = f"ssh {user}@{CLUSTER_LOGIN_NODE} \"grep -q 'machine api.wandb.ai' ~/.netrc 2>/dev/null && echo 'found' || echo 'not_found'\""
-    result = subprocess_run(check_cmd, shell=True, capture_output=True, text=True, ignore_err=True)
+    result = subprocess_run(
+        check_cmd, shell=True, capture_output=True, text=True, ignore_err=True
+    )
 
     if result.stdout.strip() == "found":
         print("WANDB credentials found in ~/.netrc on remote. No API key needed.")
@@ -116,7 +365,9 @@ def check_wandb_credentials(user):
 
     # Check environment variable
     check_env_cmd = f'ssh {user}@{CLUSTER_LOGIN_NODE} "bash -l -c \'test -n \\"\\$WANDB_API_KEY\\" && echo found || echo not_found\'"'
-    result = subprocess_run(check_env_cmd, shell=True, capture_output=True, text=True, ignore_err=True)
+    result = subprocess_run(
+        check_env_cmd, shell=True, capture_output=True, text=True, ignore_err=True
+    )
 
     if result.stdout.strip() == "found":
         print("WANDB_API_KEY found in remote environment.")
@@ -145,18 +396,40 @@ def create_parser():
     )
 
     # Required arguments
-    parser.add_argument("--robot-name", type=str, required=True, help="Robot name (e.g., 'g1', 'smpl')")
-    parser.add_argument("--simulator", type=str, required=True, help="Simulator (isaacgym/isaaclab/newton)")
-    parser.add_argument("--num-envs", type=int, required=True, help="Number of parallel environments")
-    parser.add_argument("--batch-size", type=int, required=True, help="Training batch size")
-    parser.add_argument("--motion-file", type=str, required=True, help="Path to motion data file")
-    parser.add_argument("--experiment-path", type=str, required=True, help="Path to experiment config")
-    parser.add_argument("--experiment-name", type=str, required=True, help="Experiment name for logging")
+    parser.add_argument(
+        "--robot-name", type=str, required=True, help="Robot name (e.g., 'g1', 'smpl')"
+    )
+    parser.add_argument(
+        "--simulator",
+        type=str,
+        required=True,
+        help="Simulator (isaacgym/isaaclab/newton)",
+    )
+    parser.add_argument(
+        "--num-envs", type=int, required=True, help="Number of parallel environments"
+    )
+    parser.add_argument(
+        "--batch-size", type=int, required=True, help="Training batch size"
+    )
+    parser.add_argument(
+        "--motion-file", type=str, required=True, help="Path to motion data file"
+    )
+    parser.add_argument(
+        "--experiment-path", type=str, required=True, help="Path to experiment config"
+    )
+    parser.add_argument(
+        "--experiment-name", type=str, required=True, help="Experiment name for logging"
+    )
     parser.add_argument("--user", type=str, required=True, help="Cluster username")
 
     # Optional arguments
-    parser.add_argument("--scenes-file", type=str, default=None, help="Path to scenes file (optional)")
-    parser.add_argument("--headless", default=True, help="Run headless (no GUI)")
+    parser.add_argument(
+        "--scenes-file", type=str, default=None, help="Path to scenes file (optional)"
+    )
+    # --headless is intentionally NOT declared here. train_agent.py owns it
+    # (nargs="?", parse_bool), and parse_known_args forwards it through unchanged.
+    # Declared here as a bare flag it silently swallowed the value -- the same
+    # class of bug as --seed below.
     training_limit_group = parser.add_mutually_exclusive_group()
     training_limit_group.add_argument(
         "--training-max-steps",
@@ -170,42 +443,172 @@ def create_parser():
         default=None,
         help="Max complete training iterations",
     )
-    parser.add_argument("--checkpoint", type=str, default=None, help="Resume from checkpoint")
-    parser.add_argument("--use-wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument(
+        "--checkpoint", type=str, default=None, help="Resume from checkpoint"
+    )
+    parser.add_argument(
+        "--use-wandb", action="store_true", help="Enable Weights & Biases logging"
+    )
     parser.add_argument(
         "--wandb-project",
         type=str,
         default="physical_animation",
         help="Weights & Biases project name",
     )
-    parser.add_argument("--use-slurm", action="store_true", default=True, help="Enable SLURM autoresume")
+    parser.add_argument(
+        "--use-slurm", action="store_true", default=True, help="Enable SLURM autoresume"
+    )
     parser.add_argument("--ngpu", type=int, default=1, help="GPUs per node")
     parser.add_argument("--nodes", type=int, default=1, help="Number of nodes")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
-    parser.add_argument("--overrides", nargs="*", default=[], help="Config overrides (key=value)")
+    parser.add_argument(
+        "--torch-deterministic",
+        action="store_true",
+        default=False,
+        help="Enable deterministic PyTorch ops (forwarded to train_agent.py)",
+    )
+    parser.add_argument(
+        "--overrides", nargs="*", default=[], help="Config overrides (key=value)"
+    )
 
     # SLURM arguments
     parser.add_argument("-t", "--slurm-time", default="4:00:00", help="Job time limit")
-    parser.add_argument("-a", "--account", default=DEFAULT_SLURM_ACCOUNT, help="SLURM account")
-    parser.add_argument("-p", "--partition", default=DEFAULT_SLURM_PARTITION, help="SLURM partition")
-    parser.add_argument("--array-size", type=int, default=5, help="Job array size for auto-resume")
-    parser.add_argument("--only-upload-code", action="store_true", help="Only sync code, don't submit")
+    parser.add_argument(
+        "--stall-timeout-min",
+        type=int,
+        default=30,
+        help="Kill training if the SLURM log has not grown for this many minutes -- "
+        "a wedged rank makes the whole job go silent at the distributed barrier -- so "
+        "the array's next element restarts (on a possibly different node) instead of "
+        "the job sitting until the walltime. 0 disables; raise it for very long epochs.",
+    )
+    # Left as None so the site file can supply them; a value given here still
+    # wins, because the site is only consulted for what the caller omitted.
+    parser.add_argument("-a", "--account", default=None, help="SLURM account")
+    parser.add_argument("-p", "--partition", default=None, help="SLURM partition")
+    parser.add_argument(
+        "--site-config",
+        default=None,
+        help="Cluster site YAML; overrides $PROTOMOTIONS_SLURM_SITE and slurm_site.yaml",
+    )
+    parser.add_argument(
+        "--cluster",
+        default=None,
+        help="Which cluster in the site file's 'clusters:' to submit to "
+        "(default: the site's default_cluster). --print-site lists the choices.",
+    )
+    parser.add_argument(
+        "--repo-root",
+        default=None,
+        help="Repository to rsync to the cluster (default: the one this script lives in)",
+    )
+    parser.add_argument(
+        "--print-site",
+        action="store_true",
+        help="Print the resolved cluster settings and exit, without submitting",
+    )
+    parser.add_argument(
+        "--array-size",
+        "--srun-repeat",
+        dest="array_size",
+        type=int,
+        default=None,
+        help="Job array size for auto-resume: N tasks run one at a time, each up "
+        "to --slurm-time, so total walltime is N x --slurm-time. --srun-repeat is "
+        "a backward-compatible alias. Default: the site's array_size (else 5).",
+    )
+    # Opt-in startup retry + startup watchdog. All default to None so the site
+    # file can supply a team-wide value (main() fills them like array_size); an
+    # explicit flag still wins. With the resolved defaults (1 attempt, 0 minutes)
+    # the emitted script is byte-identical to today's.
+    parser.add_argument(
+        "--startup-max-attempts",
+        type=int,
+        default=None,
+        help="In-place srun attempts per array element, for scene-build failures "
+        "that abort or hang BEFORE epoch 0 (no training progress at stake). 1 (the "
+        "default) emits no retry loop at all. Retries reuse the same allocation "
+        "instead of costing a fresh array-element scheduling round trip.",
+    )
+    parser.add_argument(
+        "--startup-stall-min",
+        type=int,
+        default=None,
+        help="Outer startup watchdog, in minutes: kill and retry an attempt whose "
+        "log goes silent for this long BEFORE training starts (a wedged scene "
+        "build). 0 (default) disables it. Should be LESS than --stall-timeout-min "
+        "so it disarms before the inner watchdog would fire.",
+    )
+    parser.add_argument(
+        "--startup-repeat-limit",
+        type=int,
+        default=None,
+        help="Stop retrying after this many attempts fail with the SAME Python "
+        "exception -- a deterministic bug, not a flaky abort. 0 disables the check. "
+        "Inert while --startup-max-attempts is 1. Default 3.",
+    )
+    parser.add_argument(
+        "--startup-retry-backoff-sec",
+        type=int,
+        default=None,
+        help="Seconds to sleep between startup attempts (default 15).",
+    )
+    parser.add_argument(
+        "--only-upload-code", action="store_true", help="Only sync code, don't submit"
+    )
 
     return parser
 
 
-def sync_code_to_cluster(user, exp_folder, local_repo):
-    """Sync local code to cluster, excluding unnecessary files."""
+def sync_code_to_cluster(user, exp_folder, local_repo, extra_excludes=None):
+    """Sync local code to cluster, excluding unnecessary files.
+
+    `extra_excludes` (from the site file's rsync_excludes) is appended to the
+    built-in list, for workflow-specific junk and pre-staged data directories.
+    """
     exclude_patterns = [
-        ".git", ".idea", "**/__pycache__", "**/*.egg-info",
-        "outputs", "output/*", "results", "exps", "tmp",
-        "data/smpl", "data/amass", "data/pretrained_models",
-        "docs", "docs/*",
+        ".git",
+        ".idea",
+        ".claude",
+        ".cursor",
+        ".vscode",
+        ".ruff_cache",
+        "**/__pycache__",
+        "**/*.egg-info",
+        # Local worktrees and in-tree virtualenvs are full duplicate checkouts /
+        # gigabytes -- never ship them.
+        ".worktrees",
+        ".venv**",
+        "outputs",
+        "output/*",
+        "results",
+        "exps",
+        "tmp",
+        "**/*tmp*",
+        # Root-level scratch caches (e.g. token/plan caches).
+        "**/_*_cache.pt",
+        # Large data blobs, pre-staged on the cluster rather than re-uploaded.
+        "data/smpl",
+        "data/amass",
+        "data/pretrained_models",
+        "docs",
+        "docs/*",
+        # Media that never belongs in a code snapshot.
+        "**/*.mp4",
+        "**/*.avi",
+        "**/*.gif",
+        "**/*.jpg",
+        "**/*.png",
+        "**/*.onnx",
     ]
+    if extra_excludes:
+        exclude_patterns += list(extra_excludes)
     exclude_str = " ".join([f'--exclude="{f}"' for f in exclude_patterns])
 
     # Create remote directory
-    subprocess_run(f"ssh {user}@{CLUSTER_LOGIN_NODE} 'mkdir -p {exp_folder}'", shell=True)
+    subprocess_run(
+        f"ssh {user}@{CLUSTER_LOGIN_NODE} 'mkdir -p {exp_folder}'", shell=True
+    )
 
     # Sync code
     rsync_cmd = f"rsync -az --partial -m --chmod=775 {exclude_str} {local_repo}/ {user}@{CLUSTER_LOGIN_NODE}:{exp_folder}/"
@@ -213,63 +616,315 @@ def sync_code_to_cluster(user, exp_folder, local_repo):
     subprocess_run(rsync_cmd, shell=True)
 
 
-def build_job_command(args, exp_folder, python_path):
-    """Build the training command to run inside the container."""
-    # Install package
-    job_cmd = f"pip uninstall -y protomotions 2>/dev/null; cd {exp_folder}; pip install -e . --no-dependencies; "
+def _kill_tree_bash() -> str:
+    """bash defining kill_tree(): kill a process and ALL its descendants, children
+    first. The training python and its ranks run several levels below the srun
+    task, so killing only $pid orphans them -- they keep the GPUs and would
+    collide with the immediate resume. Extracted so it can be unit-tested
+    (test_train_slurm_watchdog.py) against a real fake process tree."""
+    return (
+        "kill_tree() { local root=$1 child; "
+        'for child in $(pgrep -P "$root" 2>/dev/null); do kill_tree "$child"; done; '
+        'kill -9 "$root" 2>/dev/null; }'
+    )
 
-    # Add WANDB API key if needed
+
+def _stall_watchdog_bash() -> str:
+    """bash defining run_with_stall_watchdog(): run "$@" and kill its whole process
+    tree if $LOGFILE stops growing for a while.
+
+    Knobs (env): STALL_TIMEOUT_MIN is the user-facing one, in minutes; the watchdog
+    kills after that many no-growth polls of STALL_POLL_SEC (default 60s), i.e.
+    minutes by default. STALL_QUIET_LIMIT overrides the poll count directly and
+    STALL_POLL_SEC the interval, so a test can drive it in fractions of a second;
+    with the defaults this is identical to the previous 'sleep 60; quiet >=
+    STALL_TIMEOUT_MIN'. A limit <= 0 disables the watchdog. Extracted (with the
+    knobs) so it can be unit-tested without SLURM."""
+    return (
+        'run_with_stall_watchdog() { "$@" & local pid=$!; '
+        'local poll="${STALL_POLL_SEC:-60}"; '
+        'local quiet_limit="${STALL_QUIET_LIMIT:-${STALL_TIMEOUT_MIN:-30}}"; '
+        'if [ "${quiet_limit}" -le 0 ]; then wait "$pid"; return $?; fi; '
+        "( last=-1; quiet=0; "
+        'while kill -0 "$pid" 2>/dev/null; do sleep "$poll"; '
+        'size=$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0); '
+        'if [ "$size" != "$last" ]; then last=$size; quiet=0; '
+        "else quiet=$((quiet + 1)); fi; "
+        'if [ "$quiet" -ge "${quiet_limit}" ]; then '
+        'echo "[watchdog] no log growth for ${quiet_limit} poll(s) of ${poll}s; killing pid ${pid} and descendants" >&2; '
+        'kill_tree "$pid"; break; fi; '
+        "done ) & local wd=$!; "
+        'wait "$pid"; local status=$?; '
+        'kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null; return "$status"; }'
+    )
+
+
+def _startup_retry_bash() -> str:
+    """bash defining run_with_startup_retry(): run "$@" up to STARTUP_MAX_ATTEMPTS
+    times, retrying only attempts that failed BEFORE reaching training.
+
+    This is the OUTER, startup-only counterpart to the inner run_with_stall_watchdog
+    in build_job_command. The inner one lives inside srun and kills the training
+    process; a retry loop cannot (you cannot re-run srun from inside srun), so this
+    wraps srun at the batch layer and re-runs it in place on the same allocation
+    when a scene build aborts (glibc heap corruption -> SIGABRT) or hangs before
+    epoch 0. It disarms the moment training is reached -- the inner watchdog owns
+    liveness from there -- and it refuses to retry a DETERMINISTIC failure: a native
+    abort prints no Python traceback, so a repeating exception line means a real
+    bug, not a flaky one, and the loop stops and surfaces it.
+
+    Knobs (env): STARTUP_MAX_ATTEMPTS (1 = no retry), STARTUP_STALL_SEC (0 = no
+    startup watchdog), STARTUP_POLL_SEC (30), STARTUP_BACKOFF_SEC (15),
+    STARTUP_REPEAT_LIMIT (3, 0 = off), TRAINING_MARKER (default 'Epoch [0-9]'),
+    LOGFILE. Extracted, with the knobs, so a test can drive it in fractions of a
+    second (test_train_slurm_startup_retry.py). Depends on kill_tree from
+    _kill_tree_bash()."""
+    return r'''run_with_startup_retry() {
+  local max="${STARTUP_MAX_ATTEMPTS:-1}" stall_sec="${STARTUP_STALL_SEC:-0}"
+  local poll="${STARTUP_POLL_SEC:-30}" backoff="${STARTUP_BACKOFF_SEC:-15}"
+  local repeat_limit="${STARTUP_REPEAT_LIMIT:-3}" marker="${TRAINING_MARKER:-Epoch [0-9]}"
+  local attempt=0 status=0 prev_cls="" repeat=0 _mark pid wd _exc _cls
+  # Always run at least once: a 0/negative max (e.g. someone paired it with a
+  # startup watchdog) must not silently skip srun and report success.
+  [ "$max" -lt 1 ] && max=1
+  while [ "$attempt" -lt "$max" ]; do
+    attempt=$((attempt + 1))
+    # Read only THIS attempt's slice of the shared log: everything from line
+    # _mark+1 on. wc/tail/grep below all key off it.
+    if [ -f "$LOGFILE" ]; then _mark=$(wc -l < "$LOGFILE"); else _mark=0; fi
+    "$@" &
+    pid=$!
+    wd=""
+    if [ "$stall_sec" -gt 0 ]; then
+      # Startup watchdog: kill the attempt if the log's mtime stops advancing for
+      # stall_sec BEFORE training is reached. Disarms (breaks) once the slice shows
+      # the training marker -- the inner run_with_stall_watchdog takes over then.
+      ( armed=1
+        while kill -0 "$pid" 2>/dev/null; do
+          sleep "$poll"
+          if [ "$armed" = 1 ] && tail -n +$((_mark + 1)) "$LOGFILE" 2>/dev/null | grep -qE "$marker"; then
+            break
+          fi
+          now=$(date +%s); mt=$(stat -c %Y "$LOGFILE" 2>/dev/null || echo "$now")
+          if [ $((now - mt)) -ge "$stall_sec" ]; then
+            echo "[startup-watchdog] no log activity for ${stall_sec}s before training started; killing pid ${pid} and its tree so this attempt can retry" >&2
+            kill_tree "$pid"
+            break
+          fi
+        done ) &
+      wd=$!
+    fi
+    wait "$pid"; status=$?
+    if [ -n "$wd" ]; then kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null; fi
+
+    if [ "$status" -eq 0 ]; then break; fi
+    if tail -n +$((_mark + 1)) "$LOGFILE" 2>/dev/null | grep -qE "$marker"; then
+      echo "[startup-retry] attempt ${attempt} reached training then exited ${status}; not retrying in place (the array element resumes from checkpoint)." >&2
+      break
+    fi
+    # Repeat check: a native abort/hang prints no Python traceback, so retry it
+    # freely (bounded by max). A DETERMINISTIC bug prints the same exception every
+    # attempt -- stop and surface it rather than hide it behind retries. Match
+    # message-LESS exceptions too: a bare `assert` prints just "AssertionError"
+    # with no colon, and that is one of the commonest deterministic startup bugs.
+    # Compare only the exception CLASS (strip the message): a message that embeds a
+    # path, CUDA device id or rank varies between attempts, but the bug is the same.
+    _exc=$(tail -n +$((_mark + 1)) "$LOGFILE" 2>/dev/null | grep -oE '^[A-Za-z_][A-Za-z0-9_.]*(Error|Exception)(: .*)?$' | tail -1)
+    _cls="${_exc%%:*}"
+    if [ -n "$_exc" ] && [ "$_cls" = "$prev_cls" ]; then
+      repeat=$((repeat + 1))
+    elif [ -n "$_exc" ]; then
+      repeat=1
+    fi
+    prev_cls="$_cls"
+    if [ -n "$_exc" ] && [ "$repeat_limit" -gt 0 ] && [ "$repeat" -ge "$repeat_limit" ]; then
+      echo "[startup-retry] same exception ${repeat} attempts in a row -- this is deterministic, not flaky:" >&2
+      echo "[startup-retry]   ${_exc}" >&2
+      break
+    fi
+    if [ "$attempt" -lt "$max" ]; then
+      echo "[startup-retry] attempt ${attempt}/${max} failed (exit ${status}) before training; retrying in ${backoff}s." >&2
+      sleep "$backoff"
+    fi
+  done
+  return "$status"
+}'''
+
+
+def build_job_command(args, exp_folder, python_path, passthrough_args=None):
+    """Build the training command to run inside the container.
+
+    `passthrough_args` are CLI flags this launcher does not recognise (typically
+    experiment-contributed, e.g. gpc/prior.py's --tracker-checkpoint); they are
+    forwarded verbatim to train_agent.py, which does know them.
+    """
+    # Simulator-specific install. The IsaacLab container's PATH points at a venv
+    # whose bare `python`/`pip` are not runnable, so pip must go through
+    # `isaaclab.sh -p -m pip`; a plain `pip install` there fails with exit 127.
+    if args.simulator == "isaaclab":
+        ilab_pip = "/workspace/isaaclab/isaaclab.sh -p -m pip"
+        # NB: no `pip install --upgrade wandb` here. The image's wandb already
+        # satisfies protomotions' pin (<0.24); an unpinned upgrade pulls whatever
+        # shipped that day (wandb 0.29 violates the pin and drags click to 8.5,
+        # which conflicts with isaacsim-kernel's click==8.1.7). Bake a specific
+        # wandb into the image if a newer one is genuinely needed.
+        install_cmds = (
+            f"{ilab_pip} uninstall -y protomotions || true; "
+            f"{ilab_pip} install -e . --no-deps; "
+        )
+    else:
+        install_cmds = (
+            "pip uninstall -y protomotions 2>/dev/null; "
+            "pip install -e . --no-dependencies; "
+        )
+
+    # IsaacLab lazily bootstraps a shared pip env when AppLauncher first starts;
+    # warm it once on local rank 0 so the node's ranks do not race on it.
+    warmup_cmd = ""
+    if args.simulator == "isaaclab":
+        warmup_cmd = (
+            'ISAAC_WARMUP_DIR="/tmp/isaaclab_warmup_${SLURM_JOB_ID}_${SLURMD_NODENAME}"; '
+            'ISAAC_WARMUP_READY="${ISAAC_WARMUP_DIR}/ready"; '
+            'ISAAC_WARMUP_FAIL="${ISAAC_WARMUP_DIR}/failed"; '
+            'if [ "${SLURM_LOCALID:-0}" = "0" ]; then '
+            'mkdir -p "${ISAAC_WARMUP_DIR}"; rm -f "${ISAAC_WARMUP_READY}" "${ISAAC_WARMUP_FAIL}"; '
+            f'if {python_path} -c "from isaaclab.app import AppLauncher; app = AppLauncher({{\\"headless\\": True}}).app; app.close()"; then '
+            'touch "${ISAAC_WARMUP_READY}"; '
+            'else rc=$?; echo "${rc}" > "${ISAAC_WARMUP_FAIL}"; exit "${rc}"; fi; '
+            "else waited=0; "
+            'while [ ! -f "${ISAAC_WARMUP_READY}" ] && [ ! -f "${ISAAC_WARMUP_FAIL}" ]; do '
+            "sleep 2; waited=$((waited + 2)); "
+            'if [ "${waited}" -ge 300 ]; then echo "Timed out waiting for IsaacLab warmup"; exit 1; fi; done; '
+            'if [ -f "${ISAAC_WARMUP_FAIL}" ]; then echo "IsaacLab warmup failed on local rank 0"; exit 1; fi; '
+            "fi; "
+        )
+
+    # Only local rank 0 installs; other ranks wait on a marker so they do not race
+    # on shared container packages (relevant when --ngpu > 1 puts several ranks per node).
+    #
+    # Clearing the marker belongs to rank 0, inside the branch. Done before it,
+    # by every rank, a rank that starts late -- a slow image pull is enough --
+    # deletes the marker after rank 0 has already installed and touched it, and
+    # then waits for a file nobody will write again. The waiters also get a
+    # timeout, so a failed install on rank 0 ends the job instead of hanging it
+    # until the wall clock does. The warmup block below already works this way.
+    job_cmd = (
+        f"cd {exp_folder}; "
+        'if [ "${SLURM_LOCALID:-0}" = "0" ]; then '
+        f"rm -f /tmp/_pip_done_${{SLURM_JOB_ID}}; {install_cmds} "
+        f"touch /tmp/_pip_done_${{SLURM_JOB_ID}}; "
+        "else waited=0; while [ ! -f /tmp/_pip_done_${SLURM_JOB_ID} ]; do "
+        "sleep 2; waited=$((waited + 2)); "
+        'if [ "${waited}" -ge 900 ]; then echo "Timed out waiting for the rank-0 install"; exit 1; fi; '
+        "done; fi; "
+        f"{warmup_cmd}"
+    )
+
+    # Add WANDB API key if needed, as its own `export` statement. A bare
+    # `WANDB_API_KEY=<key> ` prefix would attach to the next `export
+    # PYTHONUNBUFFERED=1` builtin (below) rather than the training process, so the
+    # key would never reach train_agent.py.
     if args.use_wandb:
         wandb_key = check_wandb_credentials(args.user)
         if wandb_key:
-            job_cmd += f"WANDB_API_KEY={wandb_key} "
+            job_cmd += f"export WANDB_API_KEY={wandb_key}; "
 
-    # Build training command
-    job_cmd += (
-        f"PYTHONUNBUFFERED=1 {python_path} -u protomotions/train_agent.py "
-        f"--robot-name={args.robot_name} "
-        f"--simulator={args.simulator} "
-        f"--motion-file={args.motion_file} "
-        f"--ngpu={args.ngpu} "
-        f"--nodes={args.nodes} "
-        f"--experiment-name={args.experiment_name} "
-        f"--experiment-path={args.experiment_path} "
-        f"--num-envs={args.num_envs} "
-        f"--batch-size={args.batch_size} "
-        f"--use-slurm "
+    # Assemble the train_agent.py command, then run it under the stall watchdog
+    # below. The shared tail (robot/sim/motion/.../overrides, incl. experiment
+    # passthrough) comes from build_train_agent_args so this stays in lockstep with
+    # train_lepton.py and the two launchers cannot drift. Appended after it are the
+    # SLURM-only flags: --use-slurm (the walltime autoresume callback that
+    # stops-and-requeues at ~3.5h, which Lepton omits) and the reproducibility
+    # flags this parser owns -- --seed / --torch-deterministic are consumed by
+    # parse_known_args, so they must be forwarded explicitly or --seed 3 is
+    # silently dropped and every job runs train_agent's default seed 0. All three
+    # start with -- so the trailing --overrides (nargs="*") does not swallow them.
+    # (--seed / --torch-deterministic are appended here rather than in the shared
+    # builder because train_lepton.py does not yet expose them; unifying that is a
+    # follow-up.)
+    train_cmd = (
+        f"{python_path} -u protomotions/train_agent.py "
+        f"{build_train_agent_args(args, passthrough_args)} "
+        f"--use-slurm --seed={args.seed} "
     )
+    if args.torch_deterministic:
+        train_cmd += "--torch-deterministic "
 
-    if args.training_max_iterations is not None:
-        job_cmd += f"--training-max-iterations={args.training_max_iterations} "
-    else:
-        job_cmd += f"--training-max-steps={args.training_max_steps} "
-
-    if args.scenes_file:
-        job_cmd += f"--scenes-file={args.scenes_file} "
-    if args.use_wandb:
-        job_cmd += f"--use-wandb --wandb-project={args.wandb_project} "
-    if args.checkpoint:
-        job_cmd += f"--checkpoint={args.checkpoint} "
-    if args.overrides:
-        job_cmd += f"--overrides {' '.join(args.overrides)} "
+    # Stall watchdog. It catches ONE failure mode: a WHOLE-JOB wedge, where a rank
+    # gets stuck (e.g. never finishes setup) and every other rank then blocks at
+    # the next collective waiting for it -- so the whole job goes silent and the
+    # SLURM log stops growing, with no exit code, until the walltime reclaims it.
+    # Because a blocked collective silences the healthy ranks too, "the log stopped
+    # growing" is a reliable signal for THAT case. It is deliberately NOT a
+    # per-rank health check: a single rank hung while the others keep doing useful,
+    # log-producing work would not be caught, and any rank's output resets the
+    # observed silence. That case is rarer (collectives usually couple the ranks)
+    # and out of scope here. Kill after STALL_TIMEOUT_MIN minutes of no growth; the
+    # failed array element then restarts on the next (possibly different) node. 0
+    # disables. The bash is double-quoted throughout so it is safe inside the
+    # single-quoted `bash -c '...'` that srun wraps job_cmd in.
+    log_file = f"{exp_folder}/slurm_output.log"
+    kill_tree_fn = _kill_tree_bash()
+    watchdog_fn = _stall_watchdog_bash()
+    job_cmd += (
+        f"export PYTHONUNBUFFERED=1; LOGFILE={log_file}; "
+        f"STALL_TIMEOUT_MIN={args.stall_timeout_min}; {kill_tree_fn}; {watchdog_fn}; "
+        f"run_with_stall_watchdog {train_cmd}"
+    )
 
     return job_cmd
 
 
-def generate_slurm_script(args, exp_folder, job_cmd, container_image):
+def generate_slurm_script(args, exp_folder, job_cmd, container_image, job_name):
     """Generate SLURM batch script content."""
     log_file = f"{exp_folder}/slurm_output.log"
 
-    # Container run command (adjust for your cluster's container runtime)
+    # The IsaacLab container ships a uv-managed interpreter under /root/.local, but
+    # pyxis mounts the host $HOME over the container's /root and hides it, which breaks
+    # `isaaclab.sh -p` (its venv python then dangles). --no-container-mount-home keeps
+    # the image's interpreter intact; mount ~/.netrc explicitly so W&B still
+    # authenticates, since disabling the home mount also hides it.
+    container_mounts = CONTAINER_MOUNTS
+    if args.use_wandb:
+        container_mounts += ",${HOME}/.netrc:/root/.netrc:ro"
+
+    # Container run command (adjust for your cluster's container runtime).
+    # stdbuf -oL line-buffers srun's output so slurm_output.log grows promptly --
+    # the stall watchdog in job_cmd keys off that file's growth.
+    # Any single quote inside job_cmd (e.g. a shlex-quoted passthrough value with a
+    # space) would otherwise close this outer single-quoted string early and word-
+    # split the rest. Escape them with the POSIX '\'' idiom so the wrapping is safe.
+    job_cmd_quoted = job_cmd.replace("'", "'\\''")
     srun_cmd = (
-        f"srun "
+        f"stdbuf -oL -eL srun "
         f"--container-image={container_image} "
-        f"--container-mounts={CONTAINER_MOUNTS} "
-        f"/bin/bash -c '{job_cmd}'"
+        f"--no-container-mount-home "
+        f"--container-mounts={container_mounts} "
+        f"/bin/bash -c '{job_cmd_quoted}'"
     )
 
+    # Opt-in startup retry. When off (the default), the body is the bare srun_cmd
+    # and this script is byte-identical to before the feature existed. When on,
+    # wrap srun in run_with_startup_retry, which re-runs it in place for a scene
+    # build that failed before training. srun_cmd is passed as ARGUMENTS (not
+    # re-quoted): it already contains a single-quoted bash -c '...' and must not be
+    # escaped again.
+    retry_on = args.startup_max_attempts > 1 or args.startup_stall_min > 0
+    if retry_on:
+        body = (
+            f"{_kill_tree_bash()}\n{_startup_retry_bash()}\n"
+            f"export LOGFILE={log_file} "
+            f"STARTUP_MAX_ATTEMPTS={args.startup_max_attempts} "
+            f"STARTUP_STALL_SEC={args.startup_stall_min * 60} "
+            f"STARTUP_BACKOFF_SEC={args.startup_retry_backoff_sec} "
+            f"STARTUP_REPEAT_LIMIT={args.startup_repeat_limit}\n"
+            f"run_with_startup_retry {srun_cmd}"
+        )
+    else:
+        body = srun_cmd
+
     script = f"""#!/bin/bash
-#SBATCH --job-name={args.experiment_name}
+#SBATCH --job-name={job_name}
 #SBATCH --account={args.account}
 #SBATCH --partition={args.partition}
 #SBATCH --nodes={args.nodes}
@@ -282,68 +937,228 @@ def generate_slurm_script(args, exp_folder, job_cmd, container_image):
 
 # Job array enables automatic resume: if job times out, next array task continues
 
-{srun_cmd}
+{body}
 """
     return script, log_file
 
 
+def print_site(site):
+    print(f"site file: {site['_source'] or '(none found -- using shipped defaults)'}")
+    available = site.get("_clusters_available") or []
+    if available:
+        print(f"cluster: {site.get('_cluster')}  (available: {', '.join(available)})")
+    for key in sorted(k for k in site if not k.startswith("_")):
+        print(f"  {key}: {site[key]}")
+    missing = unconfigured_values(site)
+    print(f"  unset: {', '.join(missing) if missing else '(none)'}")
+
+
 def main():
+    # --print-site is a diagnostic and must not require a full training command
+    # line, so it is handled before the real parser demands --robot-name and the
+    # rest. This is the first thing to run when a submission goes somewhere
+    # unexpected.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--site-config", default=None)
+    pre.add_argument("--cluster", default=None)
+    pre.add_argument("--print-site", action="store_true")
+    pre_args, _ = pre.parse_known_args()
+    if pre_args.print_site:
+        print_site(load_site_config(pre_args.site_config, pre_args.cluster))
+        return
+
     parser = create_parser()
-    args = parser.parse_args()
+    # parse_known_args, not parse_args: experiment files contribute their own CLI
+    # flags via additional_experiment_arguments (e.g. gpc/prior.py's required
+    # --tracker-checkpoint), which train_agent.py parses but this launcher does
+    # not. Rejecting unknown flags made every such run unsubmittable; instead
+    # forward the unknowns to train_agent.py (see build_job_command).
+    args, passthrough_args = parser.parse_known_args()
+
+    # Resolve the cluster before anything else, so a misconfiguration is caught
+    # before code is synced rather than after.
+    site = load_site_config(args.site_config, args.cluster)
+    apply_site(site)
+    args.account = args.account or site["account"]
+    args.partition = args.partition or site["partition"]
+    # A value given on the CLI is authoritative, so reflect it back before the
+    # placeholder check: a site file that leaves the (now shared) account unset
+    # must not be refused when --account supplied a real one.
+    site["account"] = args.account
+    site["partition"] = args.partition
+    # array_size default comes from the site file (a team with long jobs sets it
+    # once) when neither --array-size nor its --srun-repeat alias was given.
+    if args.array_size is None:
+        args.array_size = site.get("array_size", 5)
+    # The startup-retry / startup-watchdog knobs resolve the same way: a flag left
+    # None takes the site value (which defaults to the off values in SITE_DEFAULTS),
+    # and an explicit flag still wins.
+    for _key, _default in (
+        ("startup_max_attempts", 1),
+        ("startup_stall_min", 0),
+        ("startup_repeat_limit", 3),
+        ("startup_retry_backoff_sec", 15),
+    ):
+        if getattr(args, _key) is None:
+            setattr(args, _key, site.get(_key, _default))
+
+    if missing := unconfigured_values(site):
+        cluster_line = ""
+        if site.get("_clusters_available"):
+            cluster_line = (
+                f"Cluster:  {site.get('_cluster')} "
+                f"(available: {', '.join(site['_clusters_available'])})\n"
+            )
+        raise SystemExit(
+            "Refusing to submit: these cluster settings are still the shipped "
+            f"placeholders -- {', '.join(missing)}.\n\n"
+            f"Searched: --site-config, ${SITE_CONFIG_ENV}, "
+            f"{_repo_root() / SITE_CONFIG_DEFAULT_RELPATH}\n"
+            f"Loaded:   {site['_source'] or '(nothing)'}\n"
+            f"{cluster_line}\n"
+            "Write a site YAML with the keys you need and pass it with "
+            "--site-config, or place it at the path above. `--print-site` shows "
+            "what was resolved."
+        )
+
+    # Startup retry multiplies with the job array. Print the worst-case execution
+    # count before anything is submitted, and warn if the startup watchdog is set
+    # so high the inner stall watchdog would always fire first (leaving it inert).
+    if args.startup_max_attempts > 1 or args.startup_stall_min > 0:
+        worst = args.startup_max_attempts * (args.array_size + 1)
+        print(
+            f"[startup-retry] up to {args.startup_max_attempts} attempts x "
+            f"{args.array_size + 1} array elements = {worst} executions worst case"
+        )
+        if (
+            args.startup_stall_min > 0
+            and args.stall_timeout_min > 0
+            and args.startup_stall_min >= args.stall_timeout_min
+        ):
+            print(
+                f"[startup-retry] WARNING: --startup-stall-min ({args.startup_stall_min}) "
+                f">= --stall-timeout-min ({args.stall_timeout_min}); the inner watchdog "
+                "fires first, so the startup watchdog never acts. Set it lower."
+            )
 
     # Setup paths
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    local_repo = Path(__file__).parent.parent
-    exp_folder = os.path.join(CLUSTER_BASE_DIR, args.user, f"exp-{timestamp}")
+    # --repo-root so this can sync a checkout other than its own; without it the
+    # only way to launch a different tree was to copy the script and edit it.
+    local_repo = Path(args.repo_root).resolve() if args.repo_root else _repo_root()
+    # base_dir may be templated on the account, which varies per allocation.
+    exp_folder = os.path.join(
+        CLUSTER_BASE_DIR.format(account=args.account), args.user, f"exp-{timestamp}"
+    )
+
+    # Resolve the container up front. A cluster may stage only some simulators
+    # (its container_images replace rather than merge), so an unsupported
+    # --simulator must fail here, before the ssh/rsync below runs.
+    container_image = CONTAINER_IMAGES.get(args.simulator)
+    python_path = PYTHON_EXECUTABLES.get(args.simulator, "python")
+    if not container_image:
+        raise ValueError(
+            f"No container configured for simulator {args.simulator!r} on cluster "
+            f"{site.get('_cluster') or '(default)'}; configured: {sorted(CONTAINER_IMAGES)}"
+        )
 
     print(f"Local repository: {local_repo}")
     print(f"Remote experiment folder: {exp_folder}")
 
     # Sync code
-    sync_code_to_cluster(args.user, exp_folder, local_repo)
+    sync_code_to_cluster(args.user, exp_folder, local_repo, site.get("rsync_excludes"))
 
     if args.only_upload_code:
         print("Code uploaded. Exiting (--only-upload-code).")
         return
 
-    # Get container and python path
-    container_image = CONTAINER_IMAGES.get(args.simulator)
-    python_path = PYTHON_EXECUTABLES.get(args.simulator, "python")
-
-    if not container_image:
-        raise ValueError(f"No container configured for simulator: {args.simulator}")
-
     # Build job command
-    job_cmd = build_job_command(args, exp_folder, python_path)
+    job_cmd = build_job_command(args, exp_folder, python_path, passthrough_args)
 
-    # Generate SLURM script
-    slurm_script, log_file = generate_slurm_script(args, exp_folder, job_cmd, container_image)
+    # SLURM job name carries the timestamp so a squeue row maps to its exp-<ts>
+    # directory and its output log -- otherwise squeue tells you nothing about
+    # where a job's output lives.
+    job_name = f"{timestamp}_{args.experiment_name}"
+    slurm_script, log_file = generate_slurm_script(
+        args, exp_folder, job_cmd, container_image, job_name
+    )
 
     print("\n" + "=" * 60)
     print("SLURM SCRIPT:")
     print("=" * 60)
     print(slurm_script)
 
-    # Write and upload script
-    local_script = Path(f"tmp/slurm_{timestamp}.sh")
-    local_script.parent.mkdir(exist_ok=True)
-    local_script.write_text(slurm_script)
+    # Write the sbatch script to a temp file, not the cwd: a relative tmp/ pollutes
+    # whatever directory you launched from and fails outright when the cwd is not
+    # writable (the normal case in an agent sandbox).
+    with tempfile.NamedTemporaryFile(
+        mode="w", prefix=f"slurm_{timestamp}_", suffix=".sh", delete=False
+    ) as handle:
+        handle.write(slurm_script)
+        local_script = handle.name
 
     remote_script = f"{exp_folder}/submit.sh"
-    subprocess_run(f"scp {local_script} {args.user}@{CLUSTER_LOGIN_NODE}:{remote_script}", shell=True)
+    subprocess_run(
+        f"scp {local_script} {args.user}@{CLUSTER_LOGIN_NODE}:{remote_script}",
+        shell=True,
+    )
 
-    # Submit job
+    # Submit and capture the job id from "Submitted batch job N".
     submit_cmd = f"ssh {args.user}@{CLUSTER_LOGIN_NODE} 'chmod +x {remote_script}; sbatch {remote_script}'"
     print(f"\nSubmitting: {submit_cmd}")
-    subprocess_run(submit_cmd, shell=True)
+    result = subprocess_run(submit_cmd, shell=True, capture_output=True, text=True)
+    sbatch_out = (result.stdout or "").strip()
+    if sbatch_out:
+        print(sbatch_out)
+    slurm_job_id = "unknown"
+    for line in sbatch_out.splitlines():
+        if "Submitted batch job" in line:
+            slurm_job_id = line.split()[-1].strip()
+            break
+
+    # Copy-back hint: auto-discover the helper wherever it lives (it has moved
+    # between directories). rglob avoids naming any specific path this file must
+    # not reference; first non-worktree match wins.
+    copy_back = next(
+        (
+            p
+            for p in sorted(local_repo.rglob("copy_back_from_slurm*.py"))
+            if ".worktrees" not in p.parts and ".git" not in p.parts
+        ),
+        None,
+    )
+    copy_back_cmd = ""
+    if copy_back is not None:
+        rel = copy_back.relative_to(local_repo)
+        copy_back_cmd = (
+            f"python3 {rel} --exp-id {timestamp} --account {args.account} "
+            f"--user {args.user} --download-last"
+        )
 
     print("\n" + "=" * 60)
     print("JOB SUBMITTED!")
     print("=" * 60)
     print(f"Monitor logs:  ssh {args.user}@{CLUSTER_LOGIN_NODE} 'tail -f {log_file}'")
-    print(f"Check status:  ssh {args.user}@{CLUSTER_LOGIN_NODE} 'squeue -u {args.user}'")
-    print(f"Cancel job:    ssh {args.user}@{CLUSTER_LOGIN_NODE} 'scancel <job_id>'")
+    print(
+        f"Check status:  ssh {args.user}@{CLUSTER_LOGIN_NODE} 'squeue -u {args.user}'"
+    )
+    print(
+        f"Cancel job:    ssh {args.user}@{CLUSTER_LOGIN_NODE} 'scancel {slurm_job_id}'"
+    )
+    if copy_back_cmd:
+        print(f"Copy back:     {copy_back_cmd}")
     print("=" * 60)
+
+    # Machine-readable block for automated parsing (agents, scripts parse this).
+    print("")
+    print("=== SUBMISSION SUMMARY ===")
+    print(f"slurm_job_id={slurm_job_id}")
+    print(f"exp_id={timestamp}")
+    print(f"exp_dir={exp_folder}")
+    print(f"output_log={log_file}")
+    if copy_back_cmd:
+        print(f"copy_back={copy_back_cmd}")
+    print("=== END SUMMARY ===")
 
 
 if __name__ == "__main__":

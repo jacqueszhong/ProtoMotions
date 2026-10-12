@@ -4,59 +4,12 @@
 import carb
 import numpy as np
 from pxr import Gf, Sdf
-import omni.replicator.core as rep
 
 
 class PerspectiveViewer(object):
     def __init__(self):
         self.viewport_api = None
         self.get_viewport_api()
-        _ = rep.create.render_product(
-            "/OmniverseKit_Persp", resolution=(500, 500)
-        )  # Lower resolution
-
-        # Disable advanced rendering features
-        self.disable_advanced_rendering()
-
-    def disable_advanced_rendering(self):
-        stage = self.viewport_api.stage
-        render_settings_path = "/Render/RenderProduct/RenderSettings"
-
-        # Create or get the RenderSettings prim
-        render_settings = stage.GetPrimAtPath(render_settings_path)
-        if not render_settings.IsValid():
-            render_settings = stage.DefinePrim(render_settings_path, "RenderSettings")
-
-        # Disable ray tracing
-        render_settings.CreateAttribute(
-            "rtx:raytracing:enabled", Sdf.ValueTypeNames.Bool
-        ).Set(False)
-
-        # Disable Global Illumination
-        render_settings.CreateAttribute(
-            "rtx:pathtracing:gi:enabled", Sdf.ValueTypeNames.Bool
-        ).Set(False)
-
-        # Disable Ambient Occlusion
-        render_settings.CreateAttribute(
-            "rtx:ambientOcclusion:enabled", Sdf.ValueTypeNames.Bool
-        ).Set(False)
-
-        # Disable Depth of Field
-        render_settings.CreateAttribute("rtx:dof:enabled", Sdf.ValueTypeNames.Bool).Set(
-            False
-        )
-
-        # Optionally, you can also reduce other quality settings
-        render_settings.CreateAttribute(
-            "rtx:pathtracing:maxBounces", Sdf.ValueTypeNames.Int
-        ).Set(1)
-        render_settings.CreateAttribute(
-            "rtx:pathtracing:maxSamples", Sdf.ValueTypeNames.Int
-        ).Set(16)
-
-        # Apply the changes
-        stage.SetEditTarget(stage.GetSessionLayer())
 
     def get_viewport_api(self):
         if self.viewport_api is None:
