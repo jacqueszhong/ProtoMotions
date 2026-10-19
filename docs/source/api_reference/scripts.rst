@@ -70,9 +70,17 @@ For kinematic motion playback without physics training state:
 
 **Keyboard Controls:**
 
+Click inside the simulation viewer to give it keyboard focus, then use the
+task's key bindings.
+
 * **W/A/S/D** - Move keyboard-controlled task targets when enabled
 * **R** - Reset environments
 * **Q** - Quit
+
+**MuJoCo only:** press **.** to toggle between ProtoMotions key bindings
+(default) and MuJoCo's native viewer key bindings. Only the selected set is
+active. Switching back to ProtoMotions key bindings restores the initial
+visualization settings. Mouse orbit and zoom work in either mode.
 
 train_slurm.py
 --------------
@@ -106,4 +114,3 @@ See Also
 
 * :doc:`../getting_started/quickstart` - Getting started guide
 * :doc:`../user_guide/configuration` - Configuration system
-

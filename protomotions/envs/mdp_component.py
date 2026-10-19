@@ -38,12 +38,20 @@ Every compute_func argument must come from exactly one of two places:
 
 Metadata keys
 -------------
-Some ``static_params`` keys are *metadata* consumed by the reward/termination
-combining logic, not by the compute_func itself.  These are automatically filtered
-out before calling the compute_func.  Current metadata keys:
+Some ``static_params`` keys are *metadata* read by the combining logic in
+``base_env/utils.py`` (reward weighting and clamping, the evaluation failure
+cut).  Current metadata keys:
 
     weight, multiplicative, zero_during_grace_period,
-    min_value, max_value
+    min_value, max_value, threshold, fail_above, use_region_weights
+
+A metadata key is passed to the compute_func only when the compute_func
+declares a parameter with that name; otherwise it is filtered out.  Termination
+kernels declare ``threshold``, so a termination's configured threshold reaches
+its kernel.  Evaluation kernels must not declare ``threshold``: for them it is
+the failure cut that ``combine_evaluation`` applies to the kernel's output.  A
+compute_func that only takes ``**kwargs``, or whose signature cannot be
+inspected (a TorchScript function, for example), receives no metadata keys.
 
 Example
 -------
@@ -91,9 +99,9 @@ if TYPE_CHECKING:
     from protomotions.envs.context_views import EnvContext
 
 
-# Keys in static_params that are reward/termination metadata, NOT compute_func arguments.
-# These are consumed by combine_rewards / combine_terminations and must not
-# be forwarded to the compute_func function.
+# Keys in static_params that are read by combine_rewards / combine_evaluation.
+# resolve_args drops them before calling the compute_func, unless the
+# compute_func declares a parameter of the same name.
 _METADATA_KEYS = frozenset({
     "weight", "multiplicative", "zero_during_grace_period",
     "min_value", "max_value",
@@ -101,38 +109,23 @@ _METADATA_KEYS = frozenset({
 })
 
 
-def kernel_forwarded_metadata_keys(compute_func: Callable[..., Tensor]) -> FrozenSet[str]:
-    """Metadata keys the kernel itself declares, and therefore must receive.
+def _declared_keyword_params(func: Callable[..., Any]) -> FrozenSet[str]:
+    """Return the names of the parameters ``func`` declares and accepts by keyword.
 
-    A few names are metadata for one consumer and a real argument for another:
-    ``threshold`` is evaluator metadata for value kernels such as
-    ``anchor_height_error_value``, but a genuine parameter of termination kernels
-    such as ``compute_anchor_height_error_term``.  Blanket-filtering it made every
-    termination run at its kernel default and silently ignore the threshold its
-    factory was given.  Forward a metadata key only when the kernel declares it by
-    name; ``**kwargs`` wrappers keep the conservative split, since what they accept
-    cannot be read from the signature.
-
-    Args:
-        compute_func: The kernel that will be called with the static params.
-
-    Returns:
-        Frozen set of metadata key names to forward to ``compute_func``.
+    ``*args`` and ``**kwargs`` do not count, so a wrapper that forwards
+    ``**kwargs`` declares nothing. A function whose signature cannot be
+    inspected declares nothing either. That includes TorchScript functions, so a
+    ``@torch.jit.script`` kernel never receives metadata keys: if one needs a
+    threshold, give its parameter a name that is not in ``_METADATA_KEYS``.
     """
     try:
-        parameters = inspect.signature(compute_func).parameters
+        parameters = inspect.signature(func).parameters.values()
     except (TypeError, ValueError):
-        # jit-scripted or builtin callables expose no inspectable signature.
         return frozenset()
-
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
-        return frozenset()
-
     return frozenset(
-        name
-        for name, param in parameters.items()
-        if name in _METADATA_KEYS
-        and param.kind
+        param.name
+        for param in parameters
+        if param.kind
         in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
     )
 
@@ -194,15 +187,18 @@ class MdpComponent:
         self.static_params = static_params or {}
         self.compile = compile
         self._device_ready = False
+        self._metadata_args = None
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state.pop("_device_ready", None)
+        state.pop("_metadata_args", None)
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._device_ready = False
+        self._metadata_args = None
 
     
     def resolve_args(self, ctx: "EnvContext") -> tuple:
@@ -225,24 +221,17 @@ class MdpComponent:
         if not self._device_ready:
             self._ensure_device(resolved)
 
-        forwarded = self._forwarded_metadata_keys()
+        if self._metadata_args is None:
+            # Metadata keys the compute_func asks for by name, such as a
+            # termination kernel's threshold.
+            self._metadata_args = _METADATA_KEYS & _declared_keyword_params(
+                self.compute_func
+            )
         func_params = {
             k: v for k, v in self.static_params.items()
-            if k not in _METADATA_KEYS or k in forwarded
+            if k not in _METADATA_KEYS or k in self._metadata_args
         }
         return resolved, func_params
-
-    def _forwarded_metadata_keys(self) -> FrozenSet[str]:
-        """Cached metadata keys this component's kernel declares.
-
-        Resolved lazily rather than in ``__init__`` so components restored from a
-        pickled ``resolved_configs.pt`` (which bypasses ``__init__``) also get it.
-        """
-        keys = self.__dict__.get("_metadata_keys_cache")
-        if keys is None:
-            keys = kernel_forwarded_metadata_keys(self.compute_func)
-            self._metadata_keys_cache = keys
-        return keys
 
     def compute(self, ctx: "EnvContext") -> Tensor:
         """Resolve dynamic_vars from context and call compute_func.
