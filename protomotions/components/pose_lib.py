@@ -618,6 +618,11 @@ def extract_control_info(
         # Extract actuator force range if available
         effort_limit = getattr(joint, "actuatorfrcrange", DEFAULT_EFFORT_LIMIT)
 
+        # MJCF parsing can hand back stiffness as a one-element numpy array
+        # rather than a scalar; unwrap it before the float handling below.
+        if isinstance(stiffness, np.ndarray):
+            stiffness = stiffness.item()
+
         # Convert to float if they're strings (common in MJCF)
         if isinstance(stiffness, str):
             stiffness = float(stiffness)
