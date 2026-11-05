@@ -116,6 +116,18 @@ def create_parser():
         help="Config overrides in format key=value (e.g., env.max_episode_length=5000 simulator.headless=True)",
     )
     parser.add_argument(
+        "--record-video",
+        action="store_true",
+        default=False,
+        help="Record the viewport to output/renderings/*.mp4 (needs a window; not headless)",
+    )
+    parser.add_argument(
+        "--record-steps",
+        type=int,
+        default=600,
+        help="Environment steps to run when --record-video is set",
+    )
+    parser.add_argument(
         "--command-source",
         nargs="*",
         default=[],
@@ -488,6 +500,20 @@ def main():
             if evaluated_score is not None:
                 print(f"  Overall Score: {evaluated_score:.6f}")
             print("=" * 60 + "\n")
+        elif args.record_video:
+            if headless:
+                raise SystemExit("--record-video requires a window; drop --headless")
+            sim = env.simulator
+            # Same state the "L" key sets; render() picks it up
+            sim._toggle_video_record()
+            try:
+                agent.evaluator.simple_test_policy(
+                    collect_metrics=True, max_steps=args.record_steps
+                )
+            finally:
+                # Next render() finalizes the frames into an mp4
+                sim._toggle_video_record()
+                sim.render()
         else:
             agent.evaluator.simple_test_policy(collect_metrics=True)
     finally:

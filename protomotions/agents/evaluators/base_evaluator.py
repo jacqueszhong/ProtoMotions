@@ -686,15 +686,18 @@ class BaseEvaluator:
         print("Per-frame metrics plotted successfully")
 
     @torch.no_grad()
-    def simple_test_policy(self, collect_metrics: bool = False) -> None:
+    def simple_test_policy(
+        self, collect_metrics: bool = False, max_steps: Optional[int] = None
+    ) -> None:
         """
         Simple evaluation loop for interactive testing.
 
-        Runs policy indefinitely, collecting running average of metrics.
-        Press Ctrl+C to stop and print summary.
+        Runs policy until max_steps (indefinitely if None), collecting running
+        average of metrics. Press Ctrl+C to stop and print summary.
 
         Args:
             collect_metrics: If True, collect and print average metrics on exit.
+            max_steps: Stop after this many environment steps.
         """
         self.agent.eval()
         done_indices = None
@@ -706,7 +709,7 @@ class BaseEvaluator:
 
         print("Evaluating policy... (Ctrl+C to stop)")
         try:
-            while True:
+            while max_steps is None or step < max_steps:
                 obs, _ = self.env.reset(done_indices)
                 self.agent.pre_collect_step(step)
                 obs = self.agent.add_agent_info_to_obs(obs)
