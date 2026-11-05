@@ -70,7 +70,7 @@ device = torch.device("cuda:0") if not args.cpu_only else torch.device("cpu")
 # Import factory functions
 from protomotions.simulator.factory import simulator_config  # noqa: E402
 from protomotions.robot_configs.smplx import SMPLXRobotConfig  # noqa: E402
-from protomotions.robot_configs.base import ControlConfig, ControlType, ControlInfo
+from protomotions.robot_configs.base import ControlConfig, ControlInfo  # noqa: E402
 
 robot_cfg = SMPLXRobotConfig(
     control= ControlConfig(
@@ -102,6 +102,8 @@ print(f"Contact bodies: {robot_cfg.contact_bodies}")
 extra_simulator_params = {}
 if args.simulator == "isaaclab":
     app_launcher_flags = {"headless": args.headless, "device": str(device)}
+    if not args.headless:
+        app_launcher_flags["visualizer"] = ["kit"]
     app_launcher = AppLauncher(app_launcher_flags)
     simulation_app = app_launcher.app
     extra_simulator_params["simulation_app"] = simulation_app

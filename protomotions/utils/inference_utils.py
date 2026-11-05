@@ -41,6 +41,13 @@ def apply_all_inference_overrides(
         args: Optional command line arguments
     """
 
+    # Keep the training default disabled, but make the J-key perturbation
+    # available during inference. Experiment and CLI overrides can select the
+    # pool size explicitly, including zero.
+    projectile_config = getattr(simulator_config, "projectile", None)
+    if projectile_config is not None and projectile_config.num_projectiles == 0:
+        projectile_config.num_projectiles = 1
+
     # Apply experiment-specific inference overrides if available
     if experiment_module is not None and args is not None:
         apply_inference_overrides_fn = getattr(

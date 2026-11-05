@@ -147,6 +147,14 @@ For temporary overrides, use a new experiment name.
 """
 
 
+def positive_int(value):
+    """Parse a strictly positive integer CLI value."""
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
 def create_parser():
     """Create and configure the argument parser."""
     parser = argparse.ArgumentParser(
@@ -212,6 +220,12 @@ def create_parser():
         help="Enable Weights & Biases logging",
     )
     parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default="physical_animation",
+        help="Weights & Biases project name",
+    )
+    parser.add_argument(
         "--use-slurm",
         action="store_true",
         default=False,
@@ -240,11 +254,21 @@ def create_parser():
         default=False,
         help="Enable deterministic PyTorch operations",
     )
-    parser.add_argument(
+    training_limit_group = parser.add_mutually_exclusive_group()
+    training_limit_group.add_argument(
         "--training-max-steps",
         type=int,
         default=10000000000000,
         help="Maximum number of training steps. Default to 'loads of steps'.",
+    )
+    training_limit_group.add_argument(
+        "--training-max-iterations",
+        type=positive_int,
+        default=None,
+        help=(
+            "Maximum number of complete training iterations. Each iteration "
+            "collects one rollout and performs its optimization updates."
+        ),
     )
     parser.add_argument(
         "--overrides",
@@ -266,6 +290,10 @@ def create_parser():
 
 # Parse arguments first (argparse is safe, doesn't import torch)
 import argparse  # noqa: E402
+import faulthandler  # noqa: E402
+
+faulthandler.enable()
+
 from protomotions.utils.cli_utils import parse_bool  # noqa: E402
 
 parser = create_parser()
@@ -280,13 +308,16 @@ AppLauncher = import_simulator_before_torch(args.simulator)
 # Now safe to import everything else including torch
 from pathlib import Path  # noqa: E402
 import logging  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
+
 from protomotions.utils.hydra_replacement import get_class  # noqa: E402
 import importlib.util  # noqa: E402
 import shutil  # noqa: E402
 import wandb  # noqa: E402
 from lightning.pytorch.loggers import WandbLogger  # noqa: E402
 import torch  # noqa: E402
-from utils.torch_utils import seeding  # noqa: E402
+from protomotions.utils.torch_utils import seeding  # noqa: E402
 from dataclasses import asdict  # noqa: E402
 from protomotions.utils.config_utils import clean_dict_for_storage, make_json_serializable  # noqa: E402
 
@@ -358,11 +389,35 @@ def load_experiment_module(experiment_path):
 
     log.info(f"Loading experiment module from: {experiment_path}")
 
-    # Ensure the repo root is on sys.path so that experiment configs can import
-    # from sibling packages (e.g. `from examples.experiments.mimic... import ...`).
-    repo_root = str(Path(__file__).resolve().parent.parent)
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
+    # Ensure the experiment file's own project root is on sys.path so that
+    # experiment configs can import sibling packages (e.g.
+    # `from examples.experiments.mimic... import ...`).
+    #
+    # For an installed (non-editable) distribution, the package parent is
+    # site-packages and contains no `examples/`, so anchoring only there breaks
+    # every downstream user who keeps experiments outside the ProtoMotions
+    # source tree. Walk up from the experiment file to find the directory that
+    # actually owns it, and fall back to the package parent + cwd.
+    # Only the owning project root goes on sys.path (examples/ and
+    # examples/experiments/ are regular packages with __init__.py, so the
+    # intermediate directories are unnecessary and putting them ahead of the
+    # stdlib would let an experiment file shadow a real module).
+    project_root = next(
+        (
+            ancestor
+            for ancestor in experiment_path.resolve().parents
+            if (ancestor / "examples").is_dir()
+            or (ancestor / "pyproject.toml").is_file()
+        ),
+        None,
+    )
+    if project_root is not None and str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
+    # Fallbacks, appended so they cannot shadow anything already importable.
+    for fallback in (Path(__file__).resolve().parent.parent, Path.cwd()):
+        if str(fallback) not in sys.path:
+            sys.path.append(str(fallback))
 
     spec = importlib.util.spec_from_file_location("experiment_module", experiment_path)
     experiment_module = importlib.util.module_from_spec(spec)
@@ -504,6 +559,58 @@ def try_log_hyperparams_to_wandb(
                 log.warning(f"Could not log hyperparams to wandb (non-critical): {e}")
 
 
+def build_wandb_logger_config(args, save_dir, wandb_id):
+    """Build the WandB logger configuration from CLI arguments."""
+    return {
+        "_target_": "lightning.pytorch.loggers.WandbLogger",
+        "name": args.experiment_name,
+        "save_dir": save_dir,
+        "project": args.wandb_project,
+        "tags": None,
+        "group": None,
+        "id": wandb_id,
+        "entity": None,
+        "resume": "allow",
+    }
+
+
+def apply_training_iteration_limit(args, agent_config):
+    """Apply the optional CLI iteration limit to a freshly built agent config."""
+    max_iterations = args.training_max_iterations
+    if max_iterations is not None:
+        agent_config.training_max_iterations = max_iterations
+
+
+def load_motion_shard_cycle(checkpoint_path: Path) -> int:
+    """Read the required packaged-motion shard cycle from a training checkpoint."""
+    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    motion_shard_cycle = state_dict["motion_shard_cycle"]
+    if type(motion_shard_cycle) is not int:
+        raise TypeError("motion_shard_cycle must be a plain Python int")
+    return motion_shard_cycle
+
+
+def resolve_resume_motion_shard_cycle(fabric, checkpoint_path: Path, motion_lib_config) -> int:
+    """Restore a switching run's shard cycle before constructing components."""
+    from protomotions.agents.utils.distributed import raise_if_any_rank_failed
+    from protomotions.components.motion_lib import MotionFileSwitchMode
+
+    if motion_lib_config.motion_file_switch_mode is MotionFileSwitchMode.FIXED:
+        return 0
+
+    motion_shard_cycle = 0
+    load_error = None
+    if fabric.global_rank == 0:
+        try:
+            motion_shard_cycle = load_motion_shard_cycle(checkpoint_path)
+        except Exception as error:
+            load_error = error
+    raise_if_any_rank_failed(
+        load_error, "Motion shard cycle checkpoint load", fabric.device
+    )
+    return fabric.broadcast(motion_shard_cycle)
+
+
 def main():
     global parser, args
     torch.set_float32_matmul_precision("high")
@@ -549,6 +656,7 @@ def main():
         motion_lib_config = resolved_configs["motion_lib"]
         env_config = resolved_configs["env"]
         agent_config = resolved_configs["agent"]
+        motion_lib_config.validate()
 
         args.checkpoint = checkpoint_path
         experiment_module = (
@@ -616,6 +724,8 @@ def main():
         env_config = configs["env"]
         agent_config = configs["agent"]
 
+        apply_training_iteration_limit(args, agent_config)
+
         # Apply CLI overrides (highest priority)
         # NOTE: These overrides are saved to resolved_configs.pt and become permanent!
         # True resume will use these overridden values.
@@ -640,6 +750,14 @@ def main():
                     motion_lib_config=motion_lib_config,
                     scene_lib_config=scene_lib_config,
                 )
+
+        motion_lib_config.validate()
+
+    # IsaacLab 3 uses xyzw quaternions. Old resolved configs may still carry
+    # the IsaacLab 2 wxyz flag, including true resume checkpoints.
+    if args.simulator == "isaaclab" and hasattr(simulator_config, "w_last") and not simulator_config.w_last:
+        log.info("Overriding w_last=False -> True for IsaacLab 3 (xyzw quaternions)")
+        simulator_config.w_last = True
 
     # ===================================================================
     # 2b. Create Config Only Mode: Save configs and exit early
@@ -668,25 +786,13 @@ def main():
     ]
 
     if args.use_wandb:
-        loggers.append(
-            {
-                "_target_": "lightning.pytorch.loggers.WandbLogger",
-                "name": args.experiment_name,
-                "save_dir": save_dir,
-                "project": "physical_animation",
-                "tags": None,
-                "group": None,
-                "id": wandb_id,
-                "entity": None,
-                "resume": "allow",
-            }
-        )
+        loggers.append(build_wandb_logger_config(args, save_dir, wandb_id))
 
     callbacks = []
     if args.use_slurm:
         callbacks.append(
             {
-                "_target_": "agents.callbacks.slurm_autoresume_srun.AutoResumeCallbackSrun",
+                "_target_": "protomotions.agents.callbacks.slurm_autoresume_srun.AutoResumeCallbackSrun",
                 "autoresume_after": 12600,
             }
         )
@@ -711,6 +817,8 @@ def main():
     simulator_extra_params = {}
     if args.simulator == "isaaclab":
         app_launcher_flags = {"headless": args.headless, "device": str(fabric.device)}
+        if not args.headless:
+            app_launcher_flags["visualizer"] = ["kit"]
         if fabric.world_size > 1:
             # This is needed when running with SLURM.
             # When launching multi-GPU/node jobs without SLURM, or differently, maybe this needs to be adapted accordingly.
@@ -731,7 +839,11 @@ def main():
         import omni.log
 
         _omni_log = omni.log.get_log()
-        for _channel in ["omni.physx.plugin", "isaaclab.sim.utils"]:
+        for _channel in [
+            "omni.physx.plugin",
+            "omni.physx.tensors.plugin",
+            "isaaclab.sim.utils",
+        ]:
             _omni_log.set_channel_enabled(
                 _channel, False, omni.log.SettingBehavior.OVERRIDE
             )
@@ -740,6 +852,12 @@ def main():
         rank = fabric.global_rank if fabric.global_rank is not None else 0
         fabric.seed_everything(args.seed + rank)
         seeding(args.seed + rank, torch_deterministic=args.torch_deterministic)
+
+    motion_shard_cycle = 0
+    if mode == "resume":
+        motion_shard_cycle = resolve_resume_motion_shard_cycle(
+            fabric, checkpoint_path, motion_lib_config
+        )
 
     # ===================================================================
     # 5. Create Environment and Agent
@@ -786,6 +904,7 @@ def main():
         robot_config=robot_config,
         device=fabric.device,
         save_dir=save_dir_for_weights,
+        motion_shard_cycle=motion_shard_cycle,
         **simulator_extra_params,  # simulation_app for IsaacLab
     )
 

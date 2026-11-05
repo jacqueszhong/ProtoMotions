@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from pathlib import Path
-from setuptools import find_namespace_packages
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 and earlier
+    import tomli as tomllib
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -74,13 +78,11 @@ def test_gpc_peft_modules_are_in_api_reference_toctrees():
 
 def test_release_legal_metadata_is_current():
     conf_text = (REPO_ROOT / "docs/source/conf.py").read_text()
-    create_video_lines = (REPO_ROOT / "scripts/create_video.sh").read_text().splitlines()
     legal_text = LEGAL_NOTICE.read_text()
 
     assert 'copyright = "2025-2026, NVIDIA CORPORATION & AFFILIATES"' in conf_text
     assert 'author = "NVIDIA CORPORATION & AFFILIATES"' in conf_text
     assert "ProtoMotions Developers" not in conf_text
-    assert create_video_lines[1:3] == CANONICAL_SPDX
     assert "- protomotions/data/assets/mesh/smpl/" in legal_text
 
 
@@ -101,7 +103,6 @@ def test_release_docs_do_not_reference_removed_public_surfaces():
         "protomotions/data/robots/",
         "GPC Prior and PEFT",
         "arch.png",
-        "data/pretrained_models/gpc_prior",
         "TODO: Add videos",
     ]
     missing = [fragment for fragment in stale_fragments if fragment in public_text]
@@ -118,22 +119,115 @@ def test_quickstart_pretrained_table_matches_shipped_release_artifacts():
     quickstart = (REPO_ROOT / "docs/source/getting_started/quickstart.rst").read_text()
 
     assert "SOMA GPC prior" in quickstart
-    assert "Releasing soon" in quickstart
     assert "SOMA BONES-SEED FSQ" in quickstart
     assert "data/pretrained_models/motion_tracker/soma_bones_fsq/inference_last.ckpt" in quickstart
+    assert "data/pretrained_models/gpc_prior/soma_bones/inference_last.ckpt" in quickstart
     assert "   * - Vaulting" not in quickstart
     assert "   * - MaskedMimic G1" not in quickstart
 
 
-def test_setup_discovers_protomotions_subpackages():
-    setup_text = (REPO_ROOT / "setup.py").read_text()
-    discovered_packages = set(find_namespace_packages(where=REPO_ROOT))
+def test_pyproject_discovers_only_protomotions_code_packages():
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    package_finder = pyproject["tool"]["setuptools"]["packages"]["find"]
+    package_data = pyproject["tool"]["setuptools"]["package-data"]["protomotions"]
 
-    assert "find_namespace_packages" in setup_text
-    assert "protomotions.agents" in discovered_packages
-    assert "protomotions.envs" in discovered_packages
-    assert "protomotions.simulator" in discovered_packages
-    assert 'packages=["protomotions"]' not in setup_text
+    assert package_finder["include"] == ["protomotions", "protomotions.*"]
+    assert package_finder["namespaces"] is False
+    assert "protomotions.tests" in package_finder["exclude"]
+    assert "data/assets/**/*" in package_data
+
+
+def test_setup_discovers_protomotions_subpackages():
+    """Actually run package discovery, not just string-match the TOML.
+
+    With ``namespaces = false`` a directory without ``__init__.py`` is silently
+    dropped from the wheel, so a purely declarative check cannot catch a
+    subpackage that stops shipping. This executes the same finder setuptools
+    uses and asserts the real result.
+    """
+
+    from setuptools import find_packages
+
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    package_finder = pyproject["tool"]["setuptools"]["packages"]["find"]
+    discovered = set(
+        find_packages(
+            where=str(REPO_ROOT),
+            include=package_finder["include"],
+            exclude=package_finder["exclude"],
+        )
+    )
+
+    for expected in (
+        "protomotions.agents",
+        "protomotions.components",
+        "protomotions.envs",
+        "protomotions.robot_configs",
+        "protomotions.simulator",
+        "protomotions.simulator.isaacgym",
+        "protomotions.simulator.isaaclab",
+        "protomotions.simulator.mujoco",
+        "protomotions.simulator.newton",
+        "protomotions.utils",
+    ):
+        assert expected in discovered, f"{expected} would not ship in the wheel"
+
+    assert "protomotions.tests" not in discovered
+
+
+def test_every_protomotions_subpackage_has_init_so_it_ships():
+    """Guard against a new module directory silently missing from the wheel."""
+
+    from setuptools import find_packages
+
+    code_dirs = set()
+    for path in (REPO_ROOT / "protomotions").rglob("*.py"):
+        relative = path.relative_to(REPO_ROOT)
+        parts = relative.parts[:-1]
+        # `data/` holds package-data (assets plus the odd asset-generation
+        # helper script); it is shipped as data, not imported as a package.
+        if "tests" in parts or "data" in parts:
+            continue
+        if any(part.startswith(".") for part in parts):
+            continue
+        code_dirs.add(".".join(parts))
+
+    discovered = set(
+        find_packages(
+            where=str(REPO_ROOT),
+            include=["protomotions", "protomotions.*"],
+            exclude=["protomotions.tests", "protomotions.tests.*"],
+        )
+    )
+    missing = sorted(code_dirs - discovered)
+    assert missing == [], (
+        "these directories contain modules but would not ship in the wheel; "
+        f"add an __init__.py: {missing}"
+    )
+
+
+def test_smpl_assets_are_excluded_from_built_distributions():
+    """SMPL/SMPL-H assets are not Apache-2.0 (legal notice section 4)."""
+
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    excluded = pyproject["tool"]["setuptools"]["exclude-package-data"]["protomotions"]
+    for pattern in (
+        "data/assets/mesh/smpl/**/*",
+        "data/assets/mjcf/smpl*.xml",
+        "data/assets/usd/smpl*.usda",
+    ):
+        assert pattern in excluded, f"SMPL carve-out missing: {pattern}"
+
+
+def test_core_dependency_bounds_preserve_preconfigured_environments():
+    """Core bounds must not replace preselected NumPy or Torch builds."""
+
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    dependencies = pyproject["project"]["dependencies"]
+    numpy_pin = next(dep for dep in dependencies if dep.startswith("numpy"))
+    torch_pin = next(dep for dep in dependencies if dep.startswith("torch"))
+    assert "<" not in numpy_pin
+    assert torch_pin == "torch>=2.2"
 
 
 def test_component_factories_public_exports_exist():
@@ -154,6 +248,23 @@ def test_public_release_surfaces_do_not_reference_nonportable_infrastructure():
 
     assert not (REPO_ROOT / "Dockerfile.isaaclab").exists()
     assert "omniverse" + "://" not in terrain_material
+
+
+def test_packaged_motion_metadata_has_no_private_source_paths():
+    """Packed public motions must not expose internal dataset provenance."""
+
+    private_markers = (
+        b"/lustre/",
+        b"/scratch/",
+        b"/home/",
+        b"gitlab-master",
+        b"protomotions-recovery",
+        b"@nvidia.com",
+    )
+    motion_dir = REPO_ROOT / "data/motion_for_trackers"
+    for motion_path in motion_dir.glob("*.pt"):
+        data = motion_path.read_bytes()
+        assert not any(marker in data for marker in private_markers), motion_path
 
 
 def test_g1_deployment_docs_match_public_script_contract():

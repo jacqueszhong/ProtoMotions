@@ -6,6 +6,7 @@ import torch
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 
+from protomotions.assets import resolve_asset_root
 from protomotions.simulator.base_simulator.simulator import Simulator
 from protomotions.simulator.base_simulator.config import (
     MarkerState,
@@ -22,9 +23,18 @@ from protomotions.simulator.base_simulator.simulator_state import (
     ResetState,
 )
 from protomotions.simulator.newton.config import NewtonSimulatorConfig
+from protomotions.utils import rotations
 from protomotions.simulator.newton.contact_utils import (
     get_contact_sensor_body_patterns,
     validate_contact_sensor_match,
+)
+from protomotions.simulator.base_simulator.utils import (
+    get_friction_bucket_count,
+    get_friction_table,
+    scale_inertia_for_mass_change,
+)
+from protomotions.simulator.newton.randomization_utils import (
+    move_friction_tables_to_device,
 )
 import warp as wp
 import newton
@@ -129,10 +139,17 @@ class NewtonSimulator(Simulator):
 
     def _create_simulation(self) -> None:
         """Create the Newton simulation environment."""
+        # ModelBuilder.finalize() and other Newton allocations use Warp's current
+        # device when no explicit device is provided. Each distributed process has
+        # its own rank-local Torch device, so keep Warp on that same device before
+        # creating any simulation state.
+        wp.set_device(str(self.device))
+
         self._create_envs()
         self._zero_passive_forces()
         self._setup_robot()
         self._setup_sim()
+        self._setup_markers(self._visualization_markers)
         if self.robot_config.contact_bodies is not None:
             self._setup_contact_sensors()
         self._create_contacts()
@@ -142,7 +159,19 @@ class NewtonSimulator(Simulator):
         self.graph = None
         self.use_cuda_graph = False
 
-        if wp.get_device().is_cuda and wp.is_mempool_enabled(wp.get_device()):
+        warp_device = wp.get_device()
+        if not warp_device.is_cuda:
+            no_cuda_graph_reason = "Warp device is not CUDA"
+        elif not wp.is_mempool_enabled(warp_device):
+            no_cuda_graph_reason = "Warp memory pool is disabled"
+        elif self._max_action_latency_ms > 0.0:
+            no_cuda_graph_reason = (
+                "action latency randomization requires per-substep control updates"
+            )
+        else:
+            no_cuda_graph_reason = None
+
+        if no_cuda_graph_reason is None:
             print(f"[INFO] Using CUDA graph ({self.control_type.name})")
             self.use_cuda_graph = True
             zeros = torch.zeros(
@@ -166,7 +195,10 @@ class NewtonSimulator(Simulator):
                 self._simulate()
             self.graph = capture.graph
         else:
-            print(f"[INFO] {self.control_type.name} mode (no CUDA graph)")
+            print(
+                f"[INFO] {self.control_type.name} mode "
+                f"(no CUDA graph: {no_cuda_graph_reason})"
+            )
 
     def _create_envs(self) -> None:
         """Creates environments and loads robot assets.
@@ -174,7 +206,7 @@ class NewtonSimulator(Simulator):
         Follows the Newton G1 example pattern: configure joint properties
         on the builder BEFORE finalize, then use replicate() for multi-env.
         """
-        asset_root = self.robot_config.asset.asset_root
+        asset_root = resolve_asset_root(self.robot_config.asset.asset_root)
         asset_file = self.robot_config.asset.asset_file_name
         asset_path = os.path.join(asset_root, asset_file)
 
@@ -210,7 +242,11 @@ class NewtonSimulator(Simulator):
         for i in range(self._proj_config.num_projectiles):
             s = proj_sizes[i]
             xform = wp.transform(
-                (0.0, 0.0, self._proj_config.hide_z),
+                (
+                    float(i),
+                    float(i),
+                    self._proj_config.hidden_z_for_index(i),
+                ),
                 (0.0, 0.0, 0.0, 1.0),
             )
             body = self.robot.add_body(xform=xform)
@@ -366,7 +402,7 @@ class NewtonSimulator(Simulator):
         self.robot_view = ArticulationView(
             self.model,
             pattern="robot",
-            include_joints=self._newton_dof_names.keys(),
+            include_joints=list(self._newton_dof_names.keys()),
             include_links=self._body_names,
         )
 
@@ -523,12 +559,16 @@ class NewtonSimulator(Simulator):
             current_friction = wp.to_torch(mu_wp)
             current_restitution = wp.to_torch(rest_wp)
 
-            # Get body indices that should be randomized
-            body_indices = self._domain_randomization["friction"]["body_indices"]
-            static_friction = self._domain_randomization["friction"]["static_friction"]
-            restitution = self._domain_randomization["friction"]["restitution"]
-
-            num_buckets = static_friction.shape[0] if static_friction is not None else 0
+            # Get body indices that should be randomized. The bucket tables are
+            # sampled on CPU by the base simulator; move them to the simulation
+            # device so they can be indexed with on-device bucket ids below.
+            friction_dr = move_friction_tables_to_device(
+                self._domain_randomization["friction"], current_friction.device
+            )
+            body_indices = friction_dr["body_indices"]
+            friction_table = get_friction_table(friction_dr)
+            restitution = friction_dr.get("restitution")
+            num_buckets = get_friction_bucket_count(friction_dr)
 
             if num_buckets > 0:
                 # Build body name → local shape indices mapping via ArticulationView
@@ -551,8 +591,8 @@ class NewtonSimulator(Simulator):
                     )
 
                     # Vectorized assignment across all envs at once
-                    if static_friction is not None:
-                        friction_values = static_friction[bucket_ids, idx]
+                    if friction_table is not None:
+                        friction_values = friction_table[bucket_ids, idx]
                         current_friction[:, 0, local_shape_indices] = (
                             friction_values.unsqueeze(1)
                         )
@@ -608,24 +648,61 @@ class NewtonSimulator(Simulator):
                 f"[INFO] Applied center of mass domain randomization to {len(body_indices)} body types"
             )
 
+        if "body_mass" in self._domain_randomization:
+            body_mass = self._domain_randomization["body_mass"]
+            mass_wp = self.robot_view.get_attribute("body_mass", self.model)
+            current_mass = wp.to_torch(mass_wp)
+            inertia_wp = self.robot_view.get_attribute("body_inertia", self.model)
+            current_inertia = wp.to_torch(inertia_wp)
+            link_name_to_idx = {
+                name: i for i, name in enumerate(self.robot_view.link_names)
+            }
+            num_buckets = body_mass["mass"].shape[0]
+            for idx, local_body_idx in enumerate(body_mass["body_indices"]):
+                body_name = self._body_names[local_body_idx]
+                link_idx = link_name_to_idx.get(body_name)
+                if link_idx is None:
+                    raise ValueError(
+                        f"Body mass randomization body '{body_name}' is not present in Newton."
+                    )
+                bucket_ids = torch.randint(
+                    0, num_buckets, (self.num_envs,), device=self.device
+                )
+                values = body_mass["mass"][bucket_ids, idx].to(current_mass.device)
+                if current_mass.ndim == 3:
+                    old_values = current_mass[:, 0, link_idx].clone()
+                    current_mass[:, 0, link_idx] = values
+                    current_inertia[:, 0, link_idx] = scale_inertia_for_mass_change(
+                        current_inertia[:, 0, link_idx], values / old_values
+                    )
+                else:
+                    old_values = current_mass[:, link_idx].clone()
+                    current_mass[:, link_idx] = values
+                    current_inertia[:, link_idx] = scale_inertia_for_mass_change(
+                        current_inertia[:, link_idx], values / old_values
+                    )
+
+            self.robot_view.set_attribute("body_mass", self.model, mass_wp)
+            self.robot_view.set_attribute("body_inertia", self.model, inertia_wp)
+            notify_flags |= SolverNotifyFlags.BODY_INERTIAL_PROPERTIES
+            print(
+                f"[INFO] Applied body mass domain randomization to {len(body_mass['body_indices'])} body types"
+            )
+
         # Notify solver of changes so MuJoCo updates its internal model
         if notify_flags != 0:
             self.solver.notify_model_changed(notify_flags)
 
     def _set_robot_friction_to_terrain(self) -> None:
-        """Set robot shape friction/restitution to terrain values as baseline.
+        """Set robot shape friction to its configured baseline.
 
-        This ensures a consistent friction floor before domain randomization.
-        DR will override with randomized values for specific bodies if configured.
+        Domain randomization overrides the configured friction for selected bodies
+        when enabled. Terrain restitution remains the baseline for compatibility
+        with the existing Newton material setup.
 
         Uses ArticulationView get/set_attribute API (not direct model.assign)
         to ensure Newton's internal solver state stays consistent.
         """
-        if self.terrain is None:
-            return
-
-        terrain_friction = self.terrain.sim_config.static_friction
-        terrain_restitution = self.terrain.sim_config.restitution
 
         # Get robot shape materials via ArticulationView (scoped to robot only)
         mu_wp = self.robot_view.get_attribute("shape_material_mu", self.model)
@@ -635,13 +712,15 @@ class NewtonSimulator(Simulator):
 
         # Modify values via torch (writes through to underlying warp memory)
         mu_torch = wp.to_torch(mu_wp)
-        rest_torch = wp.to_torch(rest_wp)
-        mu_torch[:] = terrain_friction
-        rest_torch[:] = terrain_restitution
+        mu_torch[:] = self.config.default_robot_friction
+        if self.terrain is not None and self.terrain.sim_config is not None:
+            rest_torch = wp.to_torch(rest_wp)
+            rest_torch[:] = self.terrain.sim_config.restitution
 
         # Write back through ArticulationView
         self.robot_view.set_attribute("shape_material_mu", self.model, mu_wp)
-        self.robot_view.set_attribute("shape_material_restitution", self.model, rest_wp)
+        if self.terrain is not None and self.terrain.sim_config is not None:
+            self.robot_view.set_attribute("shape_material_restitution", self.model, rest_wp)
         self.solver.notify_model_changed(SolverNotifyFlags.SHAPE_PROPERTIES)
 
     def _get_sim_body_ordering(self) -> SimBodyOrdering:
@@ -662,8 +741,43 @@ class NewtonSimulator(Simulator):
     def _setup_markers(
         self, visualization_markers: Dict[str, VisualizationMarkerConfig]
     ) -> None:
-        """Setup visualization markers."""
-        return
+        """Build and cache per-marker rendering metadata.
+
+        Newton's viewer has no native marker/arrow primitive, so spheres are
+        rendered via ``viewer.log_points`` (per-instance radius) and arrows are
+        approximated as a line segment along each marker's local +X axis via
+        ``viewer.log_lines`` (same idiom Newton's own contact-normal viz uses).
+        """
+        self._visualization_markers = {}
+        if visualization_markers is None or self.viewer is None:
+            return
+
+        for marker_name, markers_cfg in visualization_markers.items():
+            if markers_cfg.type not in ("sphere", "arrow"):
+                raise ValueError(f"Marker type {markers_cfg.type} not supported")
+
+            scale_list = []
+            for marker in markers_cfg.markers:
+                if markers_cfg.type == "sphere":
+                    if marker.size == "tiny":
+                        scale_list.append(0.007)
+                    elif marker.size == "small":
+                        scale_list.append(0.01)
+                    else:
+                        scale_list.append(0.05)
+                else:  # arrow
+                    scale_list.append(0.1 if marker.size == "small" else 0.5)
+
+            if len(scale_list) == 0:
+                continue
+
+            self._visualization_markers[marker_name] = {
+                "type": markers_cfg.type,
+                "color": markers_cfg.color,
+                "scale": torch.tensor(
+                    scale_list, device=self.device, dtype=torch.float32
+                ).repeat(self.num_envs),
+            }
 
     @staticmethod
     def _get_contact_sensor_body_patterns(body_name: str) -> List[str]:
@@ -726,6 +840,13 @@ class NewtonSimulator(Simulator):
         """Run physics simulation for one frame (decimation substeps)."""
         for _ in range(self.decimation):
             self.state_0.clear_forces()
+            if self._max_action_latency_ms > 0.0:
+                if self.control_type == ControlType.BUILT_IN_PD:
+                    self._apply_control()
+                else:
+                    actions = self._get_actions_for_physics_step()
+                    self._apply_newton_control(actions)
+                    self._advance_action_latency()
             if self.control_type == ControlType.PROPORTIONAL:
                 self._apply_pd_kernel(self.state_0)
             elif self.control_type == ControlType.TORQUE:
@@ -761,10 +882,25 @@ class NewtonSimulator(Simulator):
     def _physics_step(self) -> None:
         """Performs a physics simulation step."""
         # Update control targets before simulation
-        if self.control_type == ControlType.BUILT_IN_PD:
-            self._apply_control()
-        elif self.control_type == ControlType.PROPORTIONAL:
-            pd_tar = self._action_to_pd_targets(self._common_actions)
+        if self._max_action_latency_ms == 0.0:
+            if self.control_type == ControlType.BUILT_IN_PD:
+                self._apply_control()
+            else:
+                self._apply_newton_control(self._common_actions)
+
+        # Run simulation
+        if self.use_cuda_graph:
+            wp.capture_launch(self.graph)
+        else:
+            self._simulate()
+
+        self._update_contact_sensors()
+        self.sim_time += self.frame_dt
+
+    def _apply_newton_control(self, actions: torch.Tensor) -> None:
+        """Update Newton's explicit control buffers for one action."""
+        if self.control_type == ControlType.PROPORTIONAL:
+            pd_tar = self._action_to_pd_targets(actions)
             if (
                 self._domain_randomization is not None
                 and "action_noise" in self._domain_randomization
@@ -775,7 +911,7 @@ class NewtonSimulator(Simulator):
             sim_targets = pd_tar[:, self.data_conversion.dof_convert_to_sim]
             self._update_pd_targets(sim_targets)
         elif self.control_type == ControlType.TORQUE:
-            torques = self._action_to_torque_targets(self._common_actions)
+            torques = self._action_to_torque_targets(actions)
             if (
                 self._domain_randomization is not None
                 and "action_noise" in self._domain_randomization
@@ -788,15 +924,6 @@ class NewtonSimulator(Simulator):
             )
             sim_torques = torques[:, self.data_conversion.dof_convert_to_sim]
             self._update_torques(sim_torques)
-
-        # Run simulation
-        if self.use_cuda_graph:
-            wp.capture_launch(self.graph)
-        else:
-            self._simulate()
-
-        self._update_contact_sensors()
-        self.sim_time += self.frame_dt
 
     def _set_simulator_env_state(
         self,
@@ -918,6 +1045,28 @@ class NewtonSimulator(Simulator):
         contact_binary = (force_magnitudes > force_threshold).float()
 
         return contact_binary
+
+    def park_envs(
+        self,
+        env_ids: torch.Tensor,
+        hide_z: float = -50.0,
+    ) -> None:
+        """No-op on Newton: evaluation env-parking is unnecessary and harmful.
+
+        The base implementation teleports inactive envs to ``hide_z`` to keep
+        their AABBs out of PhysX's broadphase pair budget. Newton replicates
+        environments as separate worlds with fixed per-world contact buffers,
+        so parking buys nothing here.
+
+        Worse, a parked robot free-falls with PD control still driving its
+        joints toward policy targets: energy is pumped in with no contact to
+        dissipate it, joint velocities diverge, and the resulting non-finite
+        values persist in solver warm-start memory — permanently poisoning the
+        parked envs even after their kinematic state is restored. Leaving
+        inactive envs simulating in place (exactly as they do during training)
+        is both safe and cheap.
+        """
+        return None
 
     def _get_simulator_bodies_state(
         self, env_ids: Optional[torch.Tensor] = None
@@ -1158,6 +1307,15 @@ class NewtonSimulator(Simulator):
 
         Newton uses xyzw quaternions natively — no conversion needed.
         """
+        # Keep hidden projectiles in distinct world-space slots. A throw has
+        # z > hide_z and therefore keeps its requested position.
+        positions = positions.clone()
+        hidden_mask = positions[:, 2] <= self._proj_config.hide_z
+        if hidden_mask.any():
+            hidden_env_offsets = env_ids[hidden_mask].to(positions.dtype)
+            positions[hidden_mask, 0] = hidden_env_offsets
+            positions[hidden_mask, 1] = hidden_env_offsets
+
         joint_q = wp.to_torch(self.state_0.joint_q)
         joint_qd = wp.to_torch(self.state_0.joint_qd)
 
@@ -1304,5 +1462,53 @@ class NewtonSimulator(Simulator):
     def _update_simulator_markers(
         self, markers_state: Optional[Dict[str, MarkerState]] = None
     ) -> None:
-        """Updates visualization markers."""
-        pass
+        """Updates visualization markers.
+
+        Args:
+            markers_state (Dict[str, MarkerState]): Dictionary mapping marker names to their state (translation and orientation, xyzw).
+        """
+
+        if markers_state is None or self.viewer is None:
+            return
+
+        for marker_name, markers_state_item in markers_state.items():
+            if markers_state_item.translation.numel() == 0:
+                continue
+            assert (
+                marker_name in self._visualization_markers
+            ), f"Marker {marker_name} passed to update_markers but not defined at instantiation"
+            marker_cfg = self._visualization_markers[marker_name]
+
+            translation = markers_state_item.translation.reshape(-1, 3).contiguous()
+            scale = marker_cfg["scale"]
+
+            if marker_cfg["type"] == "sphere":
+                points_wp = wp.from_torch(translation, dtype=wp.vec3)
+                radii_wp = wp.from_torch(scale.contiguous(), dtype=wp.float32)
+                colors = (
+                    torch.tensor(
+                        marker_cfg["color"], device=self.device, dtype=torch.float32
+                    )
+                    .repeat(translation.shape[0], 1)
+                    .contiguous()
+                )
+                colors_wp = wp.from_torch(colors, dtype=wp.vec3)
+                self.viewer.log_points(
+                    f"/markers/{marker_name}", points_wp, radii_wp, colors_wp
+                )
+            else:  # arrow
+                orientation = markers_state_item.orientation.reshape(-1, 4)
+                local_x = torch.zeros_like(translation)
+                local_x[:, 0] = 1.0
+                direction = rotations.quat_rotate(orientation, local_x, w_last=True)
+                ends = (translation + direction * scale.unsqueeze(-1)).contiguous()
+
+                starts_wp = wp.from_torch(translation, dtype=wp.vec3)
+                ends_wp = wp.from_torch(ends, dtype=wp.vec3)
+                self.viewer.log_lines(
+                    f"/markers/{marker_name}",
+                    starts_wp,
+                    ends_wp,
+                    marker_cfg["color"],
+                    width=0.2 * float(scale.mean()),
+                )

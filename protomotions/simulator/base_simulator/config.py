@@ -3,6 +3,7 @@
 
 """Configuration classes for base simulator and domain randomization."""
 
+import math
 from typing import Literal, Tuple, List, Dict, Optional, Any, Union
 import torch
 import re
@@ -120,6 +121,22 @@ class ActionNoiseDomainRandomizationConfig:
 
 
 @dataclass
+class LatencyDomainRandomizationConfig:
+    """Configuration for action latency randomization."""
+
+    max_latency_ms: float = field(
+        default=0.0,
+        metadata={
+            "help": "Maximum action latency in milliseconds. Zero disables randomization."
+        },
+    )
+
+    def __post_init__(self):
+        if not math.isfinite(self.max_latency_ms) or self.max_latency_ms < 0.0:
+            raise ValueError("max_latency_ms must be non-negative.")
+
+
+@dataclass
 class FrictionDomainRandomizationConfig:
     """Configuration for friction domain randomization."""
 
@@ -127,13 +144,13 @@ class FrictionDomainRandomizationConfig:
         default=10,
         metadata={"help": "Number of friction buckets for environments.", "min": 1},
     )
-    static_friction_range: Tuple[float, float] = field(
+    static_friction_range: Optional[Tuple[float, float]] = field(
         default=(0.5, 1.5), metadata={"help": "Range (min, max) for static friction."}
     )
-    dynamic_friction_range: Tuple[float, float] = field(
+    dynamic_friction_range: Optional[Tuple[float, float]] = field(
         default=(0.5, 1.5), metadata={"help": "Range (min, max) for dynamic friction."}
     )
-    restitution_range: Tuple[float, float] = field(
+    restitution_range: Optional[Tuple[float, float]] = field(
         default=(0.0, 0.1), metadata={"help": "Range (min, max) for restitution."}
     )
     body_names: Optional[List[str]] = field(
@@ -150,6 +167,65 @@ class FrictionDomainRandomizationConfig:
             raise ValueError("Only one of body_names or body_indices must be provided.")
         if self.body_names is None and self.body_indices is None:
             raise ValueError("Either body_names or body_indices must be provided.")
+
+
+@dataclass
+class BodyMassDomainRandomizationConfig:
+    """Configuration for robot rigid-body mass randomization.
+
+    ``mass_range`` contains absolute kilograms.  Log-uniform sampling is the
+    default because the useful range for small end-effectors spans orders of
+    magnitude (for example, 1 g through 1 kg).  Inertia tensors are scaled by
+    the same mass ratio by simulator backends that expose mutable inertias.
+    """
+
+    num_buckets: int = field(
+        default=10,
+        metadata={"help": "Number of mass buckets for environments.", "min": 1},
+    )
+    mass_range: Tuple[float, float] = field(
+        default=(1e-3, 1.0),
+        metadata={"help": "Absolute mass range in kilograms (min, max)."},
+    )
+    log_uniform: bool = field(
+        default=True,
+        metadata={"help": "Sample uniformly in log mass instead of linear mass."},
+    )
+    body_names: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "Body names to randomize (regex patterns)."},
+    )
+    body_indices: Optional[List[int]] = field(
+        default=None, metadata={"help": "Body indices to randomize."}
+    )
+
+    def __post_init__(self):
+        if self.num_buckets < 1:
+            raise ValueError("num_buckets must be at least 1.")
+        if self.body_names is not None and self.body_indices is not None:
+            raise ValueError("Only one of body_names or body_indices must be provided.")
+        if self.body_names is None and self.body_indices is None:
+            raise ValueError("Either body_names or body_indices must be provided.")
+        if len(self.mass_range) != 2:
+            raise ValueError("mass_range must contain exactly two values.")
+        mass_min, mass_max = self.mass_range
+        if not (math.isfinite(mass_min) and math.isfinite(mass_max)):
+            raise ValueError("mass_range values must be finite.")
+        if mass_min <= 0 or mass_min >= mass_max:
+            raise ValueError("mass_range must satisfy 0 < min < max.")
+
+    def sample(self, num_samples: int, num_bodies: int, device=None) -> torch.Tensor:
+        """Sample absolute masses with shape ``[num_samples, num_bodies]``."""
+
+        samples = torch.rand(num_samples, num_bodies, device=device)
+        mass_min, mass_max = self.mass_range
+        if self.log_uniform:
+            log_min = torch.log(torch.tensor(mass_min, device=device))
+            log_max = torch.log(torch.tensor(mass_max, device=device))
+            return torch.exp(
+                samples * (log_max - log_min) + log_min
+            )
+        return samples * (mass_max - mass_min) + mass_min
 
 
 @dataclass
@@ -477,7 +553,7 @@ class PushDomainRandomizationConfig:
 class ProjectileConfig:
     """Configuration for projectile cube throwing (J-key perturbation)."""
 
-    num_projectiles: int = 5
+    num_projectiles: int = 0
     cube_half_size_range: Tuple[float, float] = (0.05, 0.15)  # per-pool-index size
     density: float = 500.0  # kg/m^3
     speed_range: Tuple[float, float] = (30.0, 40.0)  # m/s (ASE uses 30-40)
@@ -489,6 +565,7 @@ class ProjectileConfig:
     direction_noise_std: float = 0.1  # std of Gaussian noise added to aim direction
     hide_delay: float = 2.0  # seconds before cube disappears
     hide_z: float = -2.0  # z-position when hidden
+    hide_spacing: float = 4.0  # z-spacing between hidden projectile slots
 
     def get_sizes(self) -> list:
         """Return per-pool-index half sizes, linearly interpolated."""
@@ -498,6 +575,10 @@ class ProjectileConfig:
             return [lo]
         return [lo + (hi - lo) * i / (n - 1) for i in range(n)]
 
+    def hidden_z_for_index(self, projectile_index: int) -> float:
+        """Return a hidden z-position that avoids projectile-projectile overlap."""
+        return self.hide_z - self.hide_spacing * projectile_index
+
 
 @dataclass
 class DomainRandomizationConfig:
@@ -506,8 +587,15 @@ class DomainRandomizationConfig:
     action_noise: Optional[ActionNoiseDomainRandomizationConfig] = field(
         default=None, metadata={"help": "Action noise configuration."}
     )
+    latency: Optional[LatencyDomainRandomizationConfig] = field(
+        default=None, metadata={"help": "Action latency randomization configuration."}
+    )
     friction: Optional[FrictionDomainRandomizationConfig] = field(
         default=None, metadata={"help": "Friction randomization configuration."}
+    )
+    body_mass: Optional[BodyMassDomainRandomizationConfig] = field(
+        default=None,
+        metadata={"help": "Robot rigid-body mass randomization configuration."},
     )
     center_of_mass: Optional[CenterOfMassDomainRandomizationConfig] = field(
         default=None, metadata={"help": "Center of mass randomization configuration."}
@@ -550,6 +638,13 @@ class SimulatorConfig:
         default=None,
         metadata={"help": "Quaternion format: True for xyzw, False for wxyz."},
     )
+    default_robot_friction: float = field(
+        default=1.0,
+        metadata={
+            "help": "Friction coefficient assigned to character collision shapes.",
+            "min": 0.0,
+        },
+    )
     headless: bool = field(
         default=None, metadata={"help": "Run without GUI visualization."}
     )
@@ -583,7 +678,7 @@ class SimulatorConfig:
         metadata={
             "help": (
                 "Projectile cube perturbation configuration (J-key throws). "
-                "Set num_projectiles=0 to disable projectiles."
+                "Training defaults to no projectiles; inference enables one."
             )
         },
     )
@@ -609,6 +704,16 @@ class SimulatorConfig:
         assert (
             self.experiment_name is not None
         ), "SimulatorConfig.experiment_name must be provided"
+        if (
+            self.domain_randomization is not None
+            and self.domain_randomization.latency is not None
+            and self.domain_randomization.latency.max_latency_ms
+            > 1000.0 * self.sim.decimation / self.sim.fps
+        ):
+            raise ValueError(
+                "max_latency_ms must not exceed one control interval "
+                "(1000 * sim.decimation / sim.fps milliseconds)."
+            )
 
 
 @dataclass

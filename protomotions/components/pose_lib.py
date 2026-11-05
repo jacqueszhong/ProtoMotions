@@ -243,7 +243,6 @@ def compute_body_density_weights(
     chain_distances = torch.zeros(num_bodies, num_bodies)
     for i in range(num_bodies):
         for j in range(i + 1, num_bodies):
-            i_ancestors = ancestor_dists[i]
             j_ancestors = ancestor_dists[j]
 
             # Find LCA
@@ -618,6 +617,11 @@ def extract_control_info(
 
         # Extract actuator force range if available
         effort_limit = getattr(joint, "actuatorfrcrange", DEFAULT_EFFORT_LIMIT)
+
+        # MJCF parsing can hand back stiffness as a one-element numpy array
+        # rather than a scalar; unwrap it before the float handling below.
+        if isinstance(stiffness, np.ndarray):
+            stiffness = stiffness.item()
 
         # Convert to float if they're strings (common in MJCF)
         if isinstance(stiffness, str):
@@ -1773,7 +1777,6 @@ if __name__ == "__main__":
         import os
 
         workspace_root = "."  # Adjust if needed
-        # mjcf_path = os.path.join(workspace_root, "protomotions/data/assets/mjcf/rigv1_humanoid.xml")
         # mjcf_path = os.path.join(workspace_root, "protomotions/data/assets/mjcf/g1.xml") # Example single-DOF per body
         mjcf_path = os.path.join(
             workspace_root, "protomotions/data/assets/mjcf/h1_2.xml"

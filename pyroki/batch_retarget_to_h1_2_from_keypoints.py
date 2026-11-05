@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from protomotions.utils.retargeting_fps import fps_from_mapping, subsampled_fps
+from protomotions.utils.retargeting_fps import fps_from_mapping, subsampled_fps  # noqa: E402
 
 H1_2_LINK_NAMES = None
 N_retarget = 15
@@ -89,7 +89,7 @@ def load_motion_data(
 
     Args:
         motion_path: Path to the motion file
-        source_type: Source type ('smpl' or 'rigv1')
+        source_type: Source type ('smpl' or 'soma')
         subsample_factor: Subsampling factor
         target_raw_frames: Target number of raw frames before subsampling
         fallback_input_fps: FPS to use for legacy keypoint files without metadata
@@ -225,7 +225,7 @@ def load_motion_data(
             [simplified_keypoints_root[:, None, :], simplified_keypoints], axis=1
         )
 
-    elif source_type == "rigv1":
+    elif source_type == "soma":
         simplified_keypoints_root = simplified_keypoints[:, 0, :]
         simplified_keypoints_local = (
             simplified_keypoints - simplified_keypoints_root[:, None, :]

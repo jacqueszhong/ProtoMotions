@@ -8,8 +8,11 @@ import torch
 
 from protomotions.simulator.base_simulator.config import (
     ActionNoiseDomainRandomizationConfig,
+    BodyMassDomainRandomizationConfig,
     CenterOfMassDomainRandomizationConfig,
+    DomainRandomizationConfig,
     FrictionDomainRandomizationConfig,
+    LatencyDomainRandomizationConfig,
     ProjectileConfig,
     PushDomainRandomizationConfig,
     RobotNoiseConfig,
@@ -90,10 +93,30 @@ def test_simulator_config_matching_and_domain_randomization_validation():
             ActionNoiseDomainRandomizationConfig(**kwargs)
 
     FrictionDomainRandomizationConfig(body_indices=[0])
+    assert LatencyDomainRandomizationConfig().max_latency_ms == 0.0
+    assert DomainRandomizationConfig().latency is None
+    with pytest.raises(ValueError, match="non-negative"):
+        LatencyDomainRandomizationConfig(max_latency_ms=-1.0)
     with pytest.raises(ValueError, match="Either body_names"):
         FrictionDomainRandomizationConfig()
     with pytest.raises(ValueError, match="Only one"):
         FrictionDomainRandomizationConfig(body_names=[".*"], body_indices=[0])
+
+    body_mass = BodyMassDomainRandomizationConfig(
+        num_buckets=64,
+        mass_range=(0.001, 1.0),
+        body_names=["left_rubber_hand", "right_rubber_hand"],
+    )
+    samples = body_mass.sample(128, 2)
+    assert samples.shape == (128, 2)
+    assert torch.all(samples >= 0.001)
+    assert torch.all(samples <= 1.0)
+    with pytest.raises(ValueError, match="0 < min < max"):
+        BodyMassDomainRandomizationConfig(mass_range=(0.0, 1.0), body_indices=[0])
+    with pytest.raises(ValueError, match="Either body_names"):
+        BodyMassDomainRandomizationConfig()
+    with pytest.raises(ValueError, match="Only one"):
+        BodyMassDomainRandomizationConfig(body_names=["hand"], body_indices=[0])
 
     CenterOfMassDomainRandomizationConfig(com_range={"x": (-0.1, 0.1)}, body_names=["torso"])
     with pytest.raises(ValueError, match="valid keys"):

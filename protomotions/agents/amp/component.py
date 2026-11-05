@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import inspect
 import logging
-from typing import Callable, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from tensordict import TensorDict
@@ -266,6 +266,7 @@ class AMPTrainingComponent:
             "motion_times": motion_times,
             "dt": self.agent.env.simulator.dt,
             "num_state_history_steps": self.agent.env.config.num_state_history_steps,
+            "anchor_body_index": self.agent.env.robot_config.anchor_body_index,
             "contact_body_ids": getattr(self.agent.env, "contact_body_ids", None),
         }
 

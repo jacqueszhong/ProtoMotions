@@ -99,10 +99,33 @@ def create_parser():
         "--scenes-file", type=str, default=None, help="Path to scenes file (optional)"
     )
     parser.add_argument(
+        "--log-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory for IsaacLab artifacts. When set (isaaclab only), the resolved "
+            "SimulationCfg/SceneCfg are exported to <log-dir>/params/env.yaml in "
+            "IsaacLab workflow format, and IsaacLab's own text log is written there "
+            "instead of the temp directory."
+        ),
+    )
+    parser.add_argument(
         "--overrides",
         nargs="*",
         default=[],
         help="Config overrides in format key=value (e.g., env.max_episode_length=5000 simulator.headless=True)",
+    )
+    parser.add_argument(
+        "--record-video",
+        action="store_true",
+        default=False,
+        help="Record the viewport to output/renderings/*.mp4 (needs a window; not headless)",
+    )
+    parser.add_argument(
+        "--record-steps",
+        type=int,
+        default=600,
+        help="Environment steps to run when --record-video is set",
     )
     parser.add_argument(
         "--command-source",
@@ -293,6 +316,7 @@ def main():
     if args.motion_file is not None:
         log.info(f"CLI override: motion_file = {args.motion_file}")
         motion_lib_config.motion_file = args.motion_file  # Always present
+        motion_lib_config.motion_file_shard_indices = None
 
     if args.scenes_file is not None:
         # Normalise "None"/"null" strings to actual None (disable scenes)
@@ -315,6 +339,16 @@ def main():
     if args.headless is not None:
         log.info(f"CLI override: headless = {args.headless}")
         simulator_config.headless = args.headless
+
+    if args.log_dir is not None:
+        if args.simulator == "isaaclab":
+            log.info(f"CLI override: log_dir = {args.log_dir}")
+            simulator_config.log_dir = args.log_dir
+        else:
+            log.warning(
+                f"--log-dir is only supported by the isaaclab simulator, ignoring it "
+                f"for '{args.simulator}'"
+            )
 
     # Parse and apply general CLI overrides
     from protomotions.utils.config_utils import (
@@ -340,6 +374,8 @@ def main():
         log.info(f"CLI override: command_source = {args.command_source}")
         apply_command_source_overrides(env_config, args.command_source)
 
+    motion_lib_config.validate()
+
     # Create fabric config for inference (simplified)
     # MuJoCo is CPU-only, so force CPU accelerator
     accelerator = "cpu" if args.simulator == "mujoco" else "gpu"
@@ -356,7 +392,15 @@ def main():
     # Setup IsaacLab simulation_app if using IsaacLab simulator
     simulator_extra_params = {}
     if args.simulator == "isaaclab":
+        # Old checkpoints may still have w_last=False from IsaacLab 2.x.
+        if hasattr(simulator_config, "w_last") and not simulator_config.w_last:
+            log.info(
+                "Overriding w_last=False -> True for IsaacLab 3 (xyzw quaternions)"
+            )
+            simulator_config.w_last = True
         app_launcher_flags = {"headless": args.headless, "device": str(fabric.device)}
+        if not args.headless:
+            app_launcher_flags["visualizer"] = ["kit"]
         app_launcher = AppLauncher(app_launcher_flags)
         simulator_extra_params["simulation_app"] = app_launcher.app
 
@@ -456,6 +500,20 @@ def main():
             if evaluated_score is not None:
                 print(f"  Overall Score: {evaluated_score:.6f}")
             print("=" * 60 + "\n")
+        elif args.record_video:
+            if headless:
+                raise SystemExit("--record-video requires a window; drop --headless")
+            sim = env.simulator
+            # Same state the "L" key sets; render() picks it up
+            sim._toggle_video_record()
+            try:
+                agent.evaluator.simple_test_policy(
+                    collect_metrics=True, max_steps=args.record_steps
+                )
+            finally:
+                # Next render() finalizes the frames into an mp4
+                sim._toggle_video_record()
+                sim.render()
         else:
             agent.evaluator.simple_test_policy(collect_metrics=True)
     finally:

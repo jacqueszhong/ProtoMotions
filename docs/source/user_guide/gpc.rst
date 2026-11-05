@@ -60,7 +60,7 @@ uses the same config shape in both training loops.
 RLFT
 ~~~~
 
-``examples/experiments/gpc/task_target_prior_peft.py`` fine-tunes the adapter
+``examples/experiments/gpc/target_prior_peft.py`` fine-tunes the adapter
 with PPO on task rewards. The actor config stays compatible with the SFT config,
 so an SFT checkpoint can warm-start RLFT. The environment usually swaps from the
 SFT mimic-target source to a task control source such as random target reaching.
@@ -127,8 +127,9 @@ Common Commands
 The examples use the packaged SOMA crouch motion and FSQ tracker:
 ``data/motion_for_trackers/crouch_soma23.pt`` and
 ``data/pretrained_models/motion_tracker/soma_bones_fsq/inference_last.ckpt``.
-A packaged GPC prior is releasing soon. Until then, train the prior with the
-first command and use that run's ``last.ckpt`` for SFT and RLFT.
+A packaged GPC prior is available at
+``data/pretrained_models/gpc_prior/soma_bones/inference_last.ckpt``. Use it for
+SFT and RLFT, or train a prior with the first command below.
 
 Train the discrete GPC prior:
 
@@ -168,7 +169,7 @@ Run RLFT from the SFT checkpoint:
        --robot-name soma23 \
        --simulator isaaclab \
        --motion-file data/motion_for_trackers/crouch_soma23.pt \
-       --experiment-path examples/experiments/gpc/task_target_prior_peft.py \
+       --experiment-path examples/experiments/gpc/target_prior_peft.py \
        --prior-checkpoint results/prior_gpc_soma23/last.ckpt \
        --checkpoint results/sft_target_peft_crouch_soma/last.ckpt \
        --num-envs 512 \
@@ -206,10 +207,11 @@ Checkpoint Roles During Training
      - Inference and sharing
      - This is the small PEFT-only artifact. Do not use it to resume training.
 
-For the packaged SOMA assets, the tracker path is
-``data/pretrained_models/motion_tracker/soma_bones_fsq/inference_last.ckpt``.
-The GPC prior is releasing soon; until then, use the ``last.ckpt`` produced by
-the prior-training command above.
+For the packaged SOMA assets, the corresponding paths are
+``data/pretrained_models/motion_tracker/soma_bones_fsq/inference_last.ckpt`` and
+``data/pretrained_models/gpc_prior/soma_bones/inference_last.ckpt``. Both the
+tracker and prior provide inference-oriented checkpoints; use their full
+``last.ckpt`` artifacts only for training or resume.
 
 Inference
 ---------
@@ -254,7 +256,7 @@ only the prior path:
 
 .. code-block:: bash
 
-   --overrides agent.pretrained_modules.prior.checkpoint_path=/path/to/prior/last.ckpt
+   --overrides agent.pretrained_modules.prior.checkpoint_path=data/pretrained_models/gpc_prior/soma_bones/inference_last.ckpt
 
 The discrete-prior PEFT inference artifact is self-describing: ``--checkpoint``
 should point at the PEFT run's ``inference_last.ckpt``.
@@ -265,7 +267,7 @@ Key Files
 * ``examples/experiments/gpc/prior.py`` - train the discrete latent prior.
 * ``examples/experiments/gpc/sft_target_prior_peft.py`` - supervised PEFT
   bootstrap for target reaching.
-* ``examples/experiments/gpc/task_target_prior_peft.py`` - PPO RLFT target
+* ``examples/experiments/gpc/target_prior_peft.py`` - PPO RLFT target
   reaching.
 * ``examples/experiments/gpc/task_target_prior_peft_amp.py`` - RLFT with AMP
   rewards.

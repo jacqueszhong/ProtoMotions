@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from protomotions.utils.cli_utils import parse_bool
+from protomotions.components.motion_lib import MotionFileSwitchMode, MotionLibConfig
 
 
 TRAIN_AGENT_PATH = str(Path(__file__).resolve().parents[1] / "train_agent.py")
@@ -25,6 +26,9 @@ TRAIN_AGENT_PATH = str(Path(__file__).resolve().parents[1] / "train_agent.py")
 class _TinyConfig:
     _target_: str = "unit.Target"
     value: int = 1
+
+    def validate(self):
+        self.validate_calls = getattr(self, "validate_calls", 0) + 1
 
 
 class _TinyFabricConfig:
@@ -138,7 +142,226 @@ def test_train_agent_parser_and_bool_helpers(monkeypatch, tmp_path):
     )
     assert parsed.headless is False
     assert parsed.torch_deterministic is True
+    assert parsed.wandb_project == "physical_animation"
     assert parsed.create_config_only is True
+    assert parsed.training_max_iterations is None
+
+    parsed = parser.parse_args(
+        [
+            "--robot-name",
+            "g1",
+            "--simulator",
+            "newton",
+            "--num-envs",
+            "2",
+            "--batch-size",
+            "4",
+            "--motion-file",
+            "m.pt",
+            "--experiment-path",
+            "exp.py",
+            "--experiment-name",
+            "parser",
+            "--wandb-project",
+            "custom-project",
+        ]
+    )
+    assert parsed.wandb_project == "custom-project"
+
+    parsed = parser.parse_args(
+        [
+            "--robot-name",
+            "g1",
+            "--simulator",
+            "newton",
+            "--num-envs",
+            "2",
+            "--batch-size",
+            "4",
+            "--motion-file",
+            "m.pt",
+            "--experiment-path",
+            "exp.py",
+            "--experiment-name",
+            "parser",
+            "--training-max-iterations",
+            "30",
+        ]
+    )
+    assert parsed.training_max_iterations == 30
+
+    required_args = [
+        "--robot-name",
+        "g1",
+        "--simulator",
+        "newton",
+        "--num-envs",
+        "2",
+        "--batch-size",
+        "4",
+        "--motion-file",
+        "m.pt",
+        "--experiment-path",
+        "exp.py",
+        "--experiment-name",
+        "parser",
+    ]
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            required_args
+            + [
+                "--training-max-steps",
+                "100",
+                "--training-max-iterations",
+                "10",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        parser.parse_args(required_args + ["--training-max-iterations", "0"])
+
+
+def test_apply_training_iteration_limit(monkeypatch, tmp_path):
+    module = _load_train_agent_globals(monkeypatch, tmp_path)
+    config = SimpleNamespace(training_max_iterations=None)
+
+    module["apply_training_iteration_limit"](
+        SimpleNamespace(training_max_iterations=42), config
+    )
+    assert config.training_max_iterations == 42
+
+    module["apply_training_iteration_limit"](
+        SimpleNamespace(training_max_iterations=None), config
+    )
+    assert config.training_max_iterations == 42
+
+
+def test_load_motion_shard_cycle_reads_required_checkpoint_state(monkeypatch, tmp_path):
+    module = _load_train_agent_globals(monkeypatch, tmp_path)
+    checkpoint = tmp_path / "last.ckpt"
+    torch.save({"motion_shard_cycle": 4}, checkpoint)
+
+    assert module["load_motion_shard_cycle"](checkpoint) == 4
+
+    torch.save({}, checkpoint)
+    with pytest.raises(KeyError, match="motion_shard_cycle"):
+        module["load_motion_shard_cycle"](checkpoint)
+
+
+@pytest.mark.parametrize("bad_cycle", [1.5, True, "4"])
+def test_load_motion_shard_cycle_rejects_non_plain_integer_values(
+    monkeypatch, tmp_path, bad_cycle
+):
+    module = _load_train_agent_globals(monkeypatch, tmp_path)
+    checkpoint = tmp_path / "last.ckpt"
+    torch.save({"motion_shard_cycle": bad_cycle}, checkpoint)
+
+    with pytest.raises(TypeError, match="plain Python int"):
+        module["load_motion_shard_cycle"](checkpoint)
+
+
+def test_resume_motion_shard_cycle_fails_all_ranks_before_broadcast(
+    monkeypatch, tmp_path
+):
+    module = _load_train_agent_globals(monkeypatch, tmp_path)
+    calls = []
+    fabric = SimpleNamespace(
+        global_rank=0,
+        device=torch.device("cpu"),
+        broadcast=lambda value: calls.append(("broadcast", value)),
+    )
+    motion_lib_config = SimpleNamespace(
+        motion_file_switch_mode=MotionFileSwitchMode.LIVE,
+    )
+
+    monkeypatch.setitem(
+        module["resolve_resume_motion_shard_cycle"].__globals__,
+        "load_motion_shard_cycle",
+        lambda checkpoint: (_ for _ in ()).throw(OSError("checkpoint unavailable")),
+    )
+    with pytest.raises(RuntimeError, match="Motion shard cycle checkpoint load") as error:
+        module["resolve_resume_motion_shard_cycle"](
+            fabric, tmp_path / "last.ckpt", motion_lib_config
+        )
+
+    assert isinstance(error.value.__cause__, OSError)
+    assert calls == []
+
+
+def test_fixed_resume_motion_shard_cycle_bypasses_checkpoint_and_broadcast(
+    monkeypatch, tmp_path
+):
+    module = _load_train_agent_globals(monkeypatch, tmp_path)
+    fabric = SimpleNamespace(
+        global_rank=0,
+        device=torch.device("cpu"),
+        broadcast=lambda value: pytest.fail("fixed mode must not broadcast"),
+    )
+    monkeypatch.setitem(
+        module["resolve_resume_motion_shard_cycle"].__globals__,
+        "load_motion_shard_cycle",
+        lambda checkpoint: pytest.fail("fixed mode must not load checkpoint"),
+    )
+
+    assert (
+        module["resolve_resume_motion_shard_cycle"](
+            fabric,
+            tmp_path / "checkpoint-without-cycle.ckpt",
+            SimpleNamespace(motion_file_switch_mode=MotionFileSwitchMode.FIXED),
+        )
+        == 0
+    )
+
+
+def test_healthy_resume_rank_fails_before_broadcast_when_remote_load_fails(
+    monkeypatch, tmp_path
+):
+    from protomotions.agents.utils import distributed
+
+    module = _load_train_agent_globals(monkeypatch, tmp_path)
+    calls = []
+    fabric = SimpleNamespace(
+        global_rank=1,
+        device=torch.device("cpu"),
+        broadcast=lambda value: calls.append(("broadcast", value)),
+    )
+    monkeypatch.setitem(
+        module["resolve_resume_motion_shard_cycle"].__globals__,
+        "load_motion_shard_cycle",
+        lambda checkpoint: pytest.fail("healthy rank must not load checkpoint"),
+    )
+    monkeypatch.setattr(
+        distributed,
+        "raise_if_any_rank_failed",
+        lambda error, operation, device: (_ for _ in ()).throw(
+            RuntimeError("Motion shard cycle checkpoint load failed on another rank")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="another rank"):
+        module["resolve_resume_motion_shard_cycle"](
+            fabric,
+            tmp_path / "last.ckpt",
+            SimpleNamespace(motion_file_switch_mode=MotionFileSwitchMode.LIVE),
+        )
+
+    assert calls == []
+
+
+def test_build_wandb_logger_config_uses_cli_project(monkeypatch, tmp_path):
+    module = _load_train_agent_globals(monkeypatch, tmp_path)
+    config = module["build_wandb_logger_config"](
+        SimpleNamespace(
+            experiment_name="unit-run",
+            wandb_project="custom-project",
+        ),
+        tmp_path,
+        "wandb-id",
+    )
+
+    assert config["name"] == "unit-run"
+    assert config["project"] == "custom-project"
+    assert config["save_dir"] == tmp_path
+    assert config["id"] == "wandb-id"
 
 
 def test_detect_checkpoint_mode_handles_fresh_warm_start_and_resume(
@@ -475,6 +698,8 @@ def test_main_create_config_only_builds_configs_and_exits_before_training(
         overrides=[],
         ngpu=1,
         nodes=1,
+        simulator="isaacgym",
+        training_max_iterations=None,
     )
     fake_experiment = SimpleNamespace(
         terrain_config=lambda: "terrain",
@@ -567,6 +792,7 @@ def test_main_config_only_registers_custom_args_and_applies_cli_overrides(
     parser_calls = []
     override_calls = []
     config = _TinyConfig(value=11)
+    motion_lib_config = MotionLibConfig(motion_file="motions.pt")
     args = SimpleNamespace(
         experiment_name="main-config-overrides",
         experiment_path=str(tmp_path / "experiment.py"),
@@ -575,6 +801,8 @@ def test_main_config_only_registers_custom_args_and_applies_cli_overrides(
         overrides=["env.value=17"],
         ngpu=1,
         nodes=1,
+        simulator="isaacgym",
+        training_max_iterations=None,
     )
 
     fake_parser = SimpleNamespace(
@@ -599,7 +827,7 @@ def test_main_config_only_registers_custom_args_and_applies_cli_overrides(
             "simulator": config,
             "terrain": config,
             "scene_lib": config,
-            "motion_lib": config,
+            "motion_lib": motion_lib_config,
             "env": config,
             "agent": config,
         }
@@ -632,8 +860,9 @@ def test_main_config_only_registers_custom_args_and_applies_cli_overrides(
     monkeypatch.setattr(
         sys.modules["protomotions.utils.config_utils"],
         "apply_config_overrides",
-        lambda overrides, env, simulator, robot, agent, **kwargs: override_calls.append(
-            (overrides, env, simulator, robot, agent, kwargs)
+        lambda overrides, env, simulator, robot, agent, **kwargs: (
+            override_calls.append((overrides, env, simulator, robot, agent, kwargs)),
+            setattr(kwargs["motion_lib_config"], "motion_file_switch_mode", "fixed"),
         ),
     )
 
@@ -644,6 +873,7 @@ def test_main_config_only_registers_custom_args_and_applies_cli_overrides(
     assert override_calls[0][0] == {"env.value": 17}
     assert override_calls[0][1] is config
     assert override_calls[0][5]["terrain_config"] is config
+    assert motion_lib_config.motion_file_switch_mode is MotionFileSwitchMode.FIXED
 
 
 def test_main_fresh_training_path_wires_fabric_components_agent_and_saves(
@@ -662,17 +892,19 @@ def test_main_fresh_training_path_wires_fabric_components_agent_and_saves(
         ngpu=2,
         nodes=1,
         use_wandb=True,
+        wandb_project="custom-project",
         use_slurm=True,
         simulator="isaacgym",
         headless=True,
         seed=10,
         torch_deterministic=True,
+        training_max_iterations=None,
     )
     robot_config = SimpleNamespace(_target_="robot.Target")
     simulator_config = SimpleNamespace(_target_="sim.Target")
     terrain_config = SimpleNamespace(_target_="terrain.Target")
     scene_lib_config = SimpleNamespace(_target_="scene.Target")
-    motion_lib_config = SimpleNamespace(_target_="motion.Target")
+    motion_lib_config = _TinyConfig(_target_="motion.Target")
     env_config = SimpleNamespace(_target_="env.Target", save_dir="weights")
     agent_config = SimpleNamespace(_target_="agent.Target")
     fake_experiment = SimpleNamespace(
@@ -867,8 +1099,15 @@ def test_main_fresh_training_path_wires_fabric_components_agent_and_saves(
     assert ("save_configs", "resolved_configs_inference") in calls
     build_call = next(call for call in calls if call[0] == "build_components")
     assert build_call[1]["save_dir"] == "weights"
+    assert motion_lib_config.validate_calls == 1
     fabric_call = next(call for call in calls if call[0] == "fabric_init")
     assert len(fabric_call[1]["loggers"]) == 2
+    wandb_logger = next(
+        logger
+        for logger in fabric_call[1]["loggers"]
+        if logger["_target_"].endswith("WandbLogger")
+    )
+    assert wandb_logger["project"] == "custom-project"
     assert len(fabric_call[1]["callbacks"]) == 1
 
 
@@ -883,7 +1122,7 @@ def test_main_resume_isaaclab_uses_saved_configs_launcher_and_skip_flag(
     resume_dir = tmp_path / "results" / "resume"
     resume_dir.mkdir(parents=True)
     checkpoint_path = resume_dir / "last.ckpt"
-    checkpoint_path.write_text("checkpoint")
+    torch.save({"motion_shard_cycle": 7}, checkpoint_path)
     (resume_dir / "config.yaml").write_text(
         json.dumps(
             {
@@ -904,10 +1143,13 @@ def test_main_resume_isaaclab_uses_saved_configs_launcher_and_skip_flag(
         )
     )
     robot_config = SimpleNamespace(_target_="robot.Target")
-    simulator_config = SimpleNamespace(_target_="sim.Target")
+    simulator_config = SimpleNamespace(_target_="sim.Target", w_last=False)
     terrain_config = SimpleNamespace(_target_="terrain.Target")
     scene_lib_config = SimpleNamespace(_target_="scene.Target")
-    motion_lib_config = SimpleNamespace(_target_="motion.Target")
+    motion_lib_config = MotionLibConfig(
+        motion_file="motions_slurmrank.pt",
+        motion_file_switch_mode=MotionFileSwitchMode.RESTART,
+    )
     env_config = SimpleNamespace(_target_="env.Target", save_dir="resume_weights")
     agent_config = SimpleNamespace(_target_="agent.Target")
     torch.save(
@@ -956,8 +1198,8 @@ def test_main_resume_isaaclab_uses_saved_configs_launcher_and_skip_flag(
             calls.append(("fabric_init", kwargs))
             self.device = torch.device("cpu")
             self.world_size = 2
-            self.global_rank = 3
-            self.local_rank = 1
+            self.global_rank = 0
+            self.local_rank = 0
             self.strategy = SimpleNamespace(
                 barrier=lambda: calls.append(("agent_barrier", None))
             )
@@ -968,6 +1210,10 @@ def test_main_resume_isaaclab_uses_saved_configs_launcher_and_skip_flag(
 
         def call(self, name, *args, **kwargs):
             calls.append(("fabric_call", name))
+
+        def broadcast(self, value):
+            calls.append(("broadcast", value))
+            return value
 
     class FakeEnv:
         def __init__(self, **kwargs):
@@ -1065,10 +1311,27 @@ def test_main_resume_isaaclab_uses_saved_configs_launcher_and_skip_flag(
         True,
     ) in calls
     assert ("agent_fit", True) in calls
-    assert ("app_launcher", {"headless": False, "device": "cpu", "distributed": True}) in calls
-    assert os.environ["LOCAL_RANK"] == "1"
-    assert os.environ["RANK"] == "3"
+    assert (
+        "app_launcher",
+        {
+            "headless": False,
+            "device": "cpu",
+            "visualizer": ["kit"],
+            "distributed": True,
+        },
+    ) in calls
+    assert os.environ["LOCAL_RANK"] == "0"
+    assert os.environ["RANK"] == "0"
     build_call = next(call for call in calls if call[0] == "build_components")
+    assert build_call[1]["simulator_config"].w_last is True
     assert build_call[1]["simulation_app"] == "simulation-app"
     assert build_call[1]["save_dir"] == "resume_weights"
-    assert len([call for call in calls if call[0] == "omni_log"]) == 2
+    assert build_call[1]["motion_shard_cycle"] == 7
+    assert ("broadcast", 7) in calls
+    assert calls.index(("broadcast", 7)) < calls.index(build_call)
+    omni_log_calls = [call for call in calls if call[0] == "omni_log"]
+    assert [call[1][0] for call in omni_log_calls] == [
+        "omni.physx.plugin",
+        "omni.physx.tensors.plugin",
+        "isaaclab.sim.utils",
+    ]

@@ -5,6 +5,10 @@ import re
 from pathlib import Path
 from typing import List
 
+import pytest
+import torch
+import yaml
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PRETRAINED_ROOT = REPO_ROOT / "data/pretrained_models"
@@ -35,10 +39,23 @@ PRIVATE_PATTERNS = (
 )
 G1_DEPLOY_DIR = PRETRAINED_ROOT / "motion_tracker/g1-bones-deploy"
 SOMA_CONTINUOUS_DIR = PRETRAINED_ROOT / "motion_tracker/soma-bones"
+SOMA_FSQ_DIR = PRETRAINED_ROOT / "motion_tracker/soma_bones_fsq"
+SOMA_GPC_PRIOR_DIR = PRETRAINED_ROOT / "gpc_prior/soma_bones"
 
 
 def _model_dirs() -> List[Path]:
-    return sorted({checkpoint.parent for checkpoint in PRETRAINED_ROOT.glob("*/*/*.ckpt")})
+    """Every published model directory: one that ships a checkpoint or a card.
+
+    Keyed on the union of ``*.ckpt`` and ``MODEL_CARD.md``. The checkpoints are
+    committed via Git LFS, so globbing for them matches. Keying on the card
+    alone would make ``test_every_pretrained_model_directory_has_a_model_card``
+    a tautology -- it would check that card-bearing directories have a card --
+    and would let the public-safety scan below skip any directory that ships a
+    checkpoint but no card. The union keeps both honest.
+    """
+    dirs = {p.parent for p in PRETRAINED_ROOT.glob("*/*/*.ckpt")}
+    dirs |= {p.parent for p in PRETRAINED_ROOT.glob("*/*/MODEL_CARD.md")}
+    return sorted(dirs)
 
 
 def test_every_pretrained_model_directory_has_a_model_card():
@@ -125,17 +142,24 @@ def test_quickstart_uses_the_model_catalog_and_existing_paths():
     assert ":doc:`pretrained_models`" in quickstart
     assert "soma-bones-deploy" not in quickstart
     assert "masked_mimic/g1" not in quickstart
-    assert "motion_tracker/soma-bones/last.ckpt" in quickstart
+    assert "motion_tracker/soma-bones/last_lab.ckpt" in quickstart
 
     referenced_checkpoints = re.findall(
         r"data/pretrained_models/[A-Za-z0-9_./-]+\.ckpt", quickstart
     )
-    missing_checkpoints = [
+    assert referenced_checkpoints, "quickstart should reference at least one checkpoint"
+
+    # Checked against the model directory each path names, not the exact
+    # checkpoint file: most checkpoints are committed, but some (the IsaacLab
+    # fine-tune last_lab.ckpt) are fetched separately and are not in the tree.
+    # What must hold either way is that the docs cannot drift onto a model
+    # directory that does not exist.
+    missing_models = [
         checkpoint
         for checkpoint in referenced_checkpoints
-        if not (REPO_ROOT / checkpoint).is_file()
+        if not (REPO_ROOT / checkpoint).parent.joinpath("MODEL_CARD.md").is_file()
     ]
-    assert missing_checkpoints == []
+    assert missing_models == []
 
 
 def test_gpc_docs_reference_shipped_assets_and_current_entry_points():
@@ -150,17 +174,10 @@ def test_gpc_docs_reference_shipped_assets_and_current_entry_points():
         "data/pretrained_models/motion_tracker/soma_bones_fsq/"
         "inference_last.ckpt"
     ) in gpc_guide
-    referenced_experiments = re.findall(
-        r"examples/experiments/[A-Za-z0-9_./-]+\.py", gpc_guide
-    )
-    missing_experiments = [
-        experiment
-        for experiment in referenced_experiments
-        if not (REPO_ROOT / experiment).is_file()
-    ]
-    assert missing_experiments == []
+    assert "examples/experiments/gpc/target_prior_peft.py" in gpc_guide
     assert (
-        "agent.pretrained_modules.prior.checkpoint_path=/path/to/prior/last.ckpt"
+        "agent.pretrained_modules.prior.checkpoint_path="
+        "data/pretrained_models/gpc_prior/soma_bones/inference_last.ckpt"
         in gpc_guide
     )
 
@@ -181,6 +198,35 @@ def test_gpc_docs_reference_shipped_assets_and_current_entry_points():
     assert "GPC and PEFT guide" in readme
     assert "protomotions/data/assets/mjcf/" in readme
     assert "protomotions/data/robots/" not in readme
+
+
+@pytest.mark.needs_lfs
+def test_soma_gpc_artifacts_use_current_config_contracts():
+    tracker_config = torch.load(
+        SOMA_FSQ_DIR / "resolved_configs.pt", weights_only=False
+    )
+    prior_config = torch.load(
+        SOMA_GPC_PRIOR_DIR / "resolved_configs.pt", weights_only=False
+    )
+    prior_inference_config = torch.load(
+        SOMA_GPC_PRIOR_DIR / "resolved_configs_inference.pt",
+        weights_only=False,
+    )
+
+    assert tracker_config["agent"].model.actor.in_keys == [
+        "max_coords_obs", "mimic_target_poses"
+    ]
+    assert prior_config["agent"].model.prior.context_encoder.in_keys == [
+        "max_coords_obs"
+    ]
+    assert prior_config["agent"].model.latent_decoder.checkpoint_path == (
+        "data/pretrained_models/motion_tracker/soma_bones_fsq/"
+        "inference_last.ckpt"
+    )
+    assert prior_inference_config["agent"].model.latent_decoder.checkpoint_path == ""
+    assert (
+        prior_inference_config["agent"].model.latent_decoder.module_config is not None
+    )
 
 
 def test_gpc_and_discrete_latent_modules_are_in_the_api_reference():
@@ -212,3 +258,67 @@ def test_gpc_and_discrete_latent_modules_are_in_the_api_reference():
     assert (
         REPO_ROOT / "docs/source/api_reference/protomotions.agents.peft.rst"
     ).is_file()
+
+
+@pytest.mark.needs_lfs
+def test_pretrained_configs_preserve_training_robot_friction():
+    half_friction_model_dirs = (
+        PRETRAINED_ROOT / "gpc_prior/soma_bones",
+        PRETRAINED_ROOT / "masked_mimic/smpl",
+        PRETRAINED_ROOT / "motion_tracker/smpl-terrains",
+        PRETRAINED_ROOT / "motion_tracker/smpl",
+        PRETRAINED_ROOT / "motion_tracker/soma-bones",
+        PRETRAINED_ROOT / "motion_tracker/soma_bones_fsq",
+    )
+    violations = []
+
+    # A model listed here may not be present in every checkout -- checkpoints and
+    # their configs are sometimes fetched separately. Loading unconditionally
+    # would turn an absent model into a FileNotFoundError that reads like a
+    # broken test rather than a missing artifact, so skip what is not there.
+    present = [d for d in half_friction_model_dirs if (d / "resolved_configs.pt").is_file()]
+    assert present, "no pretrained configs found to check"
+
+    for model_dir in present:
+        training_path = model_dir / "resolved_configs.pt"
+        training_configs = torch.load(
+            training_path, map_location="cpu", weights_only=False
+        )
+        domain_randomization = getattr(
+            training_configs["simulator"], "domain_randomization", None
+        )
+        friction_randomization = (
+            getattr(domain_randomization, "friction", None)
+            if domain_randomization is not None
+            else None
+        )
+        if friction_randomization is not None:
+            relative_path = training_path.relative_to(REPO_ROOT)
+            violations.append(f"{relative_path}: unexpectedly randomizes friction")
+
+        for config_name in ("resolved_configs.pt", "resolved_configs_inference.pt"):
+            config_path = model_dir / config_name
+            configs = torch.load(config_path, map_location="cpu", weights_only=False)
+            actual_friction = getattr(
+                configs["simulator"], "default_robot_friction", None
+            )
+            if actual_friction != 0.5:
+                relative_path = config_path.relative_to(REPO_ROOT)
+                violations.append(
+                    f"{relative_path}: expected robot friction 0.5, "
+                    f"got {actual_friction}"
+                )
+
+            yaml_path = config_path.with_suffix(".yaml")
+            readable_configs = yaml.safe_load(yaml_path.read_text())
+            readable_friction = readable_configs["simulator"].get(
+                "default_robot_friction"
+            )
+            if readable_friction != 0.5:
+                relative_path = yaml_path.relative_to(REPO_ROOT)
+                violations.append(
+                    f"{relative_path}: expected robot friction 0.5, "
+                    f"got {readable_friction}"
+                )
+
+    assert violations == []

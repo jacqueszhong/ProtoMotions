@@ -20,8 +20,8 @@ Key Features:
 
 import logging
 import os
-import re
-from typing import Optional, Tuple
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
 from easydict import EasyDict
 from pathlib import Path
 
@@ -33,12 +33,12 @@ from protomotions.simulator.base_simulator.simulator_state import (
     StateConversion,
 )
 from protomotions.utils.rotations import quat_to_exp_map
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field as dataclass_field
 
 from protomotions.utils.motion_interpolation_utils import (
+    calc_frame_blend,
     interpolate_pos,
     interpolate_quat,
-    calc_frame_blend,
 )
 
 log = logging.getLogger(__name__)
@@ -54,41 +54,250 @@ _motion_field_mapping = {
 }
 
 
+class MotionFileSwitchMode(str, Enum):
+    """How distributed motion shards advance during training."""
+
+    FIXED = "fixed"
+    LIVE = "live"
+    RESTART = "restart"
+
+
+def _select_exact_frame(field_data: torch.Tensor, frame_indices: torch.Tensor):
+    selected = field_data[frame_indices]
+    return selected.clone() if frame_indices.ndim == 0 else selected
+
+
+def _smooth_contacts_segmented(
+    contacts: torch.Tensor,
+    length_starts: torch.Tensor,
+    motion_num_frames: torch.Tensor,
+    window_size: int,
+) -> torch.Tensor:
+    """Smooth per-motion contacts with one vectorized device-side operation.
+
+    ``contacts`` stores all motion clips concatenated along the frame axis. A
+    regular convolution over that tensor would leak values across clip
+    boundaries, so this implementation uses a prefix sum for each frame's
+    in-motion window and adds the replicate-padding contributions at the two
+    boundaries. The only per-frame indexing tensors are built once; there is
+    no Python loop or host/device synchronization per motion.
+    """
+    num_frames_total, _ = contacts.shape
+    if num_frames_total == 0:
+        return contacts.to(dtype=torch.float32)
+
+    # Motion metadata is normally already on the contact device, but keeping
+    # it explicit prevents repeat_interleave/indexing from falling back to CPU.
+    length_starts = length_starts.to(device=contacts.device)
+    motion_num_frames = motion_num_frames.to(device=contacts.device)
+    num_motions = motion_num_frames.numel()
+    frame_motion_ids = torch.repeat_interleave(
+        torch.arange(num_motions, device=contacts.device), motion_num_frames
+    )
+    starts = length_starts[frame_motion_ids]
+    ends = starts + motion_num_frames[frame_motion_ids]
+    frame_indices = torch.arange(num_frames_total, device=contacts.device)
+
+    padding = window_size // 2
+
+    # Prefix sums give the sum of the in-motion portion of each window.
+    contacts = contacts.to(dtype=torch.float32)
+    prefix = torch.cat(
+        [torch.zeros(1, contacts.shape[1], device=contacts.device), contacts.cumsum(0)],
+        dim=0,
+    )
+    left_indices = torch.maximum(frame_indices - padding, starts)
+    right_indices = torch.minimum(frame_indices + padding + 1, ends)
+    in_motion_sum = prefix[right_indices] - prefix[left_indices]
+
+    # Replicate padding repeats the first/last sample rather than zero-padding.
+    left_repeat_count = (starts + padding - frame_indices).clamp_min(0).to(
+        contacts.dtype
+    )
+    right_repeat_count = (
+        frame_indices + padding + 1 - ends
+    ).clamp_min(0).to(contacts.dtype)
+    left_edge = contacts[starts]
+    right_edge = contacts[ends - 1]
+    smoothed = (
+        in_motion_sum
+        + left_repeat_count.unsqueeze(1) * left_edge
+        + right_repeat_count.unsqueeze(1) * right_edge
+    ) / window_size
+    return smoothed
+
+
+def _discover_shard_files(pattern: str) -> Dict[int, str]:
+    pattern_path = Path(pattern)
+    filename = pattern_path.name
+    if filename.count("slurmrank") != 1:
+        raise ValueError(
+            "Shard pattern must contain exactly one 'slurmrank' placeholder: "
+            f"{pattern}"
+        )
+
+    prefix, suffix = filename.split("slurmrank", 1)
+    shards = {}
+    for candidate in pattern_path.parent.iterdir():
+        if not candidate.is_file():
+            continue
+        name = candidate.name
+        if not name.startswith(prefix) or not name.endswith(suffix):
+            continue
+        end = len(name) - len(suffix) if suffix else len(name)
+        index_text = name[len(prefix) : end]
+        if not index_text.isdecimal():
+            continue
+        index = int(index_text)
+        if index in shards:
+            raise ValueError(
+                f"Duplicate shard index {index} for pattern {pattern}: "
+                f"{shards[index]} and {candidate}"
+            )
+        shards[index] = str(candidate)
+
+    if not shards:
+        raise ValueError(f"No shard files match pattern: {pattern}")
+    return shards
+
+
+def resolve_shard_file(pattern: str, index: int) -> str:
+    """Return the shard matching an exact numeric ``slurmrank`` suffix."""
+    shards = _discover_shard_files(pattern)
+    try:
+        return shards[index]
+    except KeyError as error:
+        raise ValueError(f"No shard with index {index} matches pattern: {pattern}") from error
+
+
+def select_motion_shard(
+    pattern: str,
+    *,
+    rank: int,
+    world_size: int,
+    cycle: int,
+    shard_indices: Optional[List[int]] = None,
+) -> Tuple[str, int]:
+    """Select a deterministic motion shard for a distributed rank and cycle."""
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}")
+    if not 0 <= rank < world_size:
+        raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
+    if cycle < 0:
+        raise ValueError(f"cycle must be non-negative, got {cycle}")
+
+    discovered = _discover_shard_files(pattern)
+    indices = list(shard_indices) if shard_indices is not None else sorted(discovered)
+    if not indices:
+        raise ValueError("At least one shard index is required")
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"Duplicate shard index in explicit selection: {indices}")
+    for index in indices:
+        if index not in discovered:
+            raise ValueError(f"No shard with index {index} matches pattern: {pattern}")
+
+    num_shards = len(indices)
+    if world_size < num_shards:
+        position = (cycle * world_size + rank) % num_shards
+    elif rank < num_shards:
+        position = rank
+    else:
+        position = (rank - num_shards + cycle) % num_shards
+
+    index = indices[position]
+    return discovered[index], index
+
+
 @dataclass
 class MotionLibConfig:
     """Configuration for motion library."""
 
     _target_: str = "protomotions.components.motion_lib.MotionLib"
-    motion_file: Optional[str] = field(
+    motion_file: Optional[str] = dataclass_field(
         default=None,
         metadata={
             "help": "Path to motion file (.pt, .yaml, or .motion). None for empty library."
         },
     )
-    get_motion_state_use_blend: bool = field(
+    motion_file_shard_indices: Optional[List[int]] = dataclass_field(
+        default=None,
+        metadata={
+            "help": "Ordered numeric suffixes to use from a slurmrank motion pattern."
+        },
+    )
+    motion_file_switch_mode: MotionFileSwitchMode = dataclass_field(
+        default=MotionFileSwitchMode.FIXED,
+        metadata={
+            "help": "Keep the startup shard, switch live after evaluation, or "
+            "restart before loading the next shard."
+        },
+    )
+    get_motion_state_use_blend: bool = dataclass_field(
         default=True,
         metadata={
             "help": "Use interpolation for smooth motion queries between frames."
         },
     )
-    max_seconds: Optional[float] = field(
+    max_seconds: Optional[float] = dataclass_field(
         default=None,
         metadata={
             "help": "Clip motions longer than this to a random duration in "
             "[max_seconds - clip_delta, max_seconds]. None disables clipping."
         },
     )
-    clip_delta: float = field(
+    clip_delta: float = dataclass_field(
         default=3.0,
         metadata={
             "help": "Maximum random reduction (seconds) below max_seconds when clipping. "
             "Clip target = uniform(max_seconds - clip_delta, max_seconds)."
         },
     )
-    clip_seed: int = field(
+    clip_seed: int = dataclass_field(
         default=42,
         metadata={"help": "RNG seed for reproducible per-motion clip lengths."},
     )
+
+    def __post_init__(self):
+        self.validate()
+
+    def validate(self):
+        """Normalize and validate distributed packaged-motion shard settings."""
+        try:
+            self.motion_file_switch_mode = MotionFileSwitchMode(
+                self.motion_file_switch_mode
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "motion_file_switch_mode must be one of: fixed, live, restart"
+            ) from error
+
+        shard_indices = self.motion_file_shard_indices
+        if shard_indices is not None:
+            if not shard_indices:
+                raise ValueError("motion_file_shard_indices must be nonempty")
+            if any(type(index) is not int for index in shard_indices):
+                raise ValueError("motion_file_shard_indices must contain plain ints")
+            if len(set(shard_indices)) != len(shard_indices):
+                raise ValueError("motion_file_shard_indices must be unique")
+            if any(index < 0 for index in shard_indices):
+                raise ValueError("motion_file_shard_indices must be nonnegative")
+
+        requires_shard_pattern = (
+            shard_indices is not None
+            or self.motion_file_switch_mode is not MotionFileSwitchMode.FIXED
+        )
+        if requires_shard_pattern:
+            motion_file = self.motion_file
+            filename = Path(motion_file).name if isinstance(motion_file, str) else ""
+            if filename.count("slurmrank") != 1 or Path(filename).suffix != ".pt":
+                raise ValueError(
+                    "motion shard selection requires a packaged .pt filename with "
+                    "exactly one 'slurmrank' placeholder"
+                )
+
+    def prepare_inference_config_for_save(self):
+        self.motion_file_switch_mode = MotionFileSwitchMode.FIXED
+        self.validate()
 
 
 class MotionLib:
@@ -144,6 +353,7 @@ class MotionLib:
         self,
         config: "MotionLibConfig",
         device: str = "cpu",
+        shard_cycle: int = 0,
     ):
         """Initialize MotionLib from config.
 
@@ -158,6 +368,8 @@ class MotionLib:
 
         self.config = config
         self.device = device
+        self.motion_file_shard_cycle = shard_cycle
+        self.motion_file_shard_index: Optional[int] = None
 
         # Handle empty motion library (Null Object pattern)
         if config.motion_file is None:
@@ -172,7 +384,9 @@ class MotionLib:
 
         if str(motion_file).split(".")[-1] == "pt":
             print("Loading motions from packaged file which is faster")
-            motion_file = self.process_packaged_motion_file_name_multi_gpu(motion_file)
+            motion_file = self.process_packaged_motion_file_name_multi_gpu(
+                motion_file, shard_cycle=shard_cycle
+            )
             self.load_from_file(motion_file)
         else:
             print(
@@ -267,41 +481,49 @@ class MotionLib:
         else:
             return self.motion_num_frames[motion_ids]
 
-    def process_packaged_motion_file_name_multi_gpu(self, motion_file):
+    def selection_for_cycle(self, cycle: int) -> Tuple[str, int]:
+        """Return this rank's packaged motion shard for ``cycle``."""
+        motion_file = self.config.motion_file
+        if motion_file is None or "slurmrank" not in motion_file:
+            raise ValueError("MotionLib does not have a slurmrank shard pattern")
+        if not torch.distributed.is_initialized():
+            raise RuntimeError(
+                "slurmrank motion files require distributed training "
+                "(torch.distributed must be initialized)"
+            )
+        return select_motion_shard(
+            motion_file,
+            rank=torch.distributed.get_rank(),
+            world_size=torch.distributed.get_world_size(),
+            cycle=cycle,
+            shard_indices=self.config.motion_file_shard_indices,
+        )
+
+    def process_packaged_motion_file_name_multi_gpu(self, motion_file, shard_cycle=0):
         if "slurmrank" not in motion_file:
             return motion_file
 
-        assert torch.distributed.is_initialized(), (
-            "slurmrank motion files require distributed training "
-            "(torch.distributed must be initialized)"
-        )
+        if not torch.distributed.is_initialized():
+            raise RuntimeError(
+                "slurmrank motion files require distributed training "
+                "(torch.distributed must be initialized)"
+            )
         rank = torch.distributed.get_rank()
-
-        # Discover matching files: replace "slurmrank" with a regex wildcard
-        # e.g. "chunk_slurmrank.pt" -> "chunk_.*.pt" matches chunk_00.pt, chunk_1.pt, etc.
-        folder = Path(motion_file).parent
-        pattern = re.compile(
-            "^" + re.escape(Path(motion_file).name).replace("slurmrank", "(.+)") + "$"
+        selected, selected_index = select_motion_shard(
+            motion_file,
+            rank=rank,
+            world_size=torch.distributed.get_world_size(),
+            cycle=shard_cycle,
+            shard_indices=self.config.motion_file_shard_indices,
         )
-        matches = sorted(
-            (f.name for f in folder.iterdir() if pattern.match(f.name)),
-            key=lambda name: int(pattern.match(name).group(1)),
-        )
-        assert matches, (
-            f"No files matching slurmrank pattern in {folder}. "
-            f"Expected files like: {Path(motion_file).name.replace('slurmrank', '*')}"
-        )
-
-        selected = matches[rank % len(matches)]
-        motion_file = str(folder / selected)
-
         self.different_motion_files_across_ranks = True
+        self.motion_file_shard_cycle = shard_cycle
+        self.motion_file_shard_index = selected_index
         print(
-            f"Rank {rank} loading motion file: {selected} "
-            f"({len(matches)} files found, rank % {len(matches)} = {rank % len(matches)})"
+            f"Rank {rank} loading motion file: "
+            f"{Path(selected).name} (shard index {selected_index})"
         )
-
-        return motion_file
+        return selected
 
     def _calc_frame_blend_from_id_and_time(self, motion_ids, motion_times):
         motion_len = self.motion_lengths[motion_ids]
@@ -478,10 +700,10 @@ class MotionLib:
         for lib_field, motion_attr in _motion_field_mapping.items():
             field_data = getattr(self, lib_field)
             if field_data is not None:
-                motion_data[motion_attr] = field_data[fl].clone()
+                motion_data[motion_attr] = _select_exact_frame(field_data, fl)
 
         if self.lrs is not None:
-            local_rigid_body_rot = self.lrs[fl].clone()
+            local_rigid_body_rot = _select_exact_frame(self.lrs, fl)
         else:
             local_rigid_body_rot = None
 
@@ -491,7 +713,9 @@ class MotionLib:
         )
         motion_state.local_rigid_body_rot = local_rigid_body_rot
         motion_state.rigid_body_contacts = (
-            self.contacts[fl].clone() if self.contacts is not None else None
+            _select_exact_frame(self.contacts, fl)
+            if self.contacts is not None
+            else None
         )
 
         return motion_state
@@ -775,46 +999,14 @@ class MotionLib:
 
         print(f"Smoothing contact labels with window size {window_size}...")
 
-        # contacts shape: [total_frames, num_bodies]
-        total_frames, num_bodies = self.contacts.shape
-        num_motions = self.num_motions()
-
-        # Create uniform kernel for moving average
-        kernel = (
-            torch.ones(1, 1, window_size, device=self.device, dtype=torch.float32)
-            / window_size
+        # Smooth all concatenated frames in parallel while preserving motion
+        # boundaries and replicate-padding semantics for each variable-length clip.
+        smoothed_contacts = _smooth_contacts_segmented(
+            self.contacts,
+            self.length_starts,
+            self.motion_num_frames,
+            window_size,
         )
-        padding = window_size // 2
-
-        # Smooth each motion independently to respect motion boundaries
-        smoothed_contacts = torch.zeros_like(self.contacts, dtype=torch.float32)
-
-        for motion_idx in range(num_motions):
-            # Get the range for this motion
-            start_idx = self.length_starts[motion_idx].item()
-            num_frames = self.motion_num_frames[motion_idx].item()
-            end_idx = start_idx + num_frames
-
-            # Extract contacts for this motion: [num_frames, num_bodies]
-            motion_contacts = self.contacts[start_idx:end_idx].float()
-
-            # Reshape for conv1d: [num_bodies, 1, num_frames]
-            contacts_for_conv = motion_contacts.t().unsqueeze(1)
-
-            # Manually apply replicate padding (functional conv1d doesn't support padding_mode)
-            padded_contacts = torch.nn.functional.pad(
-                contacts_for_conv,
-                (padding, padding),  # pad left and right
-                mode="replicate",
-            )
-
-            # Apply 1D convolution (no padding needed since we already padded)
-            smoothed_motion = torch.nn.functional.conv1d(
-                padded_contacts, kernel, padding=0
-            )
-
-            # Reshape back to [num_frames, num_bodies] and store
-            smoothed_contacts[start_idx:end_idx] = smoothed_motion.squeeze(1).t()
 
         # Replace contacts with smoothed version
         self.contacts = smoothed_contacts
@@ -823,7 +1015,8 @@ class MotionLib:
         self.contacts = torch.clamp(self.contacts, 0.0, 1.0)
 
         print(
-            f"Contact smoothing complete for {num_motions} motions. Contacts are now float values in [0, 1]."
+            f"Contact smoothing complete for {self.motion_num_frames.numel()} motions. "
+            "Contacts are now float values in [0, 1]."
         )
 
     def translate_all_motions_to_origin(self, target_xy: Optional[torch.Tensor] = None):

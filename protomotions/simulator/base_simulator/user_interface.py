@@ -72,6 +72,7 @@ class _KeyState:
     is_down: bool = False
     pressed: bool = False
     consumed: bool = False
+    pending_presses: int = 0
 
 
 def _validate_action_name(name: str) -> None:
@@ -260,7 +261,12 @@ class UserInterface:
 
     def begin_step(self) -> None:
         for state in self._keys.values():
-            state.pressed = False
+            # Preserve only press edges that were consumed by a control during
+            # the previous step. This lets a burst of clicks drain one per
+            # step instead of collapsing into one boolean edge.
+            if not state.consumed:
+                state.pending_presses = 0
+            state.pressed = state.pending_presses > 0
             state.consumed = False
 
     def handle_key_event(self, key: str, *, pressed: bool = True) -> bool:
@@ -281,19 +287,41 @@ class UserInterface:
         state.is_down = pressed
         if pressed and not was_down:
             state.pressed = True
+            state.pending_presses += 1
             state.consumed = False
             if state.on_press is not None:
                 state.on_press()
         return True
 
+    def handle_key_press(self, key: str) -> bool:
+        """Record one discrete press from a callback-only backend.
+
+        Some viewer APIs expose key callbacks as individual press events and
+        do not provide a matching release event. Treating those callbacks as
+        level state would leave a key latched after its first press. This
+        method records one edge without changing the level-triggered ``down``
+        state used by backends that provide transitions.
+        """
+        normalized = self.normalize_key(key)
+        state = self._keys.get(normalized)
+        if state is None:
+            return False
+        state.pressed = True
+        state.pending_presses += 1
+        state.consumed = False
+        if state.on_press is not None:
+            state.on_press()
+        return True
+
     def was_pressed(self, handle: KeyBinding) -> bool:
         state = self._state_for_handle(handle)
-        return state.pressed and not state.consumed
+        return state.pending_presses > 0 and not state.consumed
 
     def consume_key_press(self, handle: KeyBinding) -> bool:
         state = self._state_for_handle(handle)
-        if state.pressed and not state.consumed:
+        if state.pending_presses > 0 and not state.consumed:
             state.consumed = True
+            state.pending_presses -= 1
             return True
         return False
 

@@ -10,7 +10,7 @@ You can install the simulation of your choice, and the simulation backend is sel
 
    <p>
      <a href="https://pypi.org/project/newton/1.0.0/"><img src="https://img.shields.io/badge/Newton-1.0.0-brightgreen.svg" alt="Newton"></a>
-     <a href="https://github.com/isaac-sim/IsaacLab/releases/tag/v2.3.0"><img src="https://img.shields.io/badge/IsaacLab-2.3.0-blue.svg" alt="IsaacLab"></a>
+     <a href="https://github.com/isaac-sim/IsaacLab/commit/4ecd0b036da19ff6ad2bb4d621f886b63e9f6db8"><img src="https://img.shields.io/badge/IsaacLab-3.0-blue.svg" alt="IsaacLab"></a>
      <a href="https://developer.nvidia.com/isaac-gym"><img src="https://img.shields.io/badge/IsaacGym-Preview_4-blue.svg" alt="IsaacGym"></a>
      <a href="https://github.com/Genesis-Embodied-AI/Genesis"><img src="https://img.shields.io/badge/Genesis-untested-lightgrey.svg" alt="Genesis"></a>
      <a href="https://github.com/google-deepmind/mujoco"><img src="https://img.shields.io/badge/MuJoCo-3.0+-orange.svg" alt="MuJoCo"></a>
@@ -20,6 +20,30 @@ You can install the simulation of your choice, and the simulation backend is sel
 
    We recommend creating a **separate virtual environment** for each simulator to avoid dependency conflicts.
    We recommend using **conda** or **venv** for IsaacGym, Genesis, and MuJoCo, and **uv** for IsaacLab and Newton.
+
+Which installation path?
+------------------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 30 48
+
+   * - Simulator
+     - Supported install
+     - Notes
+   * - MuJoCo, Newton, Genesis
+     - Source checkout **or** uv dependency
+     - Genesis is experimental.
+   * - IsaacLab
+     - **Pinned source checkout**
+     - IsaacLab 12.0.0 with Isaac Sim 6.0 requires Python 3.12 and Linux x86_64.
+   * - IsaacGym
+     - **Source checkout only**
+     - IsaacGym is not distributed on PyPI: you download it from NVIDIA and
+       install it by hand, and it requires **Python 3.8**.
+
+Use a source checkout if you want the pretrained checkpoints, motion files, or
+the ``examples/`` experiments — those live in Git LFS, not in the package.
 
 Prerequisites
 -------------
@@ -36,6 +60,60 @@ USD assets are large. If you fetch a subset of assets manually, make sure the
 files are checked out and not still Git LFS pointer files. Pointer files start
 with ``version https://git-lfs.github.com/spec/v1`` and can cause errors such as
 ``is not a valid usda layer`` when IsaacLab loads robot assets.
+
+Using ProtoMotions as a dependency (uv)
+---------------------------------------
+
+Install ProtoMotions directly from Git. Robot meshes and USD assets are Git LFS
+objects, so the source must be fetched with LFS enabled — ``lfs = true``
+requires uv 0.11.32+:
+
+.. code-block:: bash
+
+   uv init --python 3.11 my-project
+   cd my-project
+   uv add --lfs "protomotions[newton] @ git+https://github.com/NVlabs/ProtoMotions.git"
+
+Equivalently, configure the dependency in the downstream ``pyproject.toml``:
+
+.. code-block:: toml
+
+   [project]
+   dependencies = ["protomotions[newton]"] # or [mujoco] / [isaaclab] / [genesis]
+
+   [tool.uv]
+   required-version = ">=0.11.32"
+
+   [tool.uv.sources]
+   protomotions = { git = "https://github.com/NVlabs/ProtoMotions.git", lfs = true }
+
+Then run training through the installed entry point:
+
+.. code-block:: bash
+
+   uv run protomotions train-agent \
+       --robot-name g1 --simulator newton \
+       --experiment-path experiments/my_experiment.py \
+       --experiment-name my_run \
+       --motion-file data/my_motion.pt \
+       --num-envs 4096 --batch-size 16384
+
+``uv run protomotions info`` prints the resolved asset root and which simulator
+modules are importable.
+
+The package ships the Python modules and the full robot asset tree **except**
+the SMPL/SMPL-H assets, which carry their own licence terms. Pretrained
+checkpoints, motion files, and the ``examples/`` experiments are not included;
+keep a Git LFS checkout and set ``PROTOMOTIONS_ASSET_ROOT`` if you need them.
+
+IsaacLab as a dependency
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The supported IsaacLab stack is a pinned source workspace rather than a
+standalone ProtoMotions dependency resolution. Follow the IsaacLab procedure
+below to create its Python 3.12 ``.venv``, then install ProtoMotions into that
+environment. A plain ``uv add protomotions[isaaclab]`` in a separate project
+does not install the required IsaacLab source revision.
 
 Choose Your Simulator(s)
 ------------------------
@@ -75,28 +153,32 @@ IsaacGym requires **Python 3.8**.
 IsaacLab
 ~~~~~~~~
 
-We recommend using **uv** for IsaacLab installation. IsaacLab 2.x requires **Python 3.11**.
-For full installation details, see the `IsaacLab Pip Installation Guide <https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/isaaclab_pip_installation.html>`__.
+ProtoMotions targets IsaacLab 12.0.0 and Isaac Sim 6.0 from public IsaacLab
+commit ``4ecd0b036da19ff6ad2bb4d621f886b63e9f6db8``. This stack requires
+**Python 3.12**. Install the pinned IsaacLab source checkout before
+ProtoMotions so its workspace packages and simulator dependencies are present.
 
-1. Create a virtual environment with uv:
-
-   .. code-block:: bash
-
-      uv venv --python 3.11 env_isaaclab
-      source env_isaaclab/bin/activate
-
-2. Install PyTorch and IsaacLab:
+1. Clone and select the supported IsaacLab revision:
 
    .. code-block:: bash
 
-      uv pip install torch==2.7.0 torchvision==0.22.0
-      uv pip install isaaclab[isaacsim,all]==2.3.0 --extra-index-url https://pypi.nvidia.com
+      git clone https://github.com/isaac-sim/IsaacLab.git
+      cd IsaacLab
+      git checkout 4ecd0b036da19ff6ad2bb4d621f886b63e9f6db8
+
+2. Create the pinned IsaacLab environment and install its Isaac Sim extra:
+
+   .. code-block:: bash
+
+      uv sync --extra isaacsim
+      source .venv/bin/activate
 
 3. Install ProtoMotions and dependencies:
 
    .. code-block:: bash
 
-      uv pip install -e /path/to/protomotions
+      uv pip install -e "/path/to/protomotions[isaaclab]" \
+        --extra-index-url https://pypi.nvidia.com
       uv pip install -r /path/to/protomotions/requirements_isaaclab.txt
 
 .. note::
@@ -145,9 +227,9 @@ For full installation details, see the `Newton Installation Guide <https://newto
    .. code-block:: bash
 
       pip install torch --index-url https://download.pytorch.org/whl/cu124
-      pip install "newton[examples]"
+      pip install "newton[examples]==1.0.0"
 
-   Use ``newton[sim]`` instead of ``newton[examples]`` if you only need headless mode (no viewer).
+   Use ``newton[sim]==1.0.0`` instead of ``newton[examples]==1.0.0`` if you only need headless mode (no viewer).
 
 3. Install ProtoMotions and dependencies:
 
